@@ -89,3 +89,4 @@ jobs:
       - run: cargo test --test storeapi_shard_parity
       - run: cargo test --test storeapi_replica_label_parity
       - run: cargo test --test storeapi_series_hints_parity
+      - run: cargo test --test storeapi_label_endpoints_parity

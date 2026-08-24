@@ -150,8 +150,11 @@ labels after matcher evaluation and before sharding, sorting, and response mergi
 `hintspb.SeriesRequestHints` block matchers filter external block labels and the synthetic
 `__block_id` label during resolution selection. The final stream frame reports selected block IDs
 as `hintspb.SeriesResponseHints`.
+`LabelNames` and `LabelValues` support matcher and time filtering, sorted limits,
+`without_replica_labels`, block request hints, and queried-block response hints with BucketStore
+semantics across every overlapping resolution.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, native histogram SUM/COUNTER aggregate slots, and startup-time index construction. It does not support label endpoint hints or projection hints, and it does not refresh the block index while running.
+Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, native histogram SUM/COUNTER aggregate slots, and startup-time index construction. It does not support projection hints and does not refresh the block index while running.
 
 ## Flight SQL CLI
 

@@ -362,9 +362,17 @@ impl ThanosStoreService {
         };
         match chunk {
             EncodedChunk::Xor(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
-                result.raw = Some(xor_chunk(data));
+                result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::Xor));
             }
-            EncodedChunk::Xor(_) => return Ok(None),
+            EncodedChunk::Histogram(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
+                result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::Histogram));
+            }
+            EncodedChunk::FloatHistogram(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
+                result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::FloatHistogram));
+            }
+            EncodedChunk::Xor(_) | EncodedChunk::Histogram(_) | EncodedChunk::FloatHistogram(_) => {
+                return Ok(None);
+            }
             EncodedChunk::Aggregate {
                 count,
                 sum,
@@ -393,11 +401,12 @@ impl ThanosStoreService {
     }
 }
 
-fn xor_chunk(data: Vec<u8>) -> Chunk {
+fn raw_chunk(data: Vec<u8>, encoding: thanos::chunk::Encoding) -> Chunk {
+    let hash = xxhash_rust::xxh64::xxh64(&data, 0);
     Chunk {
-        r#type: thanos::chunk::Encoding::Xor as i32,
+        r#type: encoding as i32,
         data,
-        hash: 0,
+        hash,
     }
 }
 
@@ -410,7 +419,7 @@ fn aggregate_chunk(
         .contains(&(aggregate as i32))
         .then_some(data)
         .flatten()
-        .map(xor_chunk)
+        .map(|data| raw_chunk(data, thanos::chunk::Encoding::Xor))
 }
 
 fn reject_unsupported_series_options(request: &thanos::SeriesRequest) -> Result<(), Status> {

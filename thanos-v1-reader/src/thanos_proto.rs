@@ -9,3 +9,7 @@ pub mod thanos {
 pub mod prometheus_copy {
     tonic::include_proto!("prometheus_copy");
 }
+
+pub mod hintspb {
+    tonic::include_proto!("hintspb");
+}

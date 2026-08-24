@@ -12,12 +12,14 @@ import (
 	"strings"
 
 	"github.com/go-kit/log"
+	"github.com/gogo/protobuf/types"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/store/hintspb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
@@ -77,11 +79,23 @@ type oracleSpan struct {
 	Length uint32 `json:"length"`
 }
 
+type stringFlags []string
+
+func (f *stringFlags) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *stringFlags) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
 type seriesServer struct {
 	storepb.Store_SeriesServer
-	ctx      context.Context
-	series   []*storepb.Series
-	warnings []string
+	ctx       context.Context
+	series    []*storepb.Series
+	warnings  []string
+	responses []*storepb.SeriesResponse
 }
 
 func (s *seriesServer) Context() context.Context {
@@ -89,6 +103,7 @@ func (s *seriesServer) Context() context.Context {
 }
 
 func (s *seriesServer) Send(response *storepb.SeriesResponse) error {
+	s.responses = append(s.responses, response)
 	if warning := response.GetWarning(); warning != "" {
 		s.warnings = append(s.warnings, warning)
 	}
@@ -124,6 +139,11 @@ func run() error {
 	var withoutReplicaLabels string
 	var limit int64
 	var matchLabel string
+	var streamWireFormat bool
+	var hintsType string
+	var blockMatchers stringFlags
+	var skipChunks bool
+	var hintsTypeURL string
 	flag.StringVar(&bucketDir, "bucket", "", "filesystem bucket containing Thanos blocks")
 	flag.StringVar(&metric, "metric", "", "metric name to query")
 	flag.StringVar(&aggregateNames, "aggregates", "raw", "comma-separated StoreAPI aggregates")
@@ -139,6 +159,11 @@ func run() error {
 	flag.StringVar(&withoutReplicaLabels, "without-replica-labels", "\x00", "comma-separated labels to remove")
 	flag.Int64Var(&limit, "limit", 0, "StoreAPI series result limit")
 	flag.StringVar(&matchLabel, "match-label", "", "additional exact matcher in name=value form")
+	flag.BoolVar(&streamWireFormat, "stream-wire-format", false, "emit hex-encoded SeriesResponse protobufs")
+	flag.StringVar(&hintsType, "hints-type", "none", "request hints type: none, request, response, unknown, invalid-url, or malformed")
+	flag.Var(&blockMatchers, "block-matcher", "block matcher in TYPE:name:value form; repeatable")
+	flag.BoolVar(&skipChunks, "skip-chunks", false, "omit chunks from Series responses")
+	flag.StringVar(&hintsTypeURL, "hints-type-url", "", "override the request hints Any type URL")
 	flag.Parse()
 	if bucketDir == "" || metric == "" {
 		return fmt.Errorf("--bucket and --metric are required")
@@ -180,7 +205,7 @@ func run() error {
 		store.NewGapBasedPartitioner(store.PartitionerMaxGapSize),
 		4,
 		store.DefaultPostingOffsetInMemorySampling,
-		false,
+		true,
 		false,
 		0,
 	)
@@ -214,6 +239,13 @@ func run() error {
 			Labels:      splitNonEmpty(shardLabels),
 		}
 	}
+	hints, err := requestHints(hintsType, blockMatchers)
+	if err != nil {
+		return err
+	}
+	if hints != nil && hintsTypeURL != "" {
+		hints.TypeUrl = hintsTypeURL
+	}
 	if err := bucketStore.Series(&storepb.SeriesRequest{
 		MinTime:                 minTime,
 		MaxTime:                 maxTime,
@@ -224,11 +256,24 @@ func run() error {
 		ShardInfo:               shardInfo,
 		WithoutReplicaLabels:    splitRequestedLabels(withoutReplicaLabels),
 		Limit:                   limit,
+		Hints:                   hints,
+		SkipChunks:              skipChunks,
 	}, server); err != nil {
 		return fmt.Errorf("query bucket store: %w", err)
 	}
 	if len(server.warnings) != 0 {
 		return fmt.Errorf("bucket store returned warnings: %v", server.warnings)
+	}
+	if streamWireFormat {
+		encoded := make([]string, 0, len(server.responses))
+		for _, response := range server.responses {
+			data, err := response.Marshal()
+			if err != nil {
+				return fmt.Errorf("marshal response: %w", err)
+			}
+			encoded = append(encoded, hex.EncodeToString(data))
+		}
+		return json.NewEncoder(os.Stdout).Encode(encoded)
 	}
 	if wireFormat {
 		encoded := make([]string, 0, len(server.series))
@@ -332,6 +377,54 @@ func splitRequestedLabels(value string) []string {
 		return nil
 	}
 	return strings.Split(value, ",")
+}
+
+func requestHints(kind string, rawMatchers []string) (*types.Any, error) {
+	matchers := make([]storepb.LabelMatcher, 0, len(rawMatchers))
+	for _, raw := range rawMatchers {
+		rawType, remainder, ok := strings.Cut(raw, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid --block-matcher %q", raw)
+		}
+		name, value, ok := strings.Cut(remainder, ":")
+		if !ok || name == "" {
+			return nil, fmt.Errorf("invalid --block-matcher %q", raw)
+		}
+		matcherType, ok := map[string]storepb.LabelMatcher_Type{
+			"eq":      storepb.LabelMatcher_EQ,
+			"neq":     storepb.LabelMatcher_NEQ,
+			"re":      storepb.LabelMatcher_RE,
+			"nre":     storepb.LabelMatcher_NRE,
+			"invalid": storepb.LabelMatcher_Type(99),
+		}[rawType]
+		if !ok {
+			return nil, fmt.Errorf("invalid block matcher type %q", rawType)
+		}
+		matchers = append(matchers, storepb.LabelMatcher{
+			Type:  matcherType,
+			Name:  name,
+			Value: value,
+		})
+	}
+	switch kind {
+	case "none":
+		return nil, nil
+	case "request":
+		return types.MarshalAny(&hintspb.SeriesRequestHints{BlockMatchers: matchers})
+	case "response":
+		return types.MarshalAny(&hintspb.SeriesResponseHints{})
+	case "unknown":
+		return &types.Any{TypeUrl: "type.googleapis.com/unknown.SeriesRequestHints"}, nil
+	case "invalid-url":
+		return &types.Any{TypeUrl: "hintspb.SeriesRequestHints"}, nil
+	case "malformed":
+		return &types.Any{
+			TypeUrl: "type.googleapis.com/hintspb.SeriesRequestHints",
+			Value:   []byte{0xff},
+		}, nil
+	default:
+		return nil, fmt.Errorf("invalid --hints-type %q", kind)
+	}
 }
 
 func convertChunk(chunk *storepb.Chunk) (oracleEncodedChunk, error) {

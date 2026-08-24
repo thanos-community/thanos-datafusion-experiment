@@ -12,6 +12,7 @@ use arrow::{
 use datafusion::prelude::SessionContext;
 use futures::Stream;
 use opendal::Operator;
+use prost::Message;
 use regex::Regex;
 use tokio_stream::iter;
 use tonic::{Request, Response, Status};
@@ -20,6 +21,7 @@ use crate::{
     block_index::repository_operator,
     chunk_reader::{self, EncodedAggregateChunk, EncodedAggregateEncoding, EncodedChunk},
     config::ThanosRepositoryConfig,
+    thanos_proto::hintspb,
     thanos_proto::thanos::{
         self, Aggr, AggrChunk, Chunk, Label, LabelMatcher, Series, SeriesBatch, SeriesResponse,
         info, store_server::Store,
@@ -28,6 +30,8 @@ use crate::{
 
 type BoxError = Box<dyn Error>;
 type SeriesStream = Pin<Box<dyn Stream<Item = Result<SeriesResponse, Status>> + Send>>;
+const SERIES_RESPONSE_HINTS_TYPE_URL: &str = "type.googleapis.com/hintspb.SeriesResponseHints";
+const BLOCK_ID_LABEL: &str = "__block_id";
 
 #[derive(Clone)]
 pub struct ThanosStoreService {
@@ -118,12 +122,14 @@ impl ThanosStoreService {
             .collect()
     }
 
-    fn selected_block_keys(
+    fn selected_blocks(
         &self,
         start: i64,
         end: i64,
         max_resolution: i64,
-    ) -> BTreeSet<(String, String)> {
+        series_matchers: &[Matcher],
+        block_matchers: &[Matcher],
+    ) -> Vec<&BlockMetadata> {
         let mut block_sets = BTreeMap::<Vec<(String, String)>, Vec<&BlockMetadata>>::new();
         for block in self.blocks.iter() {
             block_sets
@@ -132,9 +138,9 @@ impl ThanosStoreService {
                 .push(block);
         }
         block_sets
-            .values()
-            .flat_map(|blocks| select_blocks(blocks, start, end, max_resolution))
-            .map(BlockMetadata::key)
+            .into_values()
+            .filter(|blocks| block_set_matches_series(blocks[0], series_matchers))
+            .flat_map(|blocks| select_blocks(&blocks, start, end, max_resolution, block_matchers))
             .collect()
     }
 
@@ -210,22 +216,30 @@ impl Store for ThanosStoreService {
         request: Request<thanos::SeriesRequest>,
     ) -> Result<Response<Self::SeriesStream>, Status> {
         let request = request.into_inner();
-        reject_unsupported_series_options(&request)?;
         let matchers = compile_matchers(&request.matchers)?;
+        let request_hints = decode_series_request_hints(request.hints.as_ref())?;
+        let block_matchers = compile_matchers(&request_hints.block_matchers)?;
         let aggregates = aggregates(&request.aggregates)?;
         let limit = limit(request.limit)?;
         let abort_on_error = request.partial_response_disabled
             || request.partial_response_strategy == thanos::PartialResponseStrategy::Abort as i32;
 
-        let selected_blocks = self.selected_block_keys(
+        let selected_blocks = self.selected_blocks(
             request.min_time,
             request.max_time,
             request.max_resolution_window,
+            &matchers,
+            &block_matchers,
         );
+        let selected_block_keys = selected_blocks
+            .iter()
+            .map(|block| block.key())
+            .collect::<BTreeSet<_>>();
+        let selected_block_count = selected_blocks.len();
         let mut groups =
             BTreeMap::<(String, String, Vec<(String, String)>), Vec<&ChunkDescriptor>>::new();
         for descriptor in self.matching_descriptors(request.min_time, request.max_time, &matchers) {
-            if !selected_blocks.contains(&descriptor.block_key()) {
+            if !selected_block_keys.contains(&descriptor.block_key()) {
                 continue;
             }
             groups
@@ -316,6 +330,14 @@ impl Store for ThanosStoreService {
                 }
             })
             .collect::<Vec<_>>();
+        let merged_series_count = series_responses.len();
+        let merged_chunks_count = series_responses
+            .iter()
+            .filter_map(|response| match &response.result {
+                Some(thanos::series_response::Result::Series(series)) => Some(series.chunks.len()),
+                _ => None,
+            })
+            .sum::<usize>();
 
         let batch_size = usize::try_from(request.response_batch_size)
             .ok()
@@ -345,6 +367,28 @@ impl Store for ThanosStoreService {
                 .collect()
         };
         responses.extend(warning_responses);
+        let response_hints = hintspb::SeriesResponseHints {
+            queried_blocks: selected_blocks
+                .into_iter()
+                .map(|block| hintspb::Block {
+                    id: block.block_ulid.clone(),
+                })
+                .collect(),
+            query_stats: request_hints
+                .enable_query_stats
+                .then(|| hintspb::QueryStats {
+                    blocks_queried: i64::try_from(selected_block_count).unwrap_or(i64::MAX),
+                    merged_series_count: i64::try_from(merged_series_count).unwrap_or(i64::MAX),
+                    merged_chunks_count: i64::try_from(merged_chunks_count).unwrap_or(i64::MAX),
+                    ..Default::default()
+                }),
+        };
+        responses.push(SeriesResponse {
+            result: Some(thanos::series_response::Result::Hints(prost_types::Any {
+                type_url: SERIES_RESPONSE_HINTS_TYPE_URL.to_owned(),
+                value: response_hints.encode_to_vec(),
+            })),
+        });
         Ok(Response::new(Box::pin(iter(responses.into_iter().map(Ok)))))
     }
 
@@ -501,11 +545,26 @@ fn aggregate_chunk(
     Ok(Some(raw_chunk(chunk.data, encoding)))
 }
 
-fn reject_unsupported_series_options(request: &thanos::SeriesRequest) -> Result<(), Status> {
-    if request.hints.is_some() {
-        return Err(Status::unimplemented("opaque hints are not supported"));
+fn decode_series_request_hints(
+    hints: Option<&prost_types::Any>,
+) -> Result<hintspb::SeriesRequestHints, Status> {
+    let Some(hints) = hints else {
+        return Ok(hintspb::SeriesRequestHints::default());
+    };
+    let Some((_, message_name)) = hints.type_url.rsplit_once('/') else {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal series request hints: message type url {:?} is invalid",
+            hints.type_url
+        )));
+    };
+    if message_name != "hintspb.SeriesRequestHints" {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal series request hints: mismatched message type: got {message_name:?} want \"hintspb.SeriesRequestHints\""
+        )));
     }
-    Ok(())
+    hintspb::SeriesRequestHints::decode(hints.value.as_slice()).map_err(|error| {
+        Status::invalid_argument(format!("unmarshal series request hints: {error}"))
+    })
 }
 
 fn matches_shard(labels: &[(String, String)], shard_info: Option<&thanos::ShardInfo>) -> bool {
@@ -710,6 +769,7 @@ fn select_blocks<'a>(
     mint: i64,
     maxt: i64,
     max_resolution: i64,
+    block_matchers: &[Matcher],
 ) -> Vec<&'a BlockMetadata> {
     let Some(resolution_index) = BLOCK_RESOLUTIONS
         .iter()
@@ -729,7 +789,7 @@ fn select_blocks<'a>(
             matching
         })
         .collect::<Vec<_>>();
-    select_resolution(&by_resolution, resolution_index, mint, maxt)
+    select_resolution(&by_resolution, resolution_index, mint, maxt, block_matchers)
 }
 
 fn select_resolution<'a>(
@@ -737,6 +797,7 @@ fn select_resolution<'a>(
     resolution_index: usize,
     mint: i64,
     maxt: i64,
+    block_matchers: &[Matcher],
 ) -> Vec<&'a BlockMetadata> {
     if mint > maxt {
         return Vec::new();
@@ -756,15 +817,67 @@ fn select_resolution<'a>(
                 resolution_index + 1,
                 start,
                 block.min_time.wrapping_sub(1),
+                block_matchers,
             ));
         }
-        selected.push(block);
+        if block_matches_hints(block, block_matchers) {
+            selected.push(block);
+        }
         start = block.max_time;
     }
     if resolution_index + 1 < blocks.len() {
-        selected.extend(select_resolution(blocks, resolution_index + 1, start, maxt));
+        selected.extend(select_resolution(
+            blocks,
+            resolution_index + 1,
+            start,
+            maxt,
+            block_matchers,
+        ));
     }
     selected
+}
+
+fn block_set_matches_series(block: &BlockMetadata, matchers: &[Matcher]) -> bool {
+    matchers.iter().all(|matcher| {
+        let name = matcher_name(matcher);
+        match block.external_labels.get(name) {
+            Some(value) if !value.is_empty() => matcher_matches(matcher, Some(value)),
+            _ => true,
+        }
+    })
+}
+
+fn block_matches_hints(block: &BlockMetadata, matchers: &[Matcher]) -> bool {
+    matchers.iter().all(|matcher| {
+        let value = if matcher_name(matcher) == BLOCK_ID_LABEL {
+            Some(block.block_ulid.as_str())
+        } else {
+            block
+                .external_labels
+                .get(matcher_name(matcher))
+                .map(String::as_str)
+        };
+        matcher_matches(matcher, value)
+    })
+}
+
+fn matcher_name(matcher: &Matcher) -> &str {
+    match matcher {
+        Matcher::Eq(name, _)
+        | Matcher::Neq(name, _)
+        | Matcher::Re(name, _)
+        | Matcher::Nre(name, _) => name,
+    }
+}
+
+fn matcher_matches(matcher: &Matcher, value: Option<&str>) -> bool {
+    let value = value.unwrap_or("");
+    match matcher {
+        Matcher::Eq(_, expected) => value == expected,
+        Matcher::Neq(_, expected) => value != expected,
+        Matcher::Re(_, regex) => regex.is_match(value),
+        Matcher::Nre(_, regex) => !regex.is_match(value),
+    }
 }
 
 fn duplicate_block_keys(blocks: &[BlockMetadata]) -> BTreeSet<(String, String)> {
@@ -1070,7 +1183,7 @@ mod tests {
             block("1h-2", 200, 300, 3_600_000),
         ];
         let references = blocks.iter().collect::<Vec<_>>();
-        let selected = select_blocks(&references, 0, 500, 3_600_000)
+        let selected = select_blocks(&references, 0, 500, 3_600_000, &[])
             .into_iter()
             .map(|block| block.block_ulid.as_str())
             .collect::<Vec<_>>();

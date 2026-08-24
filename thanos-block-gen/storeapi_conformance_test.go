@@ -272,6 +272,8 @@ func querySeries(t *testing.T, ctx context.Context, store storepb.StoreClient, r
 			series = append(series, result.Batch.Series...)
 		case *storepb.SeriesResponse_Warning:
 			t.Fatalf("StoreAPI warning: %s", result.Warning)
+		case *storepb.SeriesResponse_Hints:
+			continue
 		default:
 			t.Fatalf("unexpected Series response: %#v", response.Result)
 		}

@@ -1,4 +1,4 @@
-.PHONY: reader-dev reader-watch
+.PHONY: clean e2e-test gen-dev-series reader-dev reader-watch test
 
 OTEL_SDK_DISABLED ?= true
 RUST_LOG ?= debug,opentelemetry_sdk=warn,datafusion=info
@@ -17,3 +17,10 @@ reader-dev:
 
 reader-watch:
 	cd thanos-v1-reader && cargo watch -w src -w Cargo.toml -w dev.toml -x run
+
+e2e-test:
+	cd thanos-v1-reader && cargo test --test counter_parity
+
+test:
+	cd thanos-v1-reader && cargo test
+	cd thanos-block-gen && go test ./...

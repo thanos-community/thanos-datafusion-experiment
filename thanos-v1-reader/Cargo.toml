@@ -3,6 +3,10 @@ name = "thanos-v1-reader"
 version = "0.1.0"
 edition = "2024"
 
+[[test]]
+name = "counter_parity"
+path = "e2e/counter_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }

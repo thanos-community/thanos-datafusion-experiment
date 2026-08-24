@@ -50,7 +50,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-unit-
       - run: cargo test --lib
-      - run: cargo test --bin thanos-v1-reader
 
   rust-e2e-tests:
     name: Rust end-to-end tests

@@ -1,0 +1,41 @@
+name: StoreAPI conformance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  store-api-conformance:
+    name: StoreAPI conformance
+    runs-on: ubuntu-latest
+    env:
+      OTEL_SDK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: thanos-block-gen/go.mod
+          cache: true
+          cache-dependency-path: thanos-block-gen/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            thanos-v1-reader/target
+          key: ${{ runner.os }}-cargo-storeapi-${{ hashFiles('thanos-v1-reader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-storeapi-
+      - run: make store-api-conformance-test

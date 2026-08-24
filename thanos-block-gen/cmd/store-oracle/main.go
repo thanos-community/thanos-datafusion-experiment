@@ -18,6 +18,7 @@ import (
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/thanos/pkg/block"
+	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -167,7 +168,7 @@ func run() error {
 	flag.Var(&blockMatchers, "block-matcher", "block matcher in TYPE:name:value form; repeatable")
 	flag.BoolVar(&skipChunks, "skip-chunks", false, "omit chunks from Series responses")
 	flag.StringVar(&hintsTypeURL, "hints-type-url", "", "override the request hints Any type URL")
-	flag.StringVar(&endpoint, "endpoint", "series", "StoreAPI endpoint: series, label-names, or label-values")
+	flag.StringVar(&endpoint, "endpoint", "series", "API endpoint: series, label-names, label-values, or info")
 	flag.StringVar(&label, "label", "", "label name for the label-values endpoint")
 	flag.Var(&seriesMatchers, "series-matcher", "series matcher in TYPE:name:value form; repeatable")
 	flag.Parse()
@@ -261,6 +262,24 @@ func run() error {
 		hints.TypeUrl = hintsTypeURL
 	}
 	switch endpoint {
+	case "info":
+		minTime, maxTime := bucketStore.TimeRange()
+		response := &infopb.InfoResponse{
+			LabelSets:     bucketStore.LabelSet(),
+			ComponentType: "store",
+			Store: &infopb.StoreInfo{
+				MinTime:                      minTime,
+				MaxTime:                      maxTime,
+				SupportsSharding:             true,
+				SupportsWithoutReplicaLabels: true,
+				TsdbInfos:                    bucketStore.TSDBInfos(),
+			},
+		}
+		data, err := response.Marshal()
+		if err != nil {
+			return fmt.Errorf("marshal info response: %w", err)
+		}
+		return json.NewEncoder(os.Stdout).Encode(hex.EncodeToString(data))
 	case "label-names":
 		response, err := bucketStore.LabelNames(context.Background(), &storepb.LabelNamesRequest{
 			Start:                minTime,

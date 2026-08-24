@@ -303,8 +303,13 @@ async fn reader_series(
     let mut result = Vec::new();
     while let Some(response) = stream.next().await {
         let response = response.unwrap();
-        let Some(thanos::series_response::Result::Series(series)) = response.result else {
-            panic!("reader returned a non-series response");
+        let Some(response_result) = response.result else {
+            panic!("reader returned an empty response");
+        };
+        let series = match response_result {
+            thanos::series_response::Result::Series(series) => series,
+            thanos::series_response::Result::Hints(_) => continue,
+            _ => panic!("reader returned an unexpected response"),
         };
         result.push(OracleSeries {
             labels: series

@@ -113,10 +113,14 @@ func run() error {
 	var metric string
 	var aggregateNames string
 	var maxResolution int64
+	var minTime int64
+	var maxTime int64
 	flag.StringVar(&bucketDir, "bucket", "", "filesystem bucket containing Thanos blocks")
 	flag.StringVar(&metric, "metric", "", "metric name to query")
 	flag.StringVar(&aggregateNames, "aggregates", "raw", "comma-separated StoreAPI aggregates")
 	flag.Int64Var(&maxResolution, "max-resolution", 0, "maximum StoreAPI resolution window in milliseconds")
+	flag.Int64Var(&minTime, "min-time", math.MinInt64, "minimum StoreAPI query timestamp")
+	flag.Int64Var(&maxTime, "max-time", math.MaxInt64, "maximum StoreAPI query timestamp")
 	flag.Parse()
 	if bucketDir == "" || metric == "" {
 		return fmt.Errorf("--bucket and --metric are required")
@@ -143,7 +147,7 @@ func run() error {
 		block.NewConcurrentLister(logger, instrumentedBucket),
 		cacheDir,
 		nil,
-		nil,
+		[]block.MetadataFilter{block.NewDeduplicateFilter(4)},
 	)
 	if err != nil {
 		return fmt.Errorf("create metadata fetcher: %w", err)
@@ -176,8 +180,8 @@ func run() error {
 	}
 	server := &seriesServer{ctx: context.Background()}
 	if err := bucketStore.Series(&storepb.SeriesRequest{
-		MinTime:                 math.MinInt64,
-		MaxTime:                 math.MaxInt64,
+		MinTime:                 minTime,
+		MaxTime:                 maxTime,
 		Matchers:                []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: metric}},
 		Aggregates:              aggregates,
 		MaxResolutionWindow:     maxResolution,

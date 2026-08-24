@@ -14,6 +14,7 @@ pub mod block_index;
 pub mod chunk_reader;
 pub mod config;
 pub mod flight_service;
+pub mod histogram;
 pub mod metric_table;
 pub mod store_service;
 pub mod thanos_proto;

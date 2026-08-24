@@ -11,6 +11,7 @@ import (
 	"os"
 
 	"github.com/go-kit/log"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/thanos/pkg/block"
@@ -29,6 +30,12 @@ type oracleChunk struct {
 	Encoding storepb.Chunk_Encoding `json:"encoding"`
 	Data     string                 `json:"data"`
 	Hash     uint64                 `json:"hash"`
+	Samples  []oracleSample         `json:"samples,omitempty"`
+}
+
+type oracleSample struct {
+	Timestamp int64  `json:"timestamp"`
+	ValueBits uint64 `json:"value_bits"`
 }
 
 type seriesServer struct {
@@ -149,15 +156,46 @@ func run() error {
 			if chunk.Raw == nil {
 				return fmt.Errorf("series returned a non-raw chunk")
 			}
+			samples, err := decodeFloatSamples(chunk.Raw)
+			if err != nil {
+				return err
+			}
 			converted.Chunks = append(converted.Chunks, oracleChunk{
 				MinTime:  chunk.MinTime,
 				MaxTime:  chunk.MaxTime,
 				Encoding: chunk.Raw.Type,
 				Data:     hex.EncodeToString(chunk.Raw.Data),
 				Hash:     chunk.Raw.Hash,
+				Samples:  samples,
 			})
 		}
 		result = append(result, converted)
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func decodeFloatSamples(chunk *storepb.Chunk) ([]oracleSample, error) {
+	if chunk.Type != storepb.Chunk_XOR {
+		return nil, nil
+	}
+	decoded, err := chunkenc.FromData(chunkenc.EncXOR, chunk.Data)
+	if err != nil {
+		return nil, fmt.Errorf("decode XOR chunk: %w", err)
+	}
+	iterator := decoded.Iterator(nil)
+	var samples []oracleSample
+	for valueType := iterator.Next(); valueType != chunkenc.ValNone; valueType = iterator.Next() {
+		if valueType != chunkenc.ValFloat {
+			return nil, fmt.Errorf("XOR chunk returned value type %s", valueType)
+		}
+		timestamp, sampleValue := iterator.At()
+		samples = append(samples, oracleSample{
+			Timestamp: timestamp,
+			ValueBits: math.Float64bits(sampleValue),
+		})
+	}
+	if err := iterator.Err(); err != nil {
+		return nil, fmt.Errorf("iterate XOR chunk: %w", err)
+	}
+	return samples, nil
 }

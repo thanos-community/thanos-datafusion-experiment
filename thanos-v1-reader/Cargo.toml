@@ -11,6 +11,10 @@ path = "e2e/e2e.rs"
 name = "native_histogram_parity"
 path = "e2e/native_histogram_parity.rs"
 
+[[test]]
+name = "raw_scalar_parity"
+path = "e2e/raw_scalar_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }

@@ -10,7 +10,11 @@ use arrow::{
 };
 use arrow_flight::flight_service_server::FlightServiceServer;
 use config::ReaderConfig;
-use datafusion::prelude::SessionContext;
+use datafusion::{execution::SessionStateBuilder, prelude::SessionContext};
+use datafusion_tracing::{
+    InstrumentationOptions, RuleInstrumentationOptions, instrument_rules_with_info_spans,
+    instrument_with_info_spans,
+};
 use flight_service::DataFusionFlightService;
 use tonic::transport::Server;
 
@@ -45,7 +49,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn example_context() -> Result<SessionContext, datafusion::error::DataFusionError> {
-    let context = SessionContext::new();
+    let execution_options = InstrumentationOptions::builder()
+        .record_metrics(true)
+        .build();
+    let execution_rule = instrument_with_info_spans!(options: execution_options);
+    let session_state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(execution_rule)
+        .build();
+    let session_state = instrument_rules_with_info_spans!(
+        options: RuleInstrumentationOptions::full(),
+        state: session_state
+    );
+    let context = SessionContext::new_with_state(session_state);
     let schema = Arc::new(Schema::new(vec![
         Field::new("timestamp_ms", DataType::Int64, false),
         Field::new("metric", DataType::Utf8, false),

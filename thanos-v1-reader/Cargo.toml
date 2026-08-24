@@ -27,6 +27,10 @@ path = "e2e/block_selection_parity.rs"
 name = "storeapi_shard_parity"
 path = "e2e/storeapi_shard_parity.rs"
 
+[[test]]
+name = "storeapi_replica_label_parity"
+path = "e2e/storeapi_replica_label_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }

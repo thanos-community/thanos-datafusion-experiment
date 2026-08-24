@@ -121,6 +121,9 @@ func run() error {
 	var shardBy bool
 	var shardLabels string
 	var wireFormat bool
+	var withoutReplicaLabels string
+	var limit int64
+	var matchLabel string
 	flag.StringVar(&bucketDir, "bucket", "", "filesystem bucket containing Thanos blocks")
 	flag.StringVar(&metric, "metric", "", "metric name to query")
 	flag.StringVar(&aggregateNames, "aggregates", "raw", "comma-separated StoreAPI aggregates")
@@ -133,6 +136,9 @@ func run() error {
 	flag.BoolVar(&shardBy, "shard-by", false, "ShardInfo grouping-by mode")
 	flag.StringVar(&shardLabels, "shard-labels", "", "comma-separated ShardInfo labels")
 	flag.BoolVar(&wireFormat, "wire-format", false, "emit hex-encoded Series protobufs")
+	flag.StringVar(&withoutReplicaLabels, "without-replica-labels", "\x00", "comma-separated labels to remove")
+	flag.Int64Var(&limit, "limit", 0, "StoreAPI series result limit")
+	flag.StringVar(&matchLabel, "match-label", "", "additional exact matcher in name=value form")
 	flag.Parse()
 	if bucketDir == "" || metric == "" {
 		return fmt.Errorf("--bucket and --metric are required")
@@ -191,6 +197,14 @@ func run() error {
 		return err
 	}
 	server := &seriesServer{ctx: context.Background()}
+	matchers := []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: metric}}
+	if matchLabel != "" {
+		name, value, ok := strings.Cut(matchLabel, "=")
+		if !ok || name == "" {
+			return fmt.Errorf("invalid --match-label %q", matchLabel)
+		}
+		matchers = append(matchers, storepb.LabelMatcher{Type: storepb.LabelMatcher_EQ, Name: name, Value: value})
+	}
 	var shardInfo *storepb.ShardInfo
 	if shardEnabled {
 		shardInfo = &storepb.ShardInfo{
@@ -203,11 +217,13 @@ func run() error {
 	if err := bucketStore.Series(&storepb.SeriesRequest{
 		MinTime:                 minTime,
 		MaxTime:                 maxTime,
-		Matchers:                []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: metric}},
+		Matchers:                matchers,
 		Aggregates:              aggregates,
 		MaxResolutionWindow:     maxResolution,
 		PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 		ShardInfo:               shardInfo,
+		WithoutReplicaLabels:    splitRequestedLabels(withoutReplicaLabels),
+		Limit:                   limit,
 	}, server); err != nil {
 		return fmt.Errorf("query bucket store: %w", err)
 	}
@@ -309,6 +325,13 @@ func splitNonEmpty(value string) []string {
 		}
 	}
 	return result
+}
+
+func splitRequestedLabels(value string) []string {
+	if value == "\x00" {
+		return nil
+	}
+	return strings.Split(value, ",")
 }
 
 func convertChunk(chunk *storepb.Chunk) (oracleEncodedChunk, error) {

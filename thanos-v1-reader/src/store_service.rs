@@ -18,7 +18,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     block_index::repository_operator,
-    chunk_reader::{self, EncodedChunk},
+    chunk_reader::{self, EncodedAggregateChunk, EncodedAggregateEncoding, EncodedChunk},
     config::ThanosRepositoryConfig,
     thanos_proto::thanos::{
         self, Aggr, AggrChunk, Chunk, Label, LabelMatcher, Series, SeriesBatch, SeriesResponse,
@@ -377,11 +377,11 @@ impl ThanosStoreService {
                 max,
                 counter,
             } => {
-                result.count = aggregate_chunk(count, aggregates, Aggr::Count);
-                result.sum = aggregate_chunk(sum, aggregates, Aggr::Sum);
-                result.min = aggregate_chunk(min, aggregates, Aggr::Min);
-                result.max = aggregate_chunk(max, aggregates, Aggr::Max);
-                result.counter = aggregate_chunk(counter, aggregates, Aggr::Counter);
+                result.count = aggregate_chunk(count, aggregates, Aggr::Count)?;
+                result.sum = aggregate_chunk(sum, aggregates, Aggr::Sum)?;
+                result.min = aggregate_chunk(min, aggregates, Aggr::Min)?;
+                result.max = aggregate_chunk(max, aggregates, Aggr::Max)?;
+                result.counter = aggregate_chunk(counter, aggregates, Aggr::Counter)?;
             }
         }
         if result.raw.is_none()
@@ -408,15 +408,25 @@ fn raw_chunk(data: Vec<u8>, encoding: thanos::chunk::Encoding) -> Chunk {
 }
 
 fn aggregate_chunk(
-    data: Option<Vec<u8>>,
+    chunk: Option<EncodedAggregateChunk>,
     aggregates: &BTreeSet<i32>,
     aggregate: Aggr,
-) -> Option<Chunk> {
-    aggregates
-        .contains(&(aggregate as i32))
-        .then_some(data)
-        .flatten()
-        .map(|data| raw_chunk(data, thanos::chunk::Encoding::Xor))
+) -> Result<Option<Chunk>, Status> {
+    if !aggregates.contains(&(aggregate as i32)) {
+        return Ok(None);
+    }
+    let chunk = chunk.ok_or_else(|| {
+        Status::internal(format!(
+            "aggregate {} does not exist",
+            aggregate.as_str_name().to_ascii_lowercase()
+        ))
+    })?;
+    let encoding = match chunk.encoding {
+        EncodedAggregateEncoding::Xor => thanos::chunk::Encoding::Xor,
+        EncodedAggregateEncoding::Histogram => thanos::chunk::Encoding::Histogram,
+        EncodedAggregateEncoding::FloatHistogram => thanos::chunk::Encoding::FloatHistogram,
+    };
+    Ok(Some(raw_chunk(chunk.data, encoding)))
 }
 
 fn reject_unsupported_series_options(request: &thanos::SeriesRequest) -> Result<(), Status> {

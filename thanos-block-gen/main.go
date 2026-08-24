@@ -48,6 +48,7 @@ type config struct {
 	scalarEdges    bool
 	clean          bool
 	downsample5m   bool
+	downsample1h   bool
 }
 
 func main() {
@@ -74,7 +75,7 @@ func run(args []string, stdout io.Writer) error {
 
 	fmt.Fprintf(
 		stdout,
-		"level=info msg=%q output=%q mint=%d maxt=%d duration=%q samples=%d series=%d external_labels=%q downsample_5m=%t clean=%t\n",
+		"level=info msg=%q output=%q mint=%d maxt=%d duration=%q samples=%d series=%d external_labels=%q downsample_5m=%t downsample_1h=%t clean=%t\n",
 		"generating Thanos fixture blocks",
 		cfg.output,
 		cfg.mint,
@@ -84,6 +85,7 @@ func run(args []string, stdout io.Writer) error {
 		cfg.seriesCount(),
 		formatLabels(cfg.externalLabels),
 		cfg.downsample5m,
+		cfg.downsample1h,
 		cfg.clean,
 	)
 	writeSeriesSchema(stdout, cfg)
@@ -96,11 +98,18 @@ func run(args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "raw block: %s\n", rawID)
 
 	if cfg.downsample5m {
-		downsampledID, err := create5mBlock(ctx, cfg.output, rawID, rawMeta)
+		downsampledID, downsampledMeta, err := create5mBlock(ctx, cfg.output, rawID, rawMeta)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "5m block:  %s\n", downsampledID)
+		if cfg.downsample1h {
+			hourlyID, err := create1hBlock(ctx, cfg.output, downsampledID, downsampledMeta)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "1h block:  %s\n", hourlyID)
+		}
 	}
 	fmt.Fprintf(stdout, "output:     %s\n", cfg.output)
 	return nil
@@ -136,6 +145,7 @@ func parseConfig(args []string) (config, error) {
 	flags.Var(&externalLabels, "external-label", "external label in name=value form; repeatable")
 	flags.BoolVar(&cfg.clean, "clean", false, "remove the output directory before generating blocks")
 	flags.BoolVar(&cfg.downsample5m, "downsample-5m", true, "also generate a 5-minute downsampled block")
+	flags.BoolVar(&cfg.downsample1h, "downsample-1h", false, "also generate a 1-hour block from the 5-minute block")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -150,6 +160,9 @@ func parseConfig(args []string) (config, error) {
 	}
 	if cfg.maxt-cfg.mint < fiveMinutesMillis {
 		return config{}, errors.New("the time range must span at least 5 minutes")
+	}
+	if cfg.downsample1h && !cfg.downsample5m {
+		return config{}, errors.New("--downsample-1h requires --downsample-5m")
 	}
 	for _, raw := range externalLabels {
 		name, value, ok := strings.Cut(raw, "=")
@@ -564,21 +577,41 @@ func collectFiles(blockDir string) ([]metadata.File, error) {
 	return files, nil
 }
 
-func create5mBlock(ctx context.Context, output, rawID string, rawMeta *metadata.Meta) (string, error) {
+func create5mBlock(ctx context.Context, output, rawID string, rawMeta *metadata.Meta) (string, *metadata.Meta, error) {
 	rawDir := filepath.Join(output, rawID)
 	rawBlock, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(log.NewNopLogger()), rawDir, downsample.NewPool(), tsdb.DefaultPostingsDecoderFactory)
 	if err != nil {
-		return "", fmt.Errorf("open raw block for downsampling: %w", err)
+		return "", nil, fmt.Errorf("open raw block for downsampling: %w", err)
 	}
 	defer rawBlock.Close()
 
 	id, err := downsample.Downsample(ctx, log.NewNopLogger(), rawMeta, rawBlock, output, downsample.ResLevel1)
 	if err != nil {
-		return "", fmt.Errorf("downsample raw block to 5 minutes: %w", err)
+		return "", nil, fmt.Errorf("downsample raw block to 5 minutes: %w", err)
 	}
 	downsampledDir := filepath.Join(output, id.String())
-	if _, err := enrichMetadata(ctx, downsampledDir, rawMeta.Thanos.Labels, metadata.CompactorSource, downsample.ResLevel1); err != nil {
-		return "", fmt.Errorf("enrich 5m metadata: %w", err)
+	meta, err := enrichMetadata(ctx, downsampledDir, rawMeta.Thanos.Labels, metadata.CompactorSource, downsample.ResLevel1)
+	if err != nil {
+		return "", nil, fmt.Errorf("enrich 5m metadata: %w", err)
+	}
+	return id.String(), meta, nil
+}
+
+func create1hBlock(ctx context.Context, output, fiveMinuteID string, fiveMinuteMeta *metadata.Meta) (string, error) {
+	fiveMinuteDir := filepath.Join(output, fiveMinuteID)
+	fiveMinuteBlock, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(log.NewNopLogger()), fiveMinuteDir, downsample.NewPool(), tsdb.DefaultPostingsDecoderFactory)
+	if err != nil {
+		return "", fmt.Errorf("open 5m block for downsampling: %w", err)
+	}
+	defer fiveMinuteBlock.Close()
+
+	id, err := downsample.Downsample(ctx, log.NewNopLogger(), fiveMinuteMeta, fiveMinuteBlock, output, downsample.ResLevel2)
+	if err != nil {
+		return "", fmt.Errorf("downsample 5m block to 1 hour: %w", err)
+	}
+	hourlyDir := filepath.Join(output, id.String())
+	if _, err := enrichMetadata(ctx, hourlyDir, fiveMinuteMeta.Thanos.Labels, metadata.CompactorSource, downsample.ResLevel2); err != nil {
+		return "", fmt.Errorf("enrich 1h metadata: %w", err)
 	}
 	return id.String(), nil
 }

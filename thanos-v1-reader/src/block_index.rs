@@ -29,7 +29,7 @@ use crate::{
     tsdb_index::{self, Series},
 };
 
-type BoxError = Box<dyn Error>;
+type BoxError = Box<dyn Error + Send + Sync>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +251,7 @@ pub async fn build_block_index(
     let mut rows = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
     let mut metric_labels = BTreeMap::new();
+    let mut discovered = Vec::new();
 
     for repository in repositories {
         let operator = repository_operator(&repository.uri)?;
@@ -277,30 +278,44 @@ pub async fn build_block_index(
 
             let contents = operator.read(&meta_path).await?;
             let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
-            active_block_ulids.insert(meta.ulid.clone());
+            discovered.push((repository, operator.clone(), meta_path, block_path, meta));
+        }
+    }
 
-            let index_path = format!("{block_path}/index");
-            let index = operator.read(&index_path).await?;
-            let series = tsdb_index::parse(index.to_bytes().as_ref())?;
-            let series_count = series.len();
-            collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
-            let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
-            let chunk_count = chunk_rows.len();
-            let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
-            write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
+    let duplicate_blocks = duplicate_block_ids(&discovered);
+    for (repository, operator, meta_path, block_path, meta) in discovered {
+        let block_key = (repository.uri.clone(), meta.ulid.clone());
+        if duplicate_blocks.contains(&block_key) {
             tracing::debug!(
                 repository = %repository.name,
                 block_ulid = %meta.ulid,
-                block_path = %block_path,
-                index_path = %index_path,
-                chunk_index_path = %chunk_index_path,
-                series_count,
-                chunk_count,
-                "processed Thanos block into expanded chunk parquet index"
+                "skipping block superseded by compaction"
             );
-
-            rows.push(index_row(repository, meta, block_path, meta_path)?);
+            continue;
         }
+        active_block_ulids.insert(meta.ulid.clone());
+
+        let index_path = format!("{block_path}/index");
+        let index = operator.read(&index_path).await?;
+        let series = tsdb_index::parse(index.to_bytes().as_ref())?;
+        let series_count = series.len();
+        collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
+        let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
+        let chunk_count = chunk_rows.len();
+        let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
+        write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
+        tracing::debug!(
+            repository = %repository.name,
+            block_ulid = %meta.ulid,
+            block_path = %block_path,
+            index_path = %index_path,
+            chunk_index_path = %chunk_index_path,
+            series_count,
+            chunk_count,
+            "processed Thanos block into expanded chunk parquet index"
+        );
+
+        rows.push(index_row(repository, meta, block_path, meta_path)?);
     }
 
     cleanup_chunk_index_files(index_cache_location, &active_block_ulids)?;
@@ -327,6 +342,28 @@ pub async fn build_block_index(
             label_columns,
         })
         .collect())
+}
+
+fn duplicate_block_ids(
+    discovered: &[(&ThanosRepositoryConfig, Operator, String, String, BlockMeta)],
+) -> BTreeSet<(String, String)> {
+    let mut duplicates = BTreeSet::new();
+    for (repository, _, _, _, candidate) in discovered {
+        let candidate_sources = candidate.compaction.sources.iter().collect::<BTreeSet<_>>();
+        if discovered.iter().any(|(other_repository, _, _, _, other)| {
+            repository.uri == other_repository.uri
+                && candidate.ulid != other.ulid
+                && candidate.thanos.labels == other.thanos.labels
+                && candidate.thanos.downsample.resolution == other.thanos.downsample.resolution
+                && candidate_sources.len() < other.compaction.sources.len()
+                && candidate_sources
+                    .iter()
+                    .all(|source| other.compaction.sources.contains(source))
+        }) {
+            duplicates.insert((repository.uri.clone(), candidate.ulid.clone()));
+        }
+    }
+    duplicates
 }
 
 /// Return the generated block-index parquet location for a configured cache directory.

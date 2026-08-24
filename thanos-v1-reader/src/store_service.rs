@@ -31,6 +31,10 @@ use crate::{
 type BoxError = Box<dyn Error>;
 type SeriesStream = Pin<Box<dyn Stream<Item = Result<SeriesResponse, Status>> + Send>>;
 const SERIES_RESPONSE_HINTS_TYPE_URL: &str = "type.googleapis.com/hintspb.SeriesResponseHints";
+const LABEL_NAMES_RESPONSE_HINTS_TYPE_URL: &str =
+    "type.googleapis.com/hintspb.LabelNamesResponseHints";
+const LABEL_VALUES_RESPONSE_HINTS_TYPE_URL: &str =
+    "type.googleapis.com/hintspb.LabelValuesResponseHints";
 const BLOCK_ID_LABEL: &str = "__block_id";
 
 #[derive(Clone)]
@@ -141,6 +145,24 @@ impl ThanosStoreService {
             .into_values()
             .filter(|blocks| block_set_matches_series(blocks[0], series_matchers))
             .flat_map(|blocks| select_blocks(&blocks, start, end, max_resolution, block_matchers))
+            .collect()
+    }
+
+    fn label_endpoint_blocks(
+        &self,
+        start: i64,
+        end: i64,
+        series_matchers: &[Matcher],
+        block_matchers: &[Matcher],
+    ) -> Vec<&BlockMetadata> {
+        self.blocks
+            .iter()
+            .filter(|block| {
+                block.min_time <= end
+                    && start < block.max_time
+                    && block_set_matches_series(block, series_matchers)
+                    && block_matches_hints(block, block_matchers)
+            })
             .collect()
     }
 
@@ -397,17 +419,67 @@ impl Store for ThanosStoreService {
         request: Request<thanos::LabelNamesRequest>,
     ) -> Result<Response<thanos::LabelNamesResponse>, Status> {
         let request = request.into_inner();
-        reject_unsupported_label_options(&request.without_replica_labels, request.hints.is_some())?;
-        let matchers = compile_matchers(&request.matchers)?;
+        let matchers = compile_label_endpoint_matchers(&request.matchers)?;
+        let request_hints = decode_label_names_request_hints(request.hints.as_ref())?;
+        let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
+        let blocks =
+            self.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
+        let block_keys = blocks
+            .iter()
+            .map(|block| block.key())
+            .collect::<BTreeSet<_>>();
+        let external_names = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.key(),
+                    block
+                        .external_labels
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let labels_to_remove = request
+            .without_replica_labels
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let has_matchers = !matchers.is_empty();
         let names = self
-            .matching_descriptors(request.start, request.end, &matchers)
-            .into_iter()
-            .flat_map(|descriptor| descriptor.labels.keys().cloned())
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                block_keys.contains(&descriptor.block_key())
+                    && (!has_matchers
+                        || (overlaps(
+                            descriptor.chunk_mint,
+                            descriptor.chunk_maxt,
+                            request.start,
+                            request.end,
+                        ) && matches_label_endpoint_all(&descriptor.labels, &matchers)))
+            })
+            .flat_map(|descriptor| {
+                descriptor.labels.keys().filter(|name| {
+                    !labels_to_remove.contains(name)
+                        || (!has_matchers
+                            && !external_names
+                                .get(&descriptor.block_key())
+                                .is_some_and(|names| names.contains(*name)))
+                })
+            })
+            .cloned()
             .collect::<BTreeSet<_>>();
         Ok(Response::new(thanos::LabelNamesResponse {
-            names: take_limit(names, request.limit)?,
+            names: take_label_limit(names, request.limit),
             warnings: vec![],
-            hints: None,
+            hints: Some(prost_types::Any {
+                type_url: LABEL_NAMES_RESPONSE_HINTS_TYPE_URL.to_owned(),
+                value: hintspb::LabelNamesResponseHints {
+                    queried_blocks: queried_blocks(blocks),
+                }
+                .encode_to_vec(),
+            }),
         }))
     }
 
@@ -416,20 +488,53 @@ impl Store for ThanosStoreService {
         request: Request<thanos::LabelValuesRequest>,
     ) -> Result<Response<thanos::LabelValuesResponse>, Status> {
         let request = request.into_inner();
-        if request.label.is_empty() {
-            return Err(Status::invalid_argument("label must not be empty"));
+        let matchers = compile_label_endpoint_matchers(&request.matchers)?;
+        if request.without_replica_labels.contains(&request.label) {
+            return Ok(Response::new(thanos::LabelValuesResponse::default()));
         }
-        reject_unsupported_label_options(&request.without_replica_labels, request.hints.is_some())?;
-        let matchers = compile_matchers(&request.matchers)?;
-        let values = self
-            .matching_descriptors(request.start, request.end, &matchers)
-            .into_iter()
-            .filter_map(|descriptor| descriptor.labels.get(&request.label).cloned())
+        let request_hints = decode_label_values_request_hints(request.hints.as_ref())?;
+        let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
+        let blocks =
+            self.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
+        let block_keys = blocks
+            .iter()
+            .map(|block| block.key())
             .collect::<BTreeSet<_>>();
+        let has_matchers = !matchers.is_empty();
+        let mut values = self
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                block_keys.contains(&descriptor.block_key())
+                    && (!has_matchers
+                        || (overlaps(
+                            descriptor.chunk_mint,
+                            descriptor.chunk_maxt,
+                            request.start,
+                            request.end,
+                        ) && matches_label_endpoint_all(&descriptor.labels, &matchers)))
+            })
+            .filter_map(|descriptor| {
+                descriptor
+                    .labels
+                    .get(&request.label)
+                    .filter(|value| !has_matchers || !value.is_empty())
+                    .cloned()
+            })
+            .collect::<BTreeSet<_>>();
+        if !has_matchers && request.label.is_empty() && !blocks.is_empty() {
+            values.insert(String::new());
+        }
         Ok(Response::new(thanos::LabelValuesResponse {
-            values: take_limit(values, request.limit)?,
+            values: take_label_limit(values, request.limit),
             warnings: vec![],
-            hints: None,
+            hints: Some(prost_types::Any {
+                type_url: LABEL_VALUES_RESPONSE_HINTS_TYPE_URL.to_owned(),
+                value: hintspb::LabelValuesResponseHints {
+                    queried_blocks: queried_blocks(blocks),
+                }
+                .encode_to_vec(),
+            }),
         }))
     }
 }
@@ -567,6 +672,62 @@ fn decode_series_request_hints(
     })
 }
 
+fn decode_label_names_request_hints(
+    hints: Option<&prost_types::Any>,
+) -> Result<hintspb::LabelNamesRequestHints, Status> {
+    decode_label_request_hints(
+        hints,
+        "hintspb.LabelNamesRequestHints",
+        "label names",
+        |bytes| hintspb::LabelNamesRequestHints::decode(bytes),
+    )
+}
+
+fn decode_label_values_request_hints(
+    hints: Option<&prost_types::Any>,
+) -> Result<hintspb::LabelValuesRequestHints, Status> {
+    decode_label_request_hints(
+        hints,
+        "hintspb.LabelValuesRequestHints",
+        "label values",
+        |bytes| hintspb::LabelValuesRequestHints::decode(bytes),
+    )
+}
+
+fn decode_label_request_hints<T: Default>(
+    hints: Option<&prost_types::Any>,
+    expected_name: &str,
+    endpoint: &str,
+    decode: impl FnOnce(&[u8]) -> Result<T, prost::DecodeError>,
+) -> Result<T, Status> {
+    let Some(hints) = hints else {
+        return Ok(T::default());
+    };
+    let Some((_, message_name)) = hints.type_url.rsplit_once('/') else {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal {endpoint} request hints: message type url {:?} is invalid",
+            hints.type_url
+        )));
+    };
+    if message_name != expected_name {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal {endpoint} request hints: mismatched message type: got {message_name:?} want {expected_name:?}"
+        )));
+    }
+    decode(hints.value.as_slice()).map_err(|error| {
+        Status::invalid_argument(format!("unmarshal {endpoint} request hints: {error}"))
+    })
+}
+
+fn queried_blocks(blocks: Vec<&BlockMetadata>) -> Vec<hintspb::Block> {
+    blocks
+        .into_iter()
+        .map(|block| hintspb::Block {
+            id: block.block_ulid.clone(),
+        })
+        .collect()
+}
+
 fn matches_shard(labels: &[(String, String)], shard_info: Option<&thanos::ShardInfo>) -> bool {
     let Some(shard_info) = shard_info.filter(|shard| shard.total_shards >= 1) else {
         return true;
@@ -660,23 +821,22 @@ fn compare_chunks(left: Option<&Chunk>, right: Option<&Chunk>) -> i32 {
     }
 }
 
-fn reject_unsupported_label_options(
-    without_replica_labels: &[String],
-    has_hints: bool,
-) -> Result<(), Status> {
-    if has_hints || !without_replica_labels.is_empty() {
-        return Err(Status::unimplemented(
-            "opaque hints and replica-label removal are not supported",
-        ));
-    }
-    Ok(())
+fn compile_matchers(matchers: &[LabelMatcher]) -> Result<Vec<Matcher>, Status> {
+    compile_matchers_with_validation(matchers, true)
 }
 
-fn compile_matchers(matchers: &[LabelMatcher]) -> Result<Vec<Matcher>, Status> {
+fn compile_label_endpoint_matchers(matchers: &[LabelMatcher]) -> Result<Vec<Matcher>, Status> {
+    compile_matchers_with_validation(matchers, false)
+}
+
+fn compile_matchers_with_validation(
+    matchers: &[LabelMatcher],
+    validate_name: bool,
+) -> Result<Vec<Matcher>, Status> {
     matchers
         .iter()
         .map(|matcher| {
-            if matcher.name.is_empty() {
+            if validate_name && matcher.name.is_empty() {
                 return Err(Status::invalid_argument(
                     "label matcher name must not be empty",
                 ));
@@ -719,6 +879,13 @@ fn matches_all(labels: &BTreeMap<String, String>, matchers: &[Matcher]) -> bool 
     })
 }
 
+fn matches_label_endpoint_all(labels: &BTreeMap<String, String>, matchers: &[Matcher]) -> bool {
+    matchers
+        .iter()
+        .all(|matcher| !matcher_name(matcher).is_empty())
+        && matches_all(labels, matchers)
+}
+
 fn overlaps(min: i64, max: i64, start: i64, end: i64) -> bool {
     min <= end && max >= start
 }
@@ -757,9 +924,12 @@ fn limit(limit: i64) -> Result<usize, Status> {
     })
 }
 
-fn take_limit(values: BTreeSet<String>, requested_limit: i64) -> Result<Vec<String>, Status> {
-    let limit = limit(requested_limit)?;
-    Ok(values.into_iter().take(limit).collect())
+fn take_label_limit(values: BTreeSet<String>, requested_limit: i64) -> Vec<String> {
+    let limit = usize::try_from(requested_limit)
+        .ok()
+        .filter(|limit| *limit > 0)
+        .unwrap_or(usize::MAX);
+    values.into_iter().take(limit).collect()
 }
 
 const BLOCK_RESOLUTIONS: [i64; 3] = [60 * 60 * 1000, 5 * 60 * 1000, 0];

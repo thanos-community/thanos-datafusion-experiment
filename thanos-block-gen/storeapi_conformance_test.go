@@ -13,15 +13,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/types"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
+	"github.com/thanos-io/thanos/pkg/store/hintspb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -142,6 +143,10 @@ func TestThanosV1ReaderStoreAPIConformance(t *testing.T) {
 		if !equalStrings(names.Names, []string{"__name__", "i", "n", "region"}) {
 			t.Fatalf("label names = %v", names.Names)
 		}
+		var namesHints hintspb.LabelNamesResponseHints
+		if err := types.UnmarshalAny(names.Hints, &namesHints); err != nil || len(namesHints.QueriedBlocks) != 1 {
+			t.Fatalf("label names hints = %#v, err %v", names.Hints, err)
+		}
 
 		values, err := store.LabelValues(ctx, &storepb.LabelValuesRequest{
 			Label:    "n",
@@ -163,12 +168,32 @@ func TestThanosV1ReaderStoreAPIConformance(t *testing.T) {
 		if !equalStrings(limited.Values, []string{"1", "2"}) {
 			t.Fatalf("limited label values = %v", limited.Values)
 		}
+
+		withoutRegion, err := store.LabelNames(ctx, &storepb.LabelNamesRequest{
+			Start:                conformanceMinTime,
+			End:                  conformanceMaxTime,
+			Matchers:             []storepb.LabelMatcher{matcher(storepb.LabelMatcher_EQ, "n", "1")},
+			WithoutReplicaLabels: []string{"region"},
+		})
+		if err != nil || !equalStrings(withoutRegion.Names, []string{"__name__", "i", "n"}) {
+			t.Fatalf("label names without region = %v, err %v", withoutRegion.Names, err)
+		}
+
+		suppressed, err := store.LabelValues(ctx, &storepb.LabelValuesRequest{
+			Label:                "region",
+			Start:                conformanceMinTime,
+			End:                  conformanceMaxTime,
+			WithoutReplicaLabels: []string{"region"},
+		})
+		if err != nil || len(suppressed.Values) != 0 || suppressed.Hints != nil {
+			t.Fatalf("suppressed label values = %#v, err %v", suppressed, err)
+		}
 	})
 
 	t.Run("unsupported and invalid requests", func(t *testing.T) {
-		_, err := store.LabelValues(ctx, &storepb.LabelValuesRequest{Label: "", Start: conformanceMinTime, End: conformanceMaxTime})
-		if code := status.Code(err); code.String() != "InvalidArgument" {
-			t.Fatalf("empty label status = %v, want InvalidArgument", code)
+		empty, err := store.LabelValues(ctx, &storepb.LabelValuesRequest{Label: "", Start: conformanceMinTime, End: conformanceMaxTime})
+		if err != nil || !equalStrings(empty.Values, []string{""}) {
+			t.Fatalf("empty label values = %v, err %v", empty.Values, err)
 		}
 		series := querySeries(t, ctx, store, &storepb.SeriesRequest{
 			MinTime:    conformanceMinTime,

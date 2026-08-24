@@ -3,6 +3,8 @@ pub mod chunk_reader;
 pub mod config;
 pub mod flight_service;
 pub mod metric_table;
+pub mod store_service;
+pub mod thanos_proto;
 pub mod tsdb_index;
 
 use std::sync::Arc;

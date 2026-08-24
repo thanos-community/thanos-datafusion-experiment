@@ -1,16 +1,14 @@
 # Thanos v1 reader experiment
 
-This package implements [custom table provider](https://datafusion.apache.org/library-user-guide/custom-table-providers.html) for thanos storage [format](https://thanos.io/tip/thanos/storage.md/)
+This package implements a [custom table provider](https://datafusion.apache.org/library-user-guide/custom-table-providers.html) for the Thanos storage [format](https://thanos.io/tip/thanos/storage.md/).
 
-It starts by defining the objstore, which can be s3:// or file://. Underlying access pattern is using [OpenDAL](https://docs.rs/opendal/latest/opendal/) library which handles fetching, concurrency, retry, caching, etc. 
+It starts by defining the object store. The current implementation supports `file://` repositories and uses [OpenDAL](https://docs.rs/opendal/latest/opendal/) for object access.
 
 Any thanos block reader is using OpenDAL wrapper, and async via tokio. Tokio is used within datafusion, thus it's important for interoperability here.
 
-From the custom table provider goal is implementing thanos-store [API](https://github.com/thanos-io/thanos/blob/main/pkg/store/storepb/rpc.proto). Thus this rust impl could serve thanos-v1 data format...but also this code can be extended to other storage formats (e.g. [thanos-parquet-gateway](https://github.com/thanos-io/thanos-parquet-gateway) ) 
+The reader exposes the read-only Thanos [StoreAPI](https://github.com/thanos-io/thanos/blob/main/pkg/store/storepb/rpc.proto), as well as the required discovery `Info` API. It can therefore serve Thanos v1 blocks to a Thanos Query component and can be extended to other storage formats (for example, [thanos-parquet-gateway](https://github.com/thanos-io/thanos-parquet-gateway)).
 
-A minimal DataFusion-backed [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html)
-server. It is a starting point for connecting a query client to data served by a future Thanos
-reader implementation.
+A DataFusion-backed [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) SQL service remains available for direct inspection of the same data.
 
 ## Run
 
@@ -35,8 +33,8 @@ To use another configuration file, set `THANOS_READER_CONFIG`:
 THANOS_READER_CONFIG=/path/to/reader.toml cargo run
 ```
 
-The configuration contains a Flight listen address and the Thanos repositories that the reader
-will monitor and use to answer queries:
+The configuration contains the shared gRPC listen address and the Thanos repositories that the reader
+will index and use to answer queries:
 
 ```toml
 listen_addr = "127.0.0.1:50051"
@@ -82,7 +80,15 @@ FLIGHT_LISTEN_ADDR=0.0.0.0:50051 cargo run
 
 ## Query flow
 
-This scaffold implements Flight SQL statement queries. A client sends `CommandStatementQuery`
+The `listen_addr` gRPC endpoint serves all three APIs on one HTTP/2 listener:
+
+- Arrow Flight SQL (`arrow.flight.protocol.FlightService`) for statement queries.
+- Thanos StoreAPI (`thanos.Store`) for `Series`, `LabelNames`, and `LabelValues`.
+- Thanos Info API (`thanos.info.Info`) for endpoint discovery and time/label metadata.
+
+Thanos protobuf bindings are generated during the build from the vendored upstream v0.42.4 schemas in `proto/`; see `proto/README.md` for the pinned source revision.
+
+A Flight SQL client sends `CommandStatementQuery`
 through `GetFlightInfo`; the server plans it with DataFusion and returns a Flight SQL statement
 ticket. Supplying that ticket to `DoGet` streams the Arrow record batches.
 
@@ -101,6 +107,19 @@ WHERE labels['__name__'] = 'up'
   AND chunk_maxt >= 1787566290000
   AND chunk_mint <= 1787569890000
 ```
+
+## Thanos Query
+
+Configure the reader as a Thanos Query store endpoint using its gRPC address:
+
+```bash
+thanos query \
+  --endpoint=127.0.0.1:50051
+```
+
+The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR chunks. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
+
+Current limitations: the reader is read-only; it supports `file://` repositories, XOR and aggregate XOR chunks, and startup-time index construction. It does not support native histogram chunks, StoreAPI sharding, opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
 
 ## Flight SQL CLI
 

@@ -11,6 +11,8 @@ use thanos_v1_reader::{
     config::ReaderConfig,
     flight_service::DataFusionFlightService,
     index_context,
+    store_service::ThanosStoreService,
+    thanos_proto::thanos::{info::info_server::InfoServer, store_server::StoreServer},
 };
 use tokio::net::TcpListener;
 use tonic::transport::Server;
@@ -56,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.repositories,
     )
     .await?;
+    let store_service = ThanosStoreService::new(context.clone(), &config.repositories).await?;
     let service = DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
     tracing::info!(
         address = %metrics_address,
@@ -66,6 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(FlightServiceServer::new(service))
+        .add_service(StoreServer::new(store_service.clone()))
+        .add_service(InfoServer::new(store_service))
         .serve(socket_address)
         .await?;
 

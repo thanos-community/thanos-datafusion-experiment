@@ -48,8 +48,10 @@ impl FlightSqlService for DataFusionFlightService {
     async fn do_handshake(
         &self,
         _request: Request<Streaming<HandshakeRequest>>,
-    ) -> Result<Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>, Status>
-    {
+    ) -> Result<
+        Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
+        Status,
+    > {
         let response = HandshakeResponse {
             protocol_version: 0,
             payload: Default::default(),

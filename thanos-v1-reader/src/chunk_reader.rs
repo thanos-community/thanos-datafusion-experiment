@@ -16,12 +16,39 @@ pub struct Sample {
     pub timestamp: i64,
     pub value: f64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodedChunk {
+    Xor(Vec<u8>),
+    Aggregate {
+        count: Option<Vec<u8>>,
+        sum: Option<Vec<u8>>,
+        min: Option<Vec<u8>>,
+        max: Option<Vec<u8>>,
+        counter: Option<Vec<u8>>,
+    },
+}
+
+pub async fn read_encoded_chunk(
+    operator: &Operator,
+    path: &str,
+    offset: u64,
+) -> Result<EncodedChunk, io::Error> {
+    let record = read_record(operator, path, offset).await?;
+    decode_encoded_record(&record)
+}
+
 pub async fn read_samples(
     operator: &Operator,
     path: &str,
     offset: u64,
     counter_metric: bool,
 ) -> Result<Vec<Sample>, io::Error> {
+    let record = read_record(operator, path, offset).await?;
+    decode_record(&record, counter_metric)
+}
+
+async fn read_record(operator: &Operator, path: &str, offset: u64) -> Result<Vec<u8>, io::Error> {
     let prefix = operator
         .read_with(path)
         .range(offset..offset + (MAX_UVARINT_SIZE as u64) + 1)
@@ -43,10 +70,35 @@ pub async fn read_samples(
         )
         .await
         .map_err(io_error)?;
-    decode_record(record.to_bytes().as_ref(), counter_metric)
+    Ok(record.to_bytes().to_vec())
 }
 
 pub fn decode_record(record: &[u8], counter_metric: bool) -> Result<Vec<Sample>, io::Error> {
+    let (encoding, payload) = validated_payload(record)?;
+    match encoding {
+        ENCODING_XOR => decode_xor(payload),
+        ENCODING_AGGR if counter_metric => decode_aggregate_counter(payload),
+        ENCODING_AGGR => Err(invalid_data(
+            "received downsampled aggregate chunk for a non-counter metric",
+        )),
+        _ => Err(invalid_data(format!(
+            "unsupported Prometheus chunk encoding {encoding}"
+        ))),
+    }
+}
+
+pub fn decode_encoded_record(record: &[u8]) -> Result<EncodedChunk, io::Error> {
+    let (encoding, payload) = validated_payload(record)?;
+    match encoding {
+        ENCODING_XOR => Ok(EncodedChunk::Xor(payload.to_vec())),
+        ENCODING_AGGR => decode_aggregate(payload),
+        _ => Err(invalid_data(format!(
+            "unsupported Prometheus chunk encoding {encoding}"
+        ))),
+    }
+}
+
+fn validated_payload(record: &[u8]) -> Result<(u8, &[u8]), io::Error> {
     let (payload_len, length_size) = read_uvarint(record)?;
     let content_start = length_size;
     let content_end = content_start
@@ -73,16 +125,46 @@ pub fn decode_record(record: &[u8], counter_metric: bool) -> Result<Vec<Sample>,
 
     let encoding = record[content_start];
     let payload = &record[content_start + 1..content_end];
-    match encoding {
-        ENCODING_XOR => decode_xor(payload),
-        ENCODING_AGGR if counter_metric => decode_aggregate_counter(payload),
-        ENCODING_AGGR => Err(invalid_data(
-            "received downsampled aggregate chunk for a non-counter metric",
-        )),
-        _ => Err(invalid_data(format!(
-            "unsupported Prometheus chunk encoding {encoding}"
-        ))),
+    Ok((encoding, payload))
+}
+
+fn decode_aggregate(payload: &[u8]) -> Result<EncodedChunk, io::Error> {
+    let mut remaining = payload;
+    let mut slots = Vec::with_capacity(5);
+    for _ in 0..=AGGR_COUNTER_SLOT {
+        let (slot_len, length_size) = read_uvarint(remaining)?;
+        remaining = remaining
+            .get(length_size..)
+            .ok_or_else(|| invalid_data("truncated aggregate chunk slot"))?;
+        if slot_len == 0 {
+            slots.push(None);
+            continue;
+        }
+        let slot_size = slot_len
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("aggregate chunk slot length overflows usize"))?;
+        let slot_data = remaining
+            .get(..slot_size)
+            .ok_or_else(|| invalid_data("truncated aggregate chunk slot payload"))?;
+        remaining = &remaining[slot_size..];
+        if slot_data[0] != ENCODING_XOR {
+            return Err(invalid_data(format!(
+                "unsupported aggregate chunk encoding {}",
+                slot_data[0]
+            )));
+        }
+        slots.push(Some(slot_data[1..].to_vec()));
     }
+    if !remaining.is_empty() {
+        return Err(invalid_data("unexpected trailing aggregate chunk bytes"));
+    }
+    Ok(EncodedChunk::Aggregate {
+        count: slots.remove(0),
+        sum: slots.remove(0),
+        min: slots.remove(0),
+        max: slots.remove(0),
+        counter: slots.remove(0),
+    })
 }
 fn decode_aggregate_counter(payload: &[u8]) -> Result<Vec<Sample>, io::Error> {
     let mut remaining = payload;
@@ -186,6 +268,23 @@ mod tests {
                     value: 11.0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn exposes_validated_xor_payload_for_store_api() {
+        let mut record = Vec::new();
+        Chunk::new_xor(vec![XORSample {
+            timestamp: 100,
+            value: 10.0,
+        }])
+        .write(&mut record)
+        .unwrap();
+        let (payload_len, length_size) = read_uvarint(&record).unwrap();
+
+        assert_eq!(
+            decode_encoded_record(&record).unwrap(),
+            EncodedChunk::Xor(record[length_size + 1..length_size + 1 + payload_len].to_vec())
         );
     }
 

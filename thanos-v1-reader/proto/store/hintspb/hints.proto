@@ -21,6 +21,22 @@ message Block {
   string id = 1;
 }
 
+message LabelNamesRequestHints {
+  repeated thanos.LabelMatcher block_matchers = 1;
+}
+
+message LabelNamesResponseHints {
+  repeated Block queried_blocks = 1;
+}
+
+message LabelValuesRequestHints {
+  repeated thanos.LabelMatcher block_matchers = 1;
+}
+
+message LabelValuesResponseHints {
+  repeated Block queried_blocks = 1;
+}
+
 message QueryStats {
   int64 blocks_queried = 1;
   int64 merged_series_count = 2;

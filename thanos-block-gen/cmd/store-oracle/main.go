@@ -144,6 +144,9 @@ func run() error {
 	var blockMatchers stringFlags
 	var skipChunks bool
 	var hintsTypeURL string
+	var endpoint string
+	var label string
+	var seriesMatchers stringFlags
 	flag.StringVar(&bucketDir, "bucket", "", "filesystem bucket containing Thanos blocks")
 	flag.StringVar(&metric, "metric", "", "metric name to query")
 	flag.StringVar(&aggregateNames, "aggregates", "raw", "comma-separated StoreAPI aggregates")
@@ -164,9 +167,12 @@ func run() error {
 	flag.Var(&blockMatchers, "block-matcher", "block matcher in TYPE:name:value form; repeatable")
 	flag.BoolVar(&skipChunks, "skip-chunks", false, "omit chunks from Series responses")
 	flag.StringVar(&hintsTypeURL, "hints-type-url", "", "override the request hints Any type URL")
+	flag.StringVar(&endpoint, "endpoint", "series", "StoreAPI endpoint: series, label-names, or label-values")
+	flag.StringVar(&label, "label", "", "label name for the label-values endpoint")
+	flag.Var(&seriesMatchers, "series-matcher", "series matcher in TYPE:name:value form; repeatable")
 	flag.Parse()
-	if bucketDir == "" || metric == "" {
-		return fmt.Errorf("--bucket and --metric are required")
+	if bucketDir == "" || (endpoint == "series" && metric == "") {
+		return fmt.Errorf("--bucket is required; --metric is required for Series")
 	}
 
 	cacheDir, err := os.MkdirTemp("", "thanos-store-oracle-")
@@ -223,6 +229,9 @@ func run() error {
 	}
 	server := &seriesServer{ctx: context.Background()}
 	matchers := []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: metric}}
+	if endpoint != "series" {
+		matchers = nil
+	}
 	if matchLabel != "" {
 		name, value, ok := strings.Cut(matchLabel, "=")
 		if !ok || name == "" {
@@ -230,6 +239,11 @@ func run() error {
 		}
 		matchers = append(matchers, storepb.LabelMatcher{Type: storepb.LabelMatcher_EQ, Name: name, Value: value})
 	}
+	parsedSeriesMatchers, err := parseMatchers(seriesMatchers)
+	if err != nil {
+		return err
+	}
+	matchers = append(matchers, parsedSeriesMatchers...)
 	var shardInfo *storepb.ShardInfo
 	if shardEnabled {
 		shardInfo = &storepb.ShardInfo{
@@ -239,12 +253,52 @@ func run() error {
 			Labels:      splitNonEmpty(shardLabels),
 		}
 	}
-	hints, err := requestHints(hintsType, blockMatchers)
+	hints, err := requestHints(endpoint, hintsType, blockMatchers)
 	if err != nil {
 		return err
 	}
 	if hints != nil && hintsTypeURL != "" {
 		hints.TypeUrl = hintsTypeURL
+	}
+	switch endpoint {
+	case "label-names":
+		response, err := bucketStore.LabelNames(context.Background(), &storepb.LabelNamesRequest{
+			Start:                minTime,
+			End:                  maxTime,
+			Hints:                hints,
+			Matchers:             matchers,
+			WithoutReplicaLabels: splitRequestedLabels(withoutReplicaLabels),
+			Limit:                limit,
+		})
+		if err != nil {
+			return fmt.Errorf("query bucket store label names: %w", err)
+		}
+		data, err := response.Marshal()
+		if err != nil {
+			return fmt.Errorf("marshal label names response: %w", err)
+		}
+		return json.NewEncoder(os.Stdout).Encode(hex.EncodeToString(data))
+	case "label-values":
+		response, err := bucketStore.LabelValues(context.Background(), &storepb.LabelValuesRequest{
+			Label:                label,
+			Start:                minTime,
+			End:                  maxTime,
+			Hints:                hints,
+			Matchers:             matchers,
+			WithoutReplicaLabels: splitRequestedLabels(withoutReplicaLabels),
+			Limit:                limit,
+		})
+		if err != nil {
+			return fmt.Errorf("query bucket store label values: %w", err)
+		}
+		data, err := response.Marshal()
+		if err != nil {
+			return fmt.Errorf("marshal label values response: %w", err)
+		}
+		return json.NewEncoder(os.Stdout).Encode(hex.EncodeToString(data))
+	case "series":
+	default:
+		return fmt.Errorf("invalid --endpoint %q", endpoint)
 	}
 	if err := bucketStore.Series(&storepb.SeriesRequest{
 		MinTime:                 minTime,
@@ -379,7 +433,7 @@ func splitRequestedLabels(value string) []string {
 	return strings.Split(value, ",")
 }
 
-func requestHints(kind string, rawMatchers []string) (*types.Any, error) {
+func parseMatchers(rawMatchers []string) ([]storepb.LabelMatcher, error) {
 	matchers := make([]storepb.LabelMatcher, 0, len(rawMatchers))
 	for _, raw := range rawMatchers {
 		rawType, remainder, ok := strings.Cut(raw, ":")
@@ -387,7 +441,7 @@ func requestHints(kind string, rawMatchers []string) (*types.Any, error) {
 			return nil, fmt.Errorf("invalid --block-matcher %q", raw)
 		}
 		name, value, ok := strings.Cut(remainder, ":")
-		if !ok || name == "" {
+		if !ok {
 			return nil, fmt.Errorf("invalid --block-matcher %q", raw)
 		}
 		matcherType, ok := map[string]storepb.LabelMatcher_Type{
@@ -406,20 +460,54 @@ func requestHints(kind string, rawMatchers []string) (*types.Any, error) {
 			Value: value,
 		})
 	}
+	return matchers, nil
+}
+
+func requestHints(endpoint, kind string, rawMatchers []string) (*types.Any, error) {
+	matchers, err := parseMatchers(rawMatchers)
+	if err != nil {
+		return nil, err
+	}
 	switch kind {
 	case "none":
 		return nil, nil
 	case "request":
-		return types.MarshalAny(&hintspb.SeriesRequestHints{BlockMatchers: matchers})
+		switch endpoint {
+		case "series":
+			return types.MarshalAny(&hintspb.SeriesRequestHints{BlockMatchers: matchers})
+		case "label-names":
+			return types.MarshalAny(&hintspb.LabelNamesRequestHints{BlockMatchers: matchers})
+		case "label-values":
+			return types.MarshalAny(&hintspb.LabelValuesRequestHints{BlockMatchers: matchers})
+		default:
+			return nil, fmt.Errorf("invalid --endpoint %q", endpoint)
+		}
 	case "response":
-		return types.MarshalAny(&hintspb.SeriesResponseHints{})
+		switch endpoint {
+		case "series":
+			return types.MarshalAny(&hintspb.SeriesResponseHints{})
+		case "label-names":
+			return types.MarshalAny(&hintspb.LabelNamesResponseHints{})
+		case "label-values":
+			return types.MarshalAny(&hintspb.LabelValuesResponseHints{})
+		default:
+			return nil, fmt.Errorf("invalid --endpoint %q", endpoint)
+		}
 	case "unknown":
-		return &types.Any{TypeUrl: "type.googleapis.com/unknown.SeriesRequestHints"}, nil
+		return &types.Any{TypeUrl: "type.googleapis.com/unknown.RequestHints"}, nil
 	case "invalid-url":
-		return &types.Any{TypeUrl: "hintspb.SeriesRequestHints"}, nil
+		return &types.Any{TypeUrl: "hintspb.RequestHints"}, nil
 	case "malformed":
+		messageName := map[string]string{
+			"series":       "SeriesRequestHints",
+			"label-names":  "LabelNamesRequestHints",
+			"label-values": "LabelValuesRequestHints",
+		}[endpoint]
+		if messageName == "" {
+			return nil, fmt.Errorf("invalid --endpoint %q", endpoint)
+		}
 		return &types.Any{
-			TypeUrl: "type.googleapis.com/hintspb.SeriesRequestHints",
+			TypeUrl: "type.googleapis.com/hintspb." + messageName,
 			Value:   []byte{0xff},
 		}, nil
 	default:

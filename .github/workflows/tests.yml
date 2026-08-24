@@ -1,0 +1,82 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-tests:
+    name: Go tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: thanos-block-gen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: thanos-block-gen/go.mod
+          cache: true
+          cache-dependency-path: thanos-block-gen/go.sum
+      - run: go test ./...
+
+  rust-unit-tests:
+    name: Rust unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: thanos-v1-reader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            thanos-v1-reader/target
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('thanos-v1-reader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-unit-
+      - run: cargo test --lib
+      - run: cargo test --bin thanos-v1-reader
+
+  rust-e2e-tests:
+    name: Rust end-to-end tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: thanos-v1-reader
+    env:
+      OTEL_SDK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: thanos-block-gen/go.mod
+          cache: true
+          cache-dependency-path: thanos-block-gen/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            thanos-v1-reader/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('thanos-v1-reader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+      - run: cargo test --test counter_parity

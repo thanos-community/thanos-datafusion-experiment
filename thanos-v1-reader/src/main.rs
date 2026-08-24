@@ -1,12 +1,13 @@
 mod block_index;
 mod config;
 mod flight_service;
+mod tsdb_index;
 
 use std::{env, net::SocketAddr};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use axum::{Router, extract::State, routing::get};
-use block_index::{block_index_file_path, build_block_index};
+use block_index::{block_index_file_path, build_block_index, chunk_index_directory_path};
 use config::ReaderConfig;
 use datafusion::{
     execution::SessionStateBuilder,
@@ -50,12 +51,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     build_block_index(&config.repositories, &config.index_cache_location).await?;
     let block_index_path = block_index_file_path(&config.index_cache_location);
+    let chunk_index_path = chunk_index_directory_path(&config.index_cache_location);
     tracing::info!(
         path = %block_index_path,
-        "generated Thanos block index"
+        "generated Thanos blocks index"
     );
+    tracing::info!(path = %chunk_index_path, "generated Thanos chunks indexes");
 
-    let context = block_index_context(&block_index_path).await?;
+    let context = index_context(&block_index_path, &chunk_index_path).await?;
     let service = DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
     tracing::info!(
         address = %metrics_address,
@@ -111,8 +114,9 @@ async fn prometheus_metrics(State(handle): State<PrometheusHandle>) -> String {
     handle.render()
 }
 
-async fn block_index_context(
+async fn index_context(
     block_index_path: &str,
+    chunk_index_path: &str,
 ) -> Result<SessionContext, datafusion::error::DataFusionError> {
     let execution_options = InstrumentationOptions::builder()
         .record_metrics(true)
@@ -130,11 +134,10 @@ async fn block_index_context(
     );
     let context = SessionContext::new_with_state(session_state);
     context
-        .register_parquet(
-            "block_index",
-            block_index_path,
-            ParquetReadOptions::default(),
-        )
+        .register_parquet("blocks", block_index_path, ParquetReadOptions::default())
+        .await?;
+    context
+        .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
         .await?;
     Ok(context)
 }

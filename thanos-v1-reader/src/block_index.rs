@@ -1,9 +1,9 @@
-use std::{collections::BTreeMap, error::Error, io, path::Path, sync::Arc};
+use std::{collections::BTreeMap, error::Error, fs, io, path::Path, sync::Arc};
 
 use arrow::{
     array::{
         ArrayRef, Int32Array, Int64Array, ListBuilder, MapBuilder, StringArray, StringBuilder,
-        UInt64Array,
+        UInt32Array, UInt64Array,
     },
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
@@ -15,9 +15,13 @@ use opendal::{
     services::Fs,
 };
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ThanosRepositoryConfig;
+use crate::{
+    config::ThanosRepositoryConfig,
+    tsdb_index::{self, Series},
+};
 
 type BoxError = Box<dyn Error>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
@@ -124,6 +128,25 @@ struct BlockIndexRow {
     files: String,
 }
 
+#[derive(Debug)]
+struct ChunkIndexRow {
+    repository_name: String,
+    repository_uri: String,
+    block_ulid: String,
+    block_path: String,
+    chunk_file_path: String,
+    chunk_ref: u64,
+    chunk_file_seq: u32,
+    chunk_file_offset: u64,
+    series_ref: u64,
+    series_mint: i64,
+    series_maxt: i64,
+    chunk_mint: i64,
+    chunk_maxt: i64,
+    labels: BTreeMap<String, String>,
+    labels_json: String,
+}
+
 /// Rebuild the block index from all configured repositories and write it through OpenDAL.
 pub async fn build_block_index(
     repositories: &[ThanosRepositoryConfig],
@@ -157,6 +180,13 @@ pub async fn build_block_index(
             let contents = operator.read(&meta_path).await?;
             let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
 
+            let index_path = format!("{block_path}/index");
+            let index = operator.read(&index_path).await?;
+            let series = tsdb_index::parse(index.to_bytes().as_ref())?;
+            let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
+            let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
+            write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
+
             rows.push(index_row(repository, meta, block_path, meta_path)?);
         }
     }
@@ -174,7 +204,7 @@ pub async fn build_block_index(
             ))
     });
 
-    let bytes = parquet_bytes(rows)?;
+    let bytes = block_parquet_bytes(rows)?;
     write_local_file(&block_index_file_path(index_cache_location), bytes).await?;
     Ok(())
 }
@@ -186,6 +216,29 @@ pub fn block_index_file_path(index_cache_location: &str) -> String {
         .unwrap_or(index_cache_location);
     Path::new(location)
         .join("block_index.parquet")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Return the generated per-block expanded chunk-index parquet location.
+pub fn chunk_index_file_path(index_cache_location: &str, block_ulid: &str) -> String {
+    let location = index_cache_location
+        .strip_prefix("file://")
+        .unwrap_or(index_cache_location);
+    Path::new(location)
+        .join("indexes")
+        .join(format!("{block_ulid}.parquet"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Return the generated expanded chunk-index directory for a configured cache directory.
+pub fn chunk_index_directory_path(index_cache_location: &str) -> String {
+    let location = index_cache_location
+        .strip_prefix("file://")
+        .unwrap_or(index_cache_location);
+    Path::new(location)
+        .join("indexes")
         .to_string_lossy()
         .into_owned()
 }
@@ -241,19 +294,84 @@ fn index_row(
     })
 }
 
-fn parquet_bytes(rows: Vec<BlockIndexRow>) -> Result<Vec<u8>, BoxError> {
-    let schema = schema();
-    let batch = record_batch(&schema, &rows)?;
+fn chunk_rows(
+    repository: &ThanosRepositoryConfig,
+    meta: &BlockMeta,
+    block_path: &str,
+    series: Vec<Series>,
+) -> Result<Vec<ChunkIndexRow>, BoxError> {
+    let mut rows = Vec::new();
+    for series in series {
+        let series_mint = series
+            .chunks
+            .first()
+            .map(|chunk| chunk.mint)
+            .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+        let series_maxt = series
+            .chunks
+            .last()
+            .map(|chunk| chunk.maxt)
+            .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+        let labels_json = serde_json::to_string(&series.labels)?;
+
+        for chunk in series.chunks {
+            let chunk_file_seq = (chunk.reference >> 32) as u32;
+            let chunk_file_offset = chunk.reference & u64::from(u32::MAX);
+            rows.push(ChunkIndexRow {
+                repository_name: repository.name.clone(),
+                repository_uri: repository.uri.clone(),
+                block_ulid: meta.ulid.clone(),
+                block_path: block_path.to_owned(),
+                chunk_file_path: format!("{block_path}/chunks/{chunk_file_seq:06}"),
+                chunk_ref: chunk.reference,
+                chunk_file_seq,
+                chunk_file_offset,
+                series_ref: series.reference,
+                series_mint,
+                series_maxt,
+                chunk_mint: chunk.mint,
+                chunk_maxt: chunk.maxt,
+                labels: series.labels.clone(),
+                labels_json: labels_json.clone(),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+fn block_parquet_bytes(rows: Vec<BlockIndexRow>) -> Result<Vec<u8>, BoxError> {
+    let schema = block_schema();
+    let batch = block_record_batch(&schema, &rows)?;
+    parquet_bytes(schema, batch)
+}
+
+fn chunk_parquet_bytes(rows: Vec<ChunkIndexRow>) -> Result<Vec<u8>, BoxError> {
+    let schema = chunk_schema();
+    let batch = chunk_record_batch(&schema, &rows)?;
+    parquet_bytes(schema, batch)
+}
+
+fn parquet_bytes(schema: Arc<Schema>, batch: RecordBatch) -> Result<Vec<u8>, BoxError> {
     let mut bytes = Vec::new();
     {
-        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None)?;
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(parquet_properties()))?;
         writer.write(&batch)?;
         writer.close()?;
     }
     Ok(bytes)
 }
 
-fn schema() -> Arc<Schema> {
+fn parquet_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_write_page_header_statistics(true)
+        .set_statistics_truncate_length(None)
+        .set_column_index_truncate_length(None)
+        .set_max_row_group_row_count(Some(usize::MAX))
+        .build()
+}
+
+fn block_schema() -> Arc<Schema> {
     let string_field = Arc::new(Field::new("item", DataType::Utf8, true));
     let map_entries = Arc::new(Field::new(
         "entries",
@@ -300,7 +418,10 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-fn record_batch(schema: &Arc<Schema>, rows: &[BlockIndexRow]) -> Result<RecordBatch, BoxError> {
+fn block_record_batch(
+    schema: &Arc<Schema>,
+    rows: &[BlockIndexRow],
+) -> Result<RecordBatch, BoxError> {
     let mut labels = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
     let mut sources = ListBuilder::new(StringBuilder::new());
 
@@ -428,6 +549,116 @@ fn record_batch(schema: &Arc<Schema>, rows: &[BlockIndexRow]) -> Result<RecordBa
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
+fn chunk_schema() -> Arc<Schema> {
+    let map_entries = Arc::new(Field::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new("keys", DataType::Utf8, false)),
+                Arc::new(Field::new("values", DataType::Utf8, true)),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+
+    Arc::new(Schema::new(vec![
+        Field::new("repository_name", DataType::Utf8, false),
+        Field::new("repository_uri", DataType::Utf8, false),
+        Field::new("block_ulid", DataType::Utf8, false),
+        Field::new("block_path", DataType::Utf8, false),
+        Field::new("chunk_file_path", DataType::Utf8, false),
+        Field::new("chunk_ref", DataType::UInt64, false),
+        Field::new("chunk_file_seq", DataType::UInt32, false),
+        Field::new("chunk_file_offset", DataType::UInt64, false),
+        Field::new("series_ref", DataType::UInt64, false),
+        Field::new("series_mint", DataType::Int64, false),
+        Field::new("series_maxt", DataType::Int64, false),
+        Field::new("chunk_mint", DataType::Int64, false),
+        Field::new("chunk_maxt", DataType::Int64, false),
+        Field::new("labels", DataType::Map(map_entries, false), false),
+        Field::new("labels_json", DataType::Utf8, false),
+    ]))
+}
+
+fn chunk_record_batch(
+    schema: &Arc<Schema>,
+    rows: &[ChunkIndexRow],
+) -> Result<RecordBatch, BoxError> {
+    let mut labels = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for row in rows {
+        for (name, value) in &row.labels {
+            labels.keys().append_value(name);
+            labels.values().append_value(value);
+        }
+        labels.append(true)?;
+    }
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.repository_name.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.repository_uri.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.block_ulid.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.block_path.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.chunk_file_path.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            rows.iter().map(|row| row.chunk_ref).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter()
+                .map(|row| row.chunk_file_seq)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            rows.iter()
+                .map(|row| row.chunk_file_offset)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            rows.iter().map(|row| row.series_ref).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.series_mint).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.series_maxt).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.chunk_mint).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.chunk_maxt).collect::<Vec<_>>(),
+        )),
+        Arc::new(labels.finish()),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.labels_json.as_str())
+                .collect::<Vec<_>>(),
+        )),
+    ];
+
+    Ok(RecordBatch::try_new(schema.clone(), columns)?)
+}
+
 fn repository_operator(uri: &str) -> Result<Operator, BoxError> {
     let root = uri
         .strip_prefix("file://")
@@ -457,6 +688,9 @@ async fn write_local_file(path: &str, bytes: Vec<u8>) -> Result<(), BoxError> {
     let file_name = path
         .file_name()
         .ok_or_else(|| invalid_data(format!("invalid block index path {path:?}")))?;
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
     let builder = Fs::default().root(parent.map(Path::to_string_lossy).as_deref().unwrap_or("."));
     let operator = Operator::new(builder)?
         .layer(MetricsLayer::new())
@@ -469,4 +703,54 @@ async fn write_local_file(path: &str, bytes: Vec<u8>) -> Result<(), BoxError> {
 
 fn invalid_data(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+
+    #[test]
+    fn chunk_parquet_contains_row_group_statistics_and_page_indexes() {
+        let row = ChunkIndexRow {
+            repository_name: "repository".to_owned(),
+            repository_uri: "file:///repository".to_owned(),
+            block_ulid: "01M0SQFT00EQ1D78Q8Y8EFD0BZ".to_owned(),
+            block_path: "01M0SQFT00EQ1D78Q8Y8EFD0BZ".to_owned(),
+            chunk_file_path: "01M0SQFT00EQ1D78Q8Y8EFD0BZ/chunks/000001".to_owned(),
+            chunk_ref: (1 << 32) + 8,
+            chunk_file_seq: 1,
+            chunk_file_offset: 8,
+            series_ref: 16,
+            series_mint: 100,
+            series_maxt: 200,
+            chunk_mint: 100,
+            chunk_maxt: 200,
+            labels: BTreeMap::from([
+                ("__name__".to_owned(), "up".to_owned()),
+                ("job".to_owned(), "reader".to_owned()),
+            ]),
+            labels_json: r#"{"__name__":"up","job":"reader"}"#.to_owned(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "thanos-v1-reader-chunk-index-{}.parquet",
+            std::process::id()
+        ));
+        fs::write(&path, chunk_parquet_bytes(vec![row]).unwrap()).unwrap();
+
+        let file = fs::File::open(&path).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&file)
+            .unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(metadata.file_metadata().num_rows(), 1);
+        assert_eq!(metadata.num_row_groups(), 1);
+        assert!(metadata.column_index().is_some());
+        assert!(metadata.offset_index().is_some());
+        for column in metadata.row_group(0).columns() {
+            assert!(column.statistics().is_some(), "{column:?}");
+        }
+    }
 }

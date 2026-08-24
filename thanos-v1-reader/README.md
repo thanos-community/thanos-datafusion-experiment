@@ -49,8 +49,16 @@ uri = "file://../thanos-block-gen/target"
 ```
 
 Each repository needs a non-empty `name` and `uri`. The reader uses OpenDAL for repository
-access. Before accepting requests, it scans all repository `meta.json` files and writes a single
-Parquet block index to `block_index.parquet` under `index_cache_location`.
+access. Before accepting requests, it scans all repository `meta.json` and `index` files and
+writes:
+
+- `block_index.parquet` under `index_cache_location`, exposed as the `blocks` table.
+- `indexes/<block_ulid>.parquet` under `index_cache_location`, exposed together as the `chunks`
+  table. Each row represents one Prometheus chunk and includes its time range, series labels,
+  segment file path, and byte offset.
+
+The writer emits Parquet row-group min/max statistics and page-level column indexes. Each
+generated file has a single row group, so its row-group statistics cover the whole file.
 
 The Prometheus scrape endpoint listens on `metrics_listen_addr` and serves metrics at
 `/metrics`. OpenDAL operations are recorded with OpenDAL's metrics layer and traced with its
@@ -78,12 +86,20 @@ This scaffold implements Flight SQL statement queries. A client sends `CommandSt
 through `GetFlightInfo`; the server plans it with DataFusion and returns a Flight SQL statement
 ticket. Supplying that ticket to `DoGet` streams the Arrow record batches.
 
-At startup, the server registers the generated `block_index` Parquet file:
+At startup, the server registers the generated `blocks` and `chunks` Parquet tables:
 
 ```sql
 SELECT block_ulid, min_time, max_time, downsample_resolution
-FROM block_index
+FROM blocks
 WHERE external_labels_map['cluster'] = 'dummy'
+```
+
+```sql
+SELECT chunk_file_path, chunk_file_offset, chunk_mint, chunk_maxt, labels
+FROM chunks
+WHERE labels['__name__'] = 'up'
+  AND chunk_maxt >= 1787566290000
+  AND chunk_mint <= 1787569890000
 ```
 
 ## Flight SQL CLI

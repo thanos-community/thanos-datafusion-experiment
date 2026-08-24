@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [[test]]
-name = "counter_parity"
-path = "e2e/counter_parity.rs"
+name = "e2e"
+path = "e2e/e2e.rs"
 
 [dependencies]
 arrow = "58.4.0"

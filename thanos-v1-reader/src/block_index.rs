@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, error::Error, fs, io, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fs, io,
+    path::Path,
+    sync::Arc,
+};
 
 use arrow::{
     array::{
@@ -153,6 +159,7 @@ pub async fn build_block_index(
     index_cache_location: &str,
 ) -> Result<(), BoxError> {
     let mut rows = Vec::new();
+    let mut active_block_ulids = BTreeSet::new();
 
     for repository in repositories {
         let operator = repository_operator(&repository.uri)?;
@@ -179,17 +186,32 @@ pub async fn build_block_index(
 
             let contents = operator.read(&meta_path).await?;
             let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
+            active_block_ulids.insert(meta.ulid.clone());
 
             let index_path = format!("{block_path}/index");
             let index = operator.read(&index_path).await?;
             let series = tsdb_index::parse(index.to_bytes().as_ref())?;
+            let series_count = series.len();
             let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
+            let chunk_count = chunk_rows.len();
             let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
             write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
+            tracing::debug!(
+                repository = %repository.name,
+                block_ulid = %meta.ulid,
+                block_path = %block_path,
+                index_path = %index_path,
+                chunk_index_path = %chunk_index_path,
+                series_count,
+                chunk_count,
+                "processed Thanos block into expanded chunk parquet index"
+            );
 
             rows.push(index_row(repository, meta, block_path, meta_path)?);
         }
     }
+
+    cleanup_chunk_index_files(index_cache_location, &active_block_ulids)?;
 
     rows.sort_by(|left, right| {
         (
@@ -241,6 +263,41 @@ pub fn chunk_index_directory_path(index_cache_location: &str) -> String {
         .join("indexes")
         .to_string_lossy()
         .into_owned()
+}
+
+fn cleanup_chunk_index_files(
+    index_cache_location: &str,
+    active_block_ulids: &BTreeSet<String>,
+) -> Result<(), BoxError> {
+    let directory = chunk_index_directory_path(index_cache_location);
+    let directory = Path::new(&directory);
+    if !directory.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("parquet")
+        {
+            continue;
+        }
+        let Some(block_ulid) = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if active_block_ulids.contains(&block_ulid) {
+            continue;
+        }
+
+        fs::remove_file(&path)?;
+        tracing::debug!(path = %path.display(), block_ulid, "removed stale chunk index cache file");
+    }
+    Ok(())
 }
 
 fn index_row(
@@ -752,5 +809,31 @@ mod tests {
         for column in metadata.row_group(0).columns() {
             assert!(column.statistics().is_some(), "{column:?}");
         }
+    }
+
+    #[test]
+    fn cleanup_removes_only_inactive_chunk_indexes() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "thanos-v1-reader-index-cache-{}",
+            std::process::id()
+        ));
+        let indexes = cache_root.join("indexes");
+        fs::create_dir_all(&indexes).unwrap();
+        let active = "01M0SQFT00EQ1D78Q8Y8EFD0BZ";
+        let stale = "01M0SQFSN27VV8YR0RMQE3ETG7";
+        fs::write(indexes.join(format!("{active}.parquet")), []).unwrap();
+        fs::write(indexes.join(format!("{stale}.parquet")), []).unwrap();
+        fs::write(indexes.join("notes.txt"), []).unwrap();
+
+        cleanup_chunk_index_files(
+            cache_root.to_str().unwrap(),
+            &BTreeSet::from([active.to_owned()]),
+        )
+        .unwrap();
+
+        assert!(indexes.join(format!("{active}.parquet")).exists());
+        assert!(!indexes.join(format!("{stale}.parquet")).exists());
+        assert!(indexes.join("notes.txt").exists());
+        fs::remove_dir_all(cache_root).unwrap();
     }
 }

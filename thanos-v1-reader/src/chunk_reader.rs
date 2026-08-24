@@ -3,7 +3,9 @@ use std::io;
 use crc::{CRC_32_ISCSI, Crc};
 use rusty_chunkenc::xor::{XORChunk, read_xor_chunk_data};
 
+use crate::histogram::{HistogramSample, decode_float_histogram, decode_histogram};
 use crate::storage::RangeReader;
+
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const ENCODING_XOR: u8 = 1;
 const ENCODING_HISTOGRAM: u8 = 2;
@@ -17,6 +19,34 @@ const AGGR_COUNTER_SLOT: usize = 4;
 pub struct Sample {
     pub timestamp: i64,
     pub value: f64,
+    pub histogram: Option<HistogramSample>,
+    pub aggregate: SampleAggregate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateSelection {
+    Count,
+    Sum,
+    Counter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleAggregate {
+    Raw,
+    Count,
+    Sum,
+    Counter,
+}
+
+impl SampleAggregate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Counter => "counter",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +90,10 @@ pub async fn read_samples(
     path: &str,
     offset: u64,
     counter_metric: bool,
+    aggregate: Option<AggregateSelection>,
 ) -> Result<Vec<Sample>, io::Error> {
     let record = read_record(reader, path, offset).await?;
-    decode_record(&record, counter_metric)
+    decode_query_record(&record, counter_metric, aggregate)
 }
 
 async fn read_record(reader: &dyn RangeReader, path: &str, offset: u64) -> Result<Vec<u8>, io::Error> {
@@ -75,7 +106,7 @@ async fn read_record(reader: &dyn RangeReader, path: &str, offset: u64) -> Resul
         .and_then(|size| size.checked_add(payload_len))
         .and_then(|size| size.checked_add(CRC_SIZE))
         .ok_or_else(|| invalid_data("chunk record length overflows usize"))?;
-    let record = reader
+    reader
         .read_range(
             path,
             offset
@@ -83,18 +114,26 @@ async fn read_record(reader: &dyn RangeReader, path: &str, offset: u64) -> Resul
                     + u64::try_from(record_len)
                         .map_err(|_| invalid_data("chunk record length overflows u64"))?,
         )
-        .await?;
-    Ok(record)
+        .await
 }
 
 pub fn decode_record(record: &[u8], counter_metric: bool) -> Result<Vec<Sample>, io::Error> {
+    decode_query_record(record, counter_metric, None)
+}
+
+pub fn decode_query_record(
+    record: &[u8],
+    counter_metric: bool,
+    aggregate: Option<AggregateSelection>,
+) -> Result<Vec<Sample>, io::Error> {
     let (encoding, payload) = validated_payload(record)?;
     match encoding {
         ENCODING_XOR => decode_xor(payload),
-        ENCODING_AGGR if counter_metric => decode_aggregate_counter(payload),
-        ENCODING_AGGR => Err(invalid_data(
-            "received downsampled aggregate chunk for a non-counter metric",
-        )),
+        ENCODING_HISTOGRAM => histogram_samples(decode_histogram(payload)?, SampleAggregate::Raw),
+        ENCODING_FLOAT_HISTOGRAM => {
+            histogram_samples(decode_float_histogram(payload)?, SampleAggregate::Raw)
+        }
+        ENCODING_AGGR => decode_aggregate_samples(payload, counter_metric, aggregate),
         _ => Err(invalid_data(format!(
             "unsupported Prometheus chunk encoding {encoding}"
         ))),
@@ -189,38 +228,76 @@ fn decode_aggregate(payload: &[u8]) -> Result<EncodedChunk, io::Error> {
         counter: slots.remove(0),
     })
 }
-fn decode_aggregate_counter(payload: &[u8]) -> Result<Vec<Sample>, io::Error> {
-    let mut remaining = payload;
-    for slot in 0..=AGGR_COUNTER_SLOT {
-        let (slot_len, length_size) = read_uvarint(remaining)?;
-        remaining = remaining
-            .get(length_size..)
-            .ok_or_else(|| invalid_data("truncated aggregate chunk slot"))?;
-        if slot_len == 0 {
-            if slot == AGGR_COUNTER_SLOT {
-                return Ok(Vec::new());
-            }
-            continue;
-        }
-        let slot_size = slot_len
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("aggregate chunk slot length overflows usize"))?;
-        let slot_data = remaining
-            .get(..slot_size)
-            .ok_or_else(|| invalid_data("truncated aggregate chunk slot payload"))?;
-        remaining = &remaining[slot_size..];
-        if slot != AGGR_COUNTER_SLOT {
-            continue;
-        }
-        if slot_data[0] != ENCODING_XOR {
-            return Err(invalid_data(format!(
-                "unsupported aggregate counter chunk encoding {}",
-                slot_data[0]
-            )));
-        }
-        return decode_xor(&slot_data[1..]);
+fn decode_aggregate_samples(
+    payload: &[u8],
+    counter_metric: bool,
+    aggregate: Option<AggregateSelection>,
+) -> Result<Vec<Sample>, io::Error> {
+    let selected = aggregate.unwrap_or(AggregateSelection::Counter);
+    let encoded = decode_aggregate(payload)?;
+    let EncodedChunk::Aggregate {
+        count,
+        sum,
+        counter,
+        ..
+    } = encoded
+    else {
+        unreachable!("aggregate decoder returns an aggregate chunk");
+    };
+    let chunk = match selected {
+        AggregateSelection::Count => count,
+        AggregateSelection::Sum => sum,
+        AggregateSelection::Counter => counter,
     }
-    unreachable!("the counter slot is always visited");
+    .ok_or_else(|| invalid_data(format!("aggregate {} does not exist", selected.as_str())))?;
+    let sample_aggregate = match selected {
+        AggregateSelection::Count => SampleAggregate::Count,
+        AggregateSelection::Sum => SampleAggregate::Sum,
+        AggregateSelection::Counter => SampleAggregate::Counter,
+    };
+    match chunk.encoding {
+        EncodedAggregateEncoding::Xor if aggregate.is_none() && !counter_metric => Err(
+            invalid_data("received downsampled aggregate chunk for a non-counter metric"),
+        ),
+        EncodedAggregateEncoding::Xor => {
+            let mut samples = decode_xor(&chunk.data)?;
+            for sample in &mut samples {
+                sample.aggregate = sample_aggregate;
+            }
+            Ok(samples)
+        }
+        EncodedAggregateEncoding::Histogram => {
+            histogram_samples(decode_histogram(&chunk.data)?, sample_aggregate)
+        }
+        EncodedAggregateEncoding::FloatHistogram => {
+            histogram_samples(decode_float_histogram(&chunk.data)?, sample_aggregate)
+        }
+    }
+}
+
+impl AggregateSelection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Counter => "counter",
+        }
+    }
+}
+
+fn histogram_samples(
+    histograms: Vec<HistogramSample>,
+    aggregate: SampleAggregate,
+) -> Result<Vec<Sample>, io::Error> {
+    Ok(histograms
+        .into_iter()
+        .map(|histogram| Sample {
+            timestamp: histogram.timestamp,
+            value: f64::NAN,
+            histogram: Some(histogram),
+            aggregate,
+        })
+        .collect())
 }
 
 fn decode_xor(payload: &[u8]) -> Result<Vec<Sample>, io::Error> {
@@ -236,6 +313,8 @@ fn samples_from_xor(chunk: XORChunk) -> Result<Vec<Sample>, io::Error> {
         .map(|sample| Sample {
             timestamp: sample.timestamp,
             value: sample.value,
+            histogram: None,
+            aggregate: SampleAggregate::Raw,
         })
         .collect())
 }
@@ -281,11 +360,15 @@ mod tests {
             vec![
                 Sample {
                     timestamp: 100,
-                    value: 10.0
+                    value: 10.0,
+                    histogram: None,
+                    aggregate: SampleAggregate::Raw,
                 },
                 Sample {
                     timestamp: 200,
-                    value: 11.0
+                    value: 11.0,
+                    histogram: None,
+                    aggregate: SampleAggregate::Raw,
                 },
             ]
         );
@@ -346,7 +429,9 @@ mod tests {
             decode_record(&aggregate_record, true).unwrap(),
             vec![Sample {
                 timestamp: 300,
-                value: 42.0
+                value: 42.0,
+                histogram: None,
+                aggregate: SampleAggregate::Counter,
             }]
         );
     }

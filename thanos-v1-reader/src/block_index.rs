@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::ThanosRepositoryConfig;
 
 type BoxError = Box<dyn Error>;
+const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
 
 #[derive(Debug, Deserialize)]
 struct BlockMeta {
@@ -140,12 +141,21 @@ pub async fn build_block_index(
             }
 
             let meta_path = entry.path().to_owned();
-            let contents = operator.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
             let block_path = meta_path
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
+            if block_has_deletion_mark(&operator, &block_path).await? {
+                tracing::debug!(
+                    repository = %repository.name,
+                    block_path = %block_path,
+                    "skipping deleted Thanos block"
+                );
+                continue;
+            }
+
+            let contents = operator.read(&meta_path).await?;
+            let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
 
             rows.push(index_row(repository, meta, block_path, meta_path)?);
         }
@@ -426,6 +436,16 @@ fn repository_operator(uri: &str) -> Result<Operator, BoxError> {
     Ok(Operator::new(builder)?
         .layer(MetricsLayer::new())
         .layer(OtelTraceLayer::new()))
+}
+
+async fn block_has_deletion_mark(operator: &Operator, block_path: &str) -> Result<bool, BoxError> {
+    let deletion_mark_path = if block_path.is_empty() {
+        DELETION_MARK_FILE_NAME.to_owned()
+    } else {
+        format!("{block_path}/{DELETION_MARK_FILE_NAME}")
+    };
+
+    Ok(operator.exists(&deletion_mark_path).await?)
 }
 
 async fn write_local_file(path: &str, bytes: Vec<u8>) -> Result<(), BoxError> {

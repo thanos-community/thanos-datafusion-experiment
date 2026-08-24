@@ -153,6 +153,8 @@ as `hintspb.SeriesResponseHints`.
 `LabelNames` and `LabelValues` support matcher and time filtering, sorted limits,
 `without_replica_labels`, block request hints, and queried-block response hints with BucketStore
 semantics across every overlapping resolution.
+`Info` reports the loaded store's external label sets, global time range, merged per-TSDB ranges,
+and the sharding and replica-label capabilities implemented by the reader.
 
 Current limitations: the reader is read-only; it supports file, S3, and GCS repositories; raw XOR/native-histogram chunks; aggregate XOR chunks; native-histogram aggregate slots; and startup-time index construction. It does not support projection hints and does not refresh the block index while running.
 

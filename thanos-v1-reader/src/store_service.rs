@@ -159,36 +159,44 @@ impl ThanosStoreService {
     }
 
     fn info_response(&self) -> info::InfoResponse {
-        let mut ranges = BTreeMap::<Vec<(String, String)>, (i64, i64)>::new();
+        let mut ranges = BTreeMap::<Vec<(String, String)>, Vec<(i64, i64)>>::new();
         for block in self.blocks.iter() {
             let key = labels_key(&block.external_labels);
             ranges
                 .entry(key)
-                .and_modify(|range| {
-                    range.0 = range.0.min(block.min_time);
-                    range.1 = range.1.max(block.max_time);
-                })
-                .or_insert((block.min_time, block.max_time));
+                .or_default()
+                .push((block.min_time, block.max_time));
         }
 
-        let tsdb_infos = ranges
+        let mut tsdb_infos = Vec::new();
+        for (labels, block_ranges) in &mut ranges {
+            block_ranges.sort_by_key(|(min_time, _)| *min_time);
+            let mut ranges = block_ranges.iter().copied();
+            let Some(mut current) = ranges.next() else {
+                continue;
+            };
+            for next in ranges {
+                if next.0 > current.1 {
+                    tsdb_infos.push(tsdb_info(labels, current));
+                    current = next;
+                } else {
+                    current.1 = next.1;
+                }
+            }
+            tsdb_infos.push(tsdb_info(labels, current));
+        }
+        let min_time = self
+            .blocks
             .iter()
-            .map(|(labels, (min_time, max_time))| info::TsdbInfo {
-                labels: Some(thanos::ZLabelSet {
-                    labels: labels
-                        .iter()
-                        .map(|(name, value)| Label {
-                            name: name.clone(),
-                            value: value.clone(),
-                        })
-                        .collect(),
-                }),
-                min_time: *min_time,
-                max_time: *max_time,
-            })
-            .collect::<Vec<_>>();
-        let min_time = ranges.values().map(|(min, _)| *min).min().unwrap_or(0);
-        let max_time = ranges.values().map(|(_, max)| *max).max().unwrap_or(0);
+            .map(|block| block.min_time)
+            .min()
+            .unwrap_or(i64::MAX);
+        let max_time = self
+            .blocks
+            .iter()
+            .map(|block| block.max_time)
+            .max()
+            .unwrap_or(i64::MIN);
 
         info::InfoResponse {
             label_sets: ranges
@@ -887,6 +895,22 @@ fn labels_key(labels: &BTreeMap<String, String>) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+fn tsdb_info(labels: &[(String, String)], range: (i64, i64)) -> info::TsdbInfo {
+    info::TsdbInfo {
+        labels: Some(thanos::ZLabelSet {
+            labels: labels
+                .iter()
+                .map(|(name, value)| Label {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }),
+        min_time: range.0,
+        max_time: range.1,
+    }
 }
 
 fn aggregates(values: &[i32]) -> Result<BTreeSet<i32>, Status> {

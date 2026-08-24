@@ -32,6 +32,7 @@ use config::ThanosRepositoryConfig;
 use datafusion::{
     catalog::MemorySchemaProvider,
     common::TableReference,
+    datasource::MemTable,
     execution::SessionStateBuilder,
     prelude::{ParquetReadOptions, SessionConfig, SessionContext},
 };
@@ -67,9 +68,19 @@ pub async fn index_context(
     context
         .register_parquet("blocks", block_index_path, ParquetReadOptions::default())
         .await?;
-    context
-        .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
-        .await?;
+    if metric_table_schemas.is_empty() {
+        context.register_table(
+            "chunks",
+            Arc::new(MemTable::try_new(
+                block_index::chunk_index_schema(),
+                vec![vec![]],
+            )?),
+        )?;
+    } else {
+        context
+            .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
+            .await?;
+    }
     register_metric_tables(&context, metric_table_schemas, repositories, storage).await?;
     Ok(context)
 }

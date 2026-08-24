@@ -784,7 +784,7 @@ fn block_parquet_bytes(rows: Vec<BlockIndexRow>) -> Result<Vec<u8>, BoxError> {
 
 #[cfg(test)]
 fn chunk_parquet_bytes(rows: Vec<ChunkIndexRow>) -> Result<Vec<u8>, BoxError> {
-    let schema = chunk_schema();
+    let schema = chunk_index_schema();
     let batch = chunk_record_batch(&schema, &rows)?;
     parquet_bytes(schema, batch)
 }
@@ -987,7 +987,7 @@ fn block_record_batch(
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
-fn chunk_schema() -> Arc<Schema> {
+pub fn chunk_index_schema() -> Arc<Schema> {
     let map_entries = Arc::new(Field::new(
         "entries",
         DataType::Struct(

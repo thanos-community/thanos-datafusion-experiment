@@ -26,9 +26,9 @@ FLIGHT_LISTEN_ADDR=0.0.0.0:50051 cargo run
 
 ## Query flow
 
-This scaffold uses the base Arrow Flight protocol, not Flight SQL. Send UTF-8 SQL in
-`FlightDescriptor.cmd` to `GetFlightInfo`; the response contains an endpoint whose ticket is the
-same SQL. Send that ticket to `DoGet` to receive Arrow record batches.
+This scaffold implements Flight SQL statement queries. A client sends `CommandStatementQuery`
+through `GetFlightInfo`; the server plans it with DataFusion and returns a Flight SQL statement
+ticket. Supplying that ticket to `DoGet` streams the Arrow record batches.
 
 At startup, the server registers an in-memory `metrics` table:
 
@@ -36,9 +36,25 @@ At startup, the server registers an in-memory `metrics` table:
 SELECT timestamp_ms, metric, value FROM metrics WHERE metric = 'up'
 ```
 
-The `get_flight_info` and `do_get` handlers are implemented. Authentication, uploads, actions,
-query polling, and `get_schema` deliberately return `UNIMPLEMENTED` so they remain clear
-extension points.
+## Flight SQL CLI
+
+Install the Arrow Flight SQL client matching this server's Arrow Flight version:
+
+```bash
+cargo install arrow-flight --version 58.4.0 \
+  --features "cli,flight-sql,tls-ring" \
+  --bin flight_sql_client
+```
+
+With the server running, issue a query:
+
+```bash
+flight_sql_client --host 127.0.0.1 --port 50051 \
+  statement-query "SELECT 1"
+```
+
+The service currently supports statement queries. Authentication, prepared statements, metadata,
+uploads, actions, query polling, and `get_schema` remain unimplemented extension points.
 
 ## Check
 

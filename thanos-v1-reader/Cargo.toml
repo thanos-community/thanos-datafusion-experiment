@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 arrow = "58.4.0"
-arrow-flight = "58.4.0"
+arrow-flight = { version = "58.4.0", features = ["flight-sql"] }
 datafusion = "54.1.0"
 futures = "0.3.34"
 prost = "0.14.4"

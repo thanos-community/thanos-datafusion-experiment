@@ -145,9 +145,10 @@ same-label, same-resolution block are filtered at startup. Other same-resolution
 retained, as they are by Go BucketStore.
 
 Series requests support StoreAPI `ShardInfo` grouping by or without selected labels using the same
-sorted-label xxHash64 partitioning as Go BucketStore.
+sorted-label xxHash64 partitioning as Go BucketStore. `without_replica_labels` removes requested
+labels after matcher evaluation and before sharding, sorting, and response merging.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, native histogram SUM/COUNTER aggregate slots, and startup-time index construction. It does not support opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
+Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, native histogram SUM/COUNTER aggregate slots, and startup-time index construction. It does not support opaque hints or projection hints, and it does not refresh the block index while running.
 
 ## Flight SQL CLI
 

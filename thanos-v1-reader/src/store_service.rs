@@ -6,7 +6,7 @@ use std::{
 };
 
 use arrow::{
-    array::{Array, ArrayRef, Int64Array, StringArray, StringViewArray, UInt64Array},
+    array::{Array, ArrayRef, Int64Array, ListArray, StringArray, StringViewArray, UInt64Array},
     record_batch::RecordBatch,
 };
 use datafusion::prelude::SessionContext;
@@ -38,19 +38,35 @@ pub struct ThanosStoreService {
 #[derive(Clone)]
 struct ChunkDescriptor {
     repository_uri: String,
+    block_ulid: String,
     chunk_file_path: String,
     chunk_file_offset: u64,
     chunk_mint: i64,
     chunk_maxt: i64,
-    downsample_resolution: i64,
     labels: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
 struct BlockMetadata {
+    repository_uri: String,
+    block_ulid: String,
     min_time: i64,
     max_time: i64,
+    downsample_resolution: i64,
     external_labels: BTreeMap<String, String>,
+    compaction_sources: Vec<String>,
+}
+
+impl ChunkDescriptor {
+    fn block_key(&self) -> (String, String) {
+        (self.repository_uri.clone(), self.block_ulid.clone())
+    }
+}
+
+impl BlockMetadata {
+    fn key(&self) -> (String, String) {
+        (self.repository_uri.clone(), self.block_ulid.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -67,8 +83,11 @@ impl ThanosStoreService {
         _repositories: &[ThanosRepositoryConfig],
         storage: RepositoryRegistry,
     ) -> Result<Self, BoxError> {
-        let descriptors = load_descriptors(&context).await?;
-        let blocks = load_blocks(&context).await?;
+        let mut descriptors = load_descriptors(&context).await?;
+        let mut blocks = load_blocks(&context).await?;
+        let duplicate_blocks = duplicate_block_keys(&blocks);
+        blocks.retain(|block| !duplicate_blocks.contains(&block.key()));
+        descriptors.retain(|descriptor| !duplicate_blocks.contains(&descriptor.block_key()));
         Ok(Self {
             descriptors: Arc::new(descriptors),
             blocks: Arc::new(blocks),
@@ -88,6 +107,26 @@ impl ThanosStoreService {
                 overlaps(descriptor.chunk_mint, descriptor.chunk_maxt, start, end)
                     && matches_all(&descriptor.labels, matchers)
             })
+            .collect()
+    }
+
+    fn selected_block_keys(
+        &self,
+        start: i64,
+        end: i64,
+        max_resolution: i64,
+    ) -> BTreeSet<(String, String)> {
+        let mut block_sets = BTreeMap::<Vec<(String, String)>, Vec<&BlockMetadata>>::new();
+        for block in self.blocks.iter() {
+            block_sets
+                .entry(labels_key(&block.external_labels))
+                .or_default()
+                .push(block);
+        }
+        block_sets
+            .values()
+            .flat_map(|blocks| select_blocks(blocks, start, end, max_resolution))
+            .map(BlockMetadata::key)
             .collect()
     }
 
@@ -170,8 +209,16 @@ impl Store for ThanosStoreService {
         let abort_on_error = request.partial_response_disabled
             || request.partial_response_strategy == thanos::PartialResponseStrategy::Abort as i32;
 
+        let selected_blocks = self.selected_block_keys(
+            request.min_time,
+            request.max_time,
+            request.max_resolution_window,
+        );
         let mut groups = BTreeMap::<Vec<(String, String)>, Vec<&ChunkDescriptor>>::new();
         for descriptor in self.matching_descriptors(request.min_time, request.max_time, &matchers) {
+            if !selected_blocks.contains(&descriptor.block_key()) {
+                continue;
+            }
             groups
                 .entry(labels_key(&descriptor.labels))
                 .or_default()
@@ -184,22 +231,6 @@ impl Store for ThanosStoreService {
             if series_responses.len() >= limit {
                 break;
             }
-            let selected_resolution = descriptors
-                .iter()
-                .filter(|descriptor| {
-                    if aggregates.contains(&(Aggr::Raw as i32)) {
-                        descriptor.downsample_resolution == 0
-                    } else {
-                        descriptor.downsample_resolution <= request.max_resolution_window
-                    }
-                })
-                .map(|descriptor| descriptor.downsample_resolution)
-                .max();
-            let Some(selected_resolution) = selected_resolution else {
-                continue;
-            };
-            descriptors
-                .retain(|descriptor| descriptor.downsample_resolution == selected_resolution);
             descriptors.sort_by_key(|descriptor| (descriptor.chunk_mint, descriptor.chunk_maxt));
 
             let labels = descriptors[0]
@@ -535,11 +566,114 @@ fn take_limit(values: BTreeSet<String>, requested_limit: i64) -> Result<Vec<Stri
     Ok(values.into_iter().take(limit).collect())
 }
 
+const BLOCK_RESOLUTIONS: [i64; 3] = [60 * 60 * 1000, 5 * 60 * 1000, 0];
+
+fn select_blocks<'a>(
+    blocks: &[&'a BlockMetadata],
+    mint: i64,
+    maxt: i64,
+    max_resolution: i64,
+) -> Vec<&'a BlockMetadata> {
+    let Some(resolution_index) = BLOCK_RESOLUTIONS
+        .iter()
+        .position(|resolution| *resolution <= max_resolution)
+    else {
+        return Vec::new();
+    };
+    let by_resolution = BLOCK_RESOLUTIONS
+        .iter()
+        .map(|resolution| {
+            let mut matching = blocks
+                .iter()
+                .copied()
+                .filter(|block| block.downsample_resolution == *resolution)
+                .collect::<Vec<_>>();
+            matching.sort_by_key(|block| (block.min_time, block.max_time));
+            matching
+        })
+        .collect::<Vec<_>>();
+    select_resolution(&by_resolution, resolution_index, mint, maxt)
+}
+
+fn select_resolution<'a>(
+    blocks: &[Vec<&'a BlockMetadata>],
+    resolution_index: usize,
+    mint: i64,
+    maxt: i64,
+) -> Vec<&'a BlockMetadata> {
+    if mint > maxt {
+        return Vec::new();
+    }
+    let mut selected = Vec::new();
+    let mut start = mint;
+    for &block in &blocks[resolution_index] {
+        if block.max_time <= mint {
+            continue;
+        }
+        if block.min_time > maxt {
+            break;
+        }
+        if resolution_index + 1 < blocks.len() {
+            selected.extend(select_resolution(
+                blocks,
+                resolution_index + 1,
+                start,
+                block.min_time.wrapping_sub(1),
+            ));
+        }
+        selected.push(block);
+        start = block.max_time;
+    }
+    if resolution_index + 1 < blocks.len() {
+        selected.extend(select_resolution(blocks, resolution_index + 1, start, maxt));
+    }
+    selected
+}
+
+fn duplicate_block_keys(blocks: &[BlockMetadata]) -> BTreeSet<(String, String)> {
+    let mut groups = BTreeMap::<(String, i64, Vec<(String, String)>), Vec<&BlockMetadata>>::new();
+    for block in blocks {
+        groups
+            .entry((
+                block.repository_uri.clone(),
+                block.downsample_resolution,
+                labels_key(&block.external_labels),
+            ))
+            .or_default()
+            .push(block);
+    }
+    let mut duplicates = BTreeSet::new();
+    for mut group in groups.into_values() {
+        group.sort_by(|left, right| {
+            right
+                .compaction_sources
+                .len()
+                .cmp(&left.compaction_sources.len())
+                .then_with(|| left.block_ulid.cmp(&right.block_ulid))
+        });
+        let mut covering = Vec::<&BlockMetadata>::new();
+        'blocks: for block in group {
+            for parent in &covering {
+                if block
+                    .compaction_sources
+                    .iter()
+                    .all(|source| parent.compaction_sources.contains(source))
+                {
+                    duplicates.insert(block.key());
+                    continue 'blocks;
+                }
+            }
+            covering.push(block);
+        }
+    }
+    duplicates
+}
+
 async fn load_descriptors(context: &SessionContext) -> Result<Vec<ChunkDescriptor>, BoxError> {
     let batches = context
         .sql(
-            "SELECT repository_uri, chunk_file_path, chunk_file_offset, chunk_mint, chunk_maxt, \
-             downsample_resolution, labels_json FROM chunks",
+            "SELECT repository_uri, block_ulid, chunk_file_path, chunk_file_offset, chunk_mint, \
+             chunk_maxt, labels_json FROM chunks",
         )
         .await?
         .collect()
@@ -554,7 +688,10 @@ async fn load_descriptors(context: &SessionContext) -> Result<Vec<ChunkDescripto
 
 async fn load_blocks(context: &SessionContext) -> Result<Vec<BlockMetadata>, BoxError> {
     let batches = context
-        .sql("SELECT min_time, max_time, external_labels FROM blocks")
+        .sql(
+            "SELECT repository_uri, block_ulid, min_time, max_time, downsample_resolution, \
+             external_labels, compaction_sources FROM blocks",
+        )
         .await?
         .collect()
         .await?;
@@ -566,21 +703,21 @@ async fn load_blocks(context: &SessionContext) -> Result<Vec<BlockMetadata>, Box
 
 fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, BoxError> {
     let repository_uri = string_column(batch, "repository_uri")?;
+    let block_ulid = string_column(batch, "block_ulid")?;
     let chunk_file_path = string_column(batch, "chunk_file_path")?;
     let chunk_file_offset = uint64_column(batch, "chunk_file_offset")?;
     let chunk_mint = int64_column(batch, "chunk_mint")?;
     let chunk_maxt = int64_column(batch, "chunk_maxt")?;
-    let downsample_resolution = int64_column(batch, "downsample_resolution")?;
     let labels_json = string_column(batch, "labels_json")?;
     (0..batch.num_rows())
         .map(|index| {
             Ok(ChunkDescriptor {
                 repository_uri: string_value(repository_uri.as_ref(), index)?,
+                block_ulid: string_value(block_ulid.as_ref(), index)?,
                 chunk_file_path: string_value(chunk_file_path.as_ref(), index)?,
                 chunk_file_offset: chunk_file_offset.value(index),
                 chunk_mint: chunk_mint.value(index),
                 chunk_maxt: chunk_maxt.value(index),
-                downsample_resolution: downsample_resolution.value(index),
                 labels: serde_json::from_str(&string_value(labels_json.as_ref(), index)?)?,
             })
         })
@@ -588,18 +725,31 @@ fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, B
 }
 
 fn blocks_from_batch(batch: &RecordBatch) -> Result<Vec<BlockMetadata>, BoxError> {
+    let repository_uri = string_column(batch, "repository_uri")?;
+    let block_ulid = string_column(batch, "block_ulid")?;
     let min_time = int64_column(batch, "min_time")?;
     let max_time = int64_column(batch, "max_time")?;
+    let downsample_resolution = int64_column(batch, "downsample_resolution")?;
     let external_labels = string_column(batch, "external_labels")?;
+    let compaction_sources = batch
+        .column_by_name("compaction_sources")
+        .ok_or_else(|| std::io::Error::other("missing block index column compaction_sources"))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| std::io::Error::other("invalid block index column compaction_sources"))?;
     (0..batch.num_rows())
         .map(|index| {
             Ok(BlockMetadata {
+                repository_uri: string_value(repository_uri.as_ref(), index)?,
+                block_ulid: string_value(block_ulid.as_ref(), index)?,
                 min_time: min_time.value(index),
                 max_time: max_time.value(index),
+                downsample_resolution: downsample_resolution.value(index),
                 external_labels: serde_json::from_str(&string_value(
                     external_labels.as_ref(),
                     index,
                 )?)?,
+                compaction_sources: string_list_value(compaction_sources, index)?,
             })
         })
         .collect()
@@ -620,6 +770,17 @@ fn string_value(array: &dyn Array, index: usize) -> Result<String, BoxError> {
         return Ok(array.value(index).to_owned());
     }
     Err("expected a UTF-8 column".into())
+}
+
+fn string_list_value(array: &ListArray, index: usize) -> Result<Vec<String>, BoxError> {
+    let values = array.value(index);
+    let values = values
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| std::io::Error::other("invalid UTF-8 list column"))?;
+    Ok((0..values.len())
+        .map(|index| values.value(index).to_owned())
+        .collect())
 }
 
 fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array, BoxError> {
@@ -645,6 +806,18 @@ mod tests {
     use super::*;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
+
+    fn block(id: &str, min_time: i64, max_time: i64, resolution: i64) -> BlockMetadata {
+        BlockMetadata {
+            repository_uri: "file:///blocks".to_owned(),
+            block_ulid: id.to_owned(),
+            min_time,
+            max_time,
+            downsample_resolution: resolution,
+            external_labels: BTreeMap::new(),
+            compaction_sources: vec![id.to_owned()],
+        }
+    }
 
     use crate::thanos_proto::thanos::{
         info::{info_client::InfoClient, info_server::InfoServer},
@@ -687,35 +860,45 @@ mod tests {
     }
 
     #[test]
-    fn raw_queries_choose_raw_resolution() {
-        let descriptors = vec![
-            ChunkDescriptor {
-                repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "raw".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 0,
-                chunk_maxt: 10,
-                downsample_resolution: 0,
-                labels: BTreeMap::new(),
-            },
-            ChunkDescriptor {
-                repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "downsampled".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 0,
-                chunk_maxt: 10,
-                downsample_resolution: 300_000,
-                labels: BTreeMap::new(),
-            },
+    fn block_selection_matches_bucket_store_resolution_and_overlap_order() {
+        let blocks = [
+            block("raw-0", 0, 100, 0),
+            block("raw-1a", 100, 200, 0),
+            block("raw-1b", 100, 200, 0),
+            block("raw-2-short", 200, 299, 0),
+            block("raw-2", 200, 300, 0),
+            block("raw-3", 300, 400, 0),
+            block("raw-long", 300, 600, 0),
+            block("raw-4", 400, 500, 0),
+            block("5m-0", 0, 100, 300_000),
+            block("5m-1", 100, 200, 300_000),
+            block("5m-2", 200, 300, 300_000),
+            block("5m-3", 300, 400, 300_000),
+            block("1h-1", 100, 200, 3_600_000),
+            block("1h-2", 200, 300, 3_600_000),
         ];
-        let raw = aggregates(&[Aggr::Raw as i32]).unwrap();
-        assert!(
-            descriptors
-                .iter()
-                .filter(|descriptor| {
-                    raw.contains(&(Aggr::Raw as i32)) && descriptor.downsample_resolution == 0
-                })
-                .all(|descriptor| descriptor.chunk_file_path == "raw")
+        let references = blocks.iter().collect::<Vec<_>>();
+        let selected = select_blocks(&references, 0, 500, 3_600_000)
+            .into_iter()
+            .map(|block| block.block_ulid.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            vec!["5m-0", "1h-1", "1h-2", "5m-3", "raw-long", "raw-4"]
+        );
+    }
+
+    #[test]
+    fn compaction_source_supersets_filter_only_same_group_duplicates() {
+        let mut source = block("source", 0, 100, 0);
+        source.compaction_sources = vec!["a".to_owned()];
+        let mut compacted = block("compacted", 0, 100, 0);
+        compacted.compaction_sources = vec!["a".to_owned(), "b".to_owned()];
+        let mut downsampled = block("downsampled", 0, 100, 300_000);
+        downsampled.compaction_sources = vec!["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            duplicate_block_keys(&[source, compacted, downsampled]),
+            BTreeSet::from([("file:///blocks".to_owned(), "source".to_owned())])
         );
     }
 
@@ -724,20 +907,24 @@ mod tests {
         let service = ThanosStoreService {
             descriptors: Arc::new(vec![ChunkDescriptor {
                 repository_uri: "file:///blocks".to_owned(),
+                block_ulid: "block".to_owned(),
                 chunk_file_path: "unused-when-skipping-chunks".to_owned(),
                 chunk_file_offset: 0,
                 chunk_mint: 100,
                 chunk_maxt: 200,
-                downsample_resolution: 0,
                 labels: BTreeMap::from([
                     ("__name__".to_owned(), "up".to_owned()),
                     ("cluster".to_owned(), "test".to_owned()),
                 ]),
             }]),
             blocks: Arc::new(vec![BlockMetadata {
+                repository_uri: "file:///blocks".to_owned(),
+                block_ulid: "block".to_owned(),
                 min_time: 100,
                 max_time: 200,
+                downsample_resolution: 0,
                 external_labels: BTreeMap::from([("cluster".to_owned(), "test".to_owned())]),
+                compaction_sources: vec!["block".to_owned()],
             }]),
             storage: RepositoryRegistry::empty(),
         };

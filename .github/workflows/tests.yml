@@ -81,3 +81,4 @@ jobs:
             ${{ runner.os }}-cargo-e2e-
       - run: cargo test --test e2e
       - run: cargo test --test native_histogram_parity
+      - run: cargo test --test raw_scalar_parity

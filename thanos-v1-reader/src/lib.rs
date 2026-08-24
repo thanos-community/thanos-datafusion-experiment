@@ -1,8 +1,5 @@
 use std::{env, net::SocketAddr};
 
-#[cfg(unix)]
-use std::os::fd::{FromRawFd, RawFd};
-
 use arrow_flight::flight_service_server::FlightServiceServer;
 use axum::{Router, extract::State, routing::get};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -10,17 +7,16 @@ use opentelemetry::{global, trace::TracerProvider as _};
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub mod block_index;
+pub mod block_sync;
 pub mod chunk_reader;
 pub mod config;
 pub mod flight_service;
 pub mod histogram;
 pub mod metric_table;
-pub mod storage;
 pub mod store_service;
 pub mod thanos_proto;
 pub mod tsdb_index;
@@ -41,14 +37,12 @@ use datafusion_tracing::{
     instrument_with_info_spans,
 };
 use metric_table::MetricTableProvider;
-use storage::RepositoryRegistry;
 
 pub async fn index_context(
     block_index_path: &str,
     chunk_index_path: &str,
     metric_table_schemas: &[MetricTableSchema],
     repositories: &[ThanosRepositoryConfig],
-    storage: RepositoryRegistry,
 ) -> Result<SessionContext, datafusion::error::DataFusionError> {
     let execution_options = InstrumentationOptions::builder()
         .record_metrics(true)
@@ -81,15 +75,14 @@ pub async fn index_context(
             .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
             .await?;
     }
-    register_metric_tables(&context, metric_table_schemas, repositories, storage).await?;
+    register_metric_tables(&context, metric_table_schemas, repositories).await?;
     Ok(context)
 }
 
 pub async fn register_metric_tables(
     context: &SessionContext,
     metric_table_schemas: &[MetricTableSchema],
-    _repositories: &[ThanosRepositoryConfig],
-    storage: RepositoryRegistry,
+    repositories: &[ThanosRepositoryConfig],
 ) -> Result<(), datafusion::error::DataFusionError> {
     let catalog = context.catalog("datafusion").ok_or_else(|| {
         datafusion::error::DataFusionError::Internal("default catalog is missing".to_owned())
@@ -101,7 +94,7 @@ pub async fn register_metric_tables(
         let table = MetricTableProvider::new(
             metric_table_schema.clone(),
             chunk_provider.clone(),
-            storage.clone(),
+            repositories,
         )?;
         context.register_table(
             TableReference::full("datafusion", "metrics", metric_table_schema.name.as_str()),
@@ -113,27 +106,18 @@ pub async fn register_metric_tables(
 
 const LISTEN_ADDR_ENV_VAR: &str = "FLIGHT_LISTEN_ADDR";
 const METRICS_LISTEN_ADDR_ENV_VAR: &str = "METRICS_LISTEN_ADDR";
-/// When set, the reader adopts already-bound TCP listeners from its parent process.
-///
-/// This is primarily useful for hermetic integration tests: the harness can reserve an
-/// ephemeral port and pass its file descriptor to the reader without a close-and-rebind race.
-const LISTEN_FD_ENV_VAR: &str = "THANOS_READER_LISTEN_FD";
-const METRICS_LISTEN_FD_ENV_VAR: &str = "THANOS_READER_METRICS_LISTEN_FD";
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing()?;
     let prometheus_handle = PrometheusBuilder::new().install_recorder()?;
 
     let config_path = config::ReaderConfig::config_path();
     let config = config::ReaderConfig::load(&config_path)?;
-    let storage = RepositoryRegistry::new(&config)?;
     let address = env::var(LISTEN_ADDR_ENV_VAR).unwrap_or(config.listen_addr);
     let metrics_address =
         env::var(METRICS_LISTEN_ADDR_ENV_VAR).unwrap_or(config.metrics_listen_addr);
-    let listener = listener_from_env(LISTEN_FD_ENV_VAR)?;
-    let metrics_listener = listener_from_env(METRICS_LISTEN_FD_ENV_VAR)?;
     let socket_address: SocketAddr = address.parse()?;
-    start_metrics_server(&metrics_address, metrics_listener, prometheus_handle).await?;
+    start_metrics_server(&metrics_address, prometheus_handle).await?;
 
     for repository in &config.repositories {
         tracing::info!(
@@ -142,14 +126,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "configured Thanos repository"
         );
     }
-    let metric_table_schemas = block_index::build_block_index(
-        &config.repositories,
-        &config.index_cache_location,
-        &storage,
-        config.storage.index_build_concurrency,
-        config.storage.block_max_age_duration()?,
-    )
-    .await?;
+    let metric_table_schemas =
+        block_index::build_block_index(&config.repositories, &config.index_cache_location).await?;
     let block_index_path = block_index::block_index_file_path(&config.index_cache_location);
     let chunk_index_path = block_index::chunk_index_directory_path(&config.index_cache_location);
     tracing::info!(path = %block_index_path, "generated Thanos blocks index");
@@ -160,14 +138,30 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &chunk_index_path,
         &metric_table_schemas,
         &config.repositories,
-        storage.clone(),
     )
     .await?;
     let store_service =
-        store_service::ThanosStoreService::new(context.clone(), &config.repositories, storage)
-            .await?;
-    let service =
-        flight_service::DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
+        store_service::ThanosStoreService::new(context.clone(), &config.repositories).await?;
+    let refresher = block_sync::BlockRefresher::new(
+        store_service.shared_state(),
+        &config.repositories,
+        &config.index_cache_location,
+    );
+    let service = flight_service::DataFusionFlightService::new_shared(
+        store_service.shared_state(),
+        format!("grpc+tcp://{address}"),
+    );
+    let sync_interval = config.block_sync_interval;
+    let refresh_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sync_interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Err(error) = refresher.refresh().await {
+                tracing::warn!(%error, "block refresh failed; retaining previous snapshot");
+            }
+        }
+    });
     tracing::info!(
         address = %metrics_address,
         path = "/metrics",
@@ -175,26 +169,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(%address, "starting DataFusion Arrow Flight server");
 
-    let server = Server::builder()
+    let server_result = Server::builder()
         .add_service(FlightServiceServer::new(service))
         .add_service(thanos_proto::thanos::store_server::StoreServer::new(
             store_service.clone(),
         ))
         .add_service(thanos_proto::thanos::info::info_server::InfoServer::new(
             store_service,
-        ));
-    if let Some(listener) = listener {
-        server
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await?;
-    } else {
-        server.serve(socket_address).await?;
-    }
+        ))
+        .serve(socket_address)
+        .await;
+    refresh_task.abort();
+    server_result?;
 
     Ok(())
 }
 
-fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
+fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let exporter = SpanExporter::builder().with_tonic().build()?;
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
@@ -205,7 +196,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(tracing_subscriber::fmt::layer())
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .init();
     Ok(())
@@ -213,13 +204,9 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn start_metrics_server(
     address: &str,
-    listener: Option<TcpListener>,
     prometheus_handle: PrometheusHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = match listener {
-        Some(listener) => listener,
-        None => TcpListener::bind(address).await?,
-    };
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(address).await?;
     let app = Router::new()
         .route("/metrics", get(prometheus_metrics))
         .with_state(prometheus_handle);
@@ -230,32 +217,6 @@ async fn start_metrics_server(
         }
     });
     Ok(())
-}
-
-fn listener_from_env(name: &str) -> Result<Option<TcpListener>, Box<dyn std::error::Error>> {
-    let Some(raw_fd) = env::var_os(name) else {
-        return Ok(None);
-    };
-    let raw_fd = raw_fd
-        .to_string_lossy()
-        .parse::<i32>()
-        .map_err(|error| format!("{name} must be a file descriptor: {error}"))?;
-    if raw_fd < 0 {
-        return Err(format!("{name} must be non-negative").into());
-    }
-
-    #[cfg(unix)]
-    {
-        // The parent deliberately transfers ownership of this inherited descriptor.
-        let listener = unsafe { std::net::TcpListener::from_raw_fd(raw_fd as RawFd) };
-        listener.set_nonblocking(true)?;
-        return Ok(Some(TcpListener::from_std(listener)?));
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = raw_fd;
-        Err(format!("{name} is only supported on Unix").into())
-    }
 }
 
 async fn prometheus_metrics(State(handle): State<PrometheusHandle>) -> String {
@@ -291,7 +252,6 @@ mod tests {
                 label_columns: BTreeSet::from(["job".to_owned(), "pod".to_owned()]),
             }],
             &[],
-            RepositoryRegistry::empty(),
         )
         .await
         .unwrap();
@@ -326,33 +286,18 @@ mod tests {
         let repository = config::ThanosRepositoryConfig {
             name: "fixtures".to_owned(),
             uri: format!("file://{}", fixture_root.display()),
-            s3: None,
-            gcs: None,
         };
-        let repositories = vec![repository];
-        let storage = RepositoryRegistry::new(&config::ReaderConfig {
-            listen_addr: "127.0.0.1:1".to_owned(),
-            metrics_listen_addr: "127.0.0.1:2".to_owned(),
-            index_cache_location: cache.display().to_string(),
-            repositories: repositories.clone(),
-            storage: config::StorageConfig::default(),
-        })
-        .unwrap();
-        let schemas = block_index::build_block_index(
-            &repositories,
-            cache.to_str().unwrap(),
-            &storage,
-            config::StorageConfig::default().index_build_concurrency,
-            None,
-        )
-        .await
-        .unwrap();
+        let schemas = block_index::build_block_index(&[repository], cache.to_str().unwrap())
+            .await
+            .unwrap();
         let context = index_context(
             &block_index::block_index_file_path(cache.to_str().unwrap()),
             &block_index::chunk_index_directory_path(cache.to_str().unwrap()),
             &schemas,
-            &repositories,
-            storage,
+            &[config::ThanosRepositoryConfig {
+                name: "fixtures".to_owned(),
+                uri: format!("file://{}", fixture_root.display()),
+            }],
         )
         .await
         .unwrap();

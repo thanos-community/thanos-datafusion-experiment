@@ -7,9 +7,17 @@ edition = "2024"
 name = "e2e"
 path = "e2e/e2e.rs"
 
-[[bench]]
-name = "chunk_io"
-harness = false
+[[test]]
+name = "native_histogram_parity"
+path = "e2e/native_histogram_parity.rs"
+
+[[test]]
+name = "raw_scalar_parity"
+path = "e2e/raw_scalar_parity.rs"
+
+[[test]]
+name = "scalar_downsample_parity"
+path = "e2e/scalar_downsample_parity.rs"
 
 [[test]]
 name = "native_histogram_downsample_parity"
@@ -43,23 +51,22 @@ path = "e2e/storeapi_label_endpoints_parity.rs"
 name = "storeapi_info_parity"
 path = "e2e/storeapi_info_parity.rs"
 
+[[test]]
+name = "dynamic_block_refresh_parity"
+path = "e2e/dynamic_block_refresh_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }
 async-trait = "0.1.92"
 axum = "0.8.9"
-cache-rs = { version = "0.4.0", features = ["concurrent"] }
 crc = "3.4.0"
-dashmap = "6.2.1"
 datafusion = "54.1.0"
 datafusion-tracing = "54.0.0"
-fs2 = "0.4.3"
 futures = "0.3.34"
-hmac = "0.13.0"
-humantime = "2.4.0"
-metrics = "0.24.6"
+humantime-serde = "1.1.1"
 metrics-exporter-prometheus = "0.18.3"
-opendal = { version = "0.58.2", features = ["layers-concurrent-limit", "layers-metrics", "layers-otel-trace", "layers-retry", "layers-timeout", "services-fs", "services-gcs", "services-s3"] }
+opendal = { version = "0.58.2", features = ["layers-metrics", "layers-otel-trace", "services-fs"] }
 opentelemetry = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = "0.32.1"
@@ -70,21 +77,15 @@ regex = "1.13.1"
 rusty-chunkenc = "0.1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
-sha2 = "0.11.0"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "sync", "fs", "io-util", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 toml = "1"
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xxhash-rust = { version = "0.8.18", features = ["xxh64"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
-
-[dev-dependencies]
-criterion = { version = "0.8.2", features = ["async_tokio"] }
-libc = "0.2"
-tempfile = "3.27.0"

@@ -11,21 +11,46 @@ use futures::{Stream, StreamExt, stream};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::store_service::{ReaderQuerySnapshot, SharedReaderState};
+
 /// A minimal Flight SQL service backed by a DataFusion session.
 ///
 /// Statement query tickets use the SQL text as their opaque handle. Production services should
 /// replace this with an expiring server-side query handle.
 #[derive(Clone)]
 pub struct DataFusionFlightService {
-    context: SessionContext,
+    context: FlightContext,
     location: String,
+}
+
+#[derive(Clone)]
+enum FlightContext {
+    Static(SessionContext),
+    Shared(SharedReaderState),
 }
 
 impl DataFusionFlightService {
     pub fn new(context: SessionContext, location: impl Into<String>) -> Self {
         Self {
-            context,
+            context: FlightContext::Static(context),
             location: location.into(),
+        }
+    }
+
+    pub fn new_shared(context: SharedReaderState, location: impl Into<String>) -> Self {
+        Self {
+            context: FlightContext::Shared(context),
+            location: location.into(),
+        }
+    }
+
+    async fn context(&self) -> (SessionContext, Option<ReaderQuerySnapshot>) {
+        match &self.context {
+            FlightContext::Static(context) => (context.clone(), None),
+            FlightContext::Shared(context) => {
+                let snapshot = context.query_snapshot().await;
+                (snapshot.context().clone(), Some(snapshot))
+            }
         }
     }
 
@@ -69,8 +94,8 @@ impl FlightSqlService for DataFusionFlightService {
             return Err(Status::invalid_argument("SQL query must not be empty"));
         }
 
-        let dataframe = self
-            .context
+        let (context, _snapshot) = self.context().await;
+        let dataframe = context
             .sql(&statement.query)
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -95,8 +120,8 @@ impl FlightSqlService for DataFusionFlightService {
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let query = Self::query_from_handle(&ticket.statement_handle)?;
-        let batches = self
-            .context
+        let (context, _snapshot) = self.context().await;
+        let batches = context
             .sql(query)
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?

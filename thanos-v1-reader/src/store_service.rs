@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
 };
@@ -11,15 +12,17 @@ use arrow::{
 };
 use datafusion::prelude::SessionContext;
 use futures::Stream;
+use opendal::Operator;
 use prost::Message;
 use regex::Regex;
+use tokio::sync::RwLock;
 use tokio_stream::iter;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    block_index::repository_operator,
     chunk_reader::{self, EncodedAggregateChunk, EncodedAggregateEncoding, EncodedChunk},
     config::ThanosRepositoryConfig,
-    storage::RepositoryRegistry,
     thanos_proto::hintspb,
     thanos_proto::thanos::{
         self, Aggr, AggrChunk, Chunk, Label, LabelMatcher, Series, SeriesBatch, SeriesResponse,
@@ -27,7 +30,7 @@ use crate::{
     },
 };
 
-type BoxError = Box<dyn Error>;
+type BoxError = Box<dyn Error + Send + Sync>;
 type SeriesStream = Pin<Box<dyn Stream<Item = Result<SeriesResponse, Status>> + Send>>;
 const SERIES_RESPONSE_HINTS_TYPE_URL: &str = "type.googleapis.com/hintspb.SeriesResponseHints";
 const LABEL_NAMES_RESPONSE_HINTS_TYPE_URL: &str =
@@ -38,9 +41,42 @@ const BLOCK_ID_LABEL: &str = "__block_id";
 
 #[derive(Clone)]
 pub struct ThanosStoreService {
-    descriptors: Arc<Vec<ChunkDescriptor>>,
-    blocks: Arc<Vec<BlockMetadata>>,
-    storage: RepositoryRegistry,
+    state: SharedReaderState,
+}
+
+#[derive(Clone)]
+pub struct SharedReaderState {
+    snapshot: Arc<RwLock<Arc<ReaderSnapshot>>>,
+}
+
+pub struct ReaderQuerySnapshot {
+    snapshot: Arc<ReaderSnapshot>,
+}
+
+struct ReaderSnapshot {
+    context: SessionContext,
+    descriptors: Vec<ChunkDescriptor>,
+    blocks: Vec<BlockMetadata>,
+    operators: BTreeMap<String, Operator>,
+    _cache_generation: Option<SnapshotCacheGeneration>,
+}
+
+struct SnapshotCacheGeneration {
+    path: PathBuf,
+}
+
+impl Drop for SnapshotCacheGeneration {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to remove retired reader snapshot cache"
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -88,21 +124,93 @@ enum Matcher {
 impl ThanosStoreService {
     pub async fn new(
         context: SessionContext,
-        _repositories: &[ThanosRepositoryConfig],
-        storage: RepositoryRegistry,
+        repositories: &[ThanosRepositoryConfig],
+    ) -> Result<Self, BoxError> {
+        let snapshot = ReaderSnapshot::new(context, repositories, None).await?;
+        Ok(Self {
+            state: SharedReaderState {
+                snapshot: Arc::new(RwLock::new(Arc::new(snapshot))),
+            },
+        })
+    }
+
+    pub fn shared_state(&self) -> SharedReaderState {
+        self.state.clone()
+    }
+}
+
+impl SharedReaderState {
+    pub async fn query_snapshot(&self) -> ReaderQuerySnapshot {
+        ReaderQuerySnapshot {
+            snapshot: self.load().await,
+        }
+    }
+
+    pub async fn replace(
+        &self,
+        context: SessionContext,
+        repositories: &[ThanosRepositoryConfig],
+        cache_generation: PathBuf,
+    ) -> Result<(), BoxError> {
+        let snapshot = match ReaderSnapshot::new(
+            context,
+            repositories,
+            Some(cache_generation.clone()),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(cache_generation);
+                return Err(error);
+            }
+        };
+        let retired = {
+            let mut current = self.snapshot.write().await;
+            std::mem::replace(&mut *current, Arc::new(snapshot))
+        };
+        drop(retired);
+        Ok(())
+    }
+
+    async fn load(&self) -> Arc<ReaderSnapshot> {
+        self.snapshot.read().await.clone()
+    }
+}
+
+impl ReaderQuerySnapshot {
+    pub fn context(&self) -> &SessionContext {
+        &self.snapshot.context
+    }
+}
+
+impl ReaderSnapshot {
+    async fn new(
+        context: SessionContext,
+        repositories: &[ThanosRepositoryConfig],
+        cache_generation: Option<PathBuf>,
     ) -> Result<Self, BoxError> {
         let mut descriptors = load_descriptors(&context).await?;
         let mut blocks = load_blocks(&context).await?;
         let duplicate_blocks = duplicate_block_keys(&blocks);
         blocks.retain(|block| !duplicate_blocks.contains(&block.key()));
         descriptors.retain(|descriptor| !duplicate_blocks.contains(&descriptor.block_key()));
+        let operators = repositories
+            .iter()
+            .map(|repository| {
+                repository_operator(&repository.uri)
+                    .map(|operator| (repository.uri.clone(), operator))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+
         Ok(Self {
-            descriptors: Arc::new(descriptors),
-            blocks: Arc::new(blocks),
-            storage,
+            context,
+            descriptors,
+            blocks,
+            operators,
+            _cache_generation: cache_generation.map(|path| SnapshotCacheGeneration { path }),
         })
     }
-
     fn matching_descriptors<'a>(
         &'a self,
         start: i64,
@@ -237,6 +345,7 @@ impl Store for ThanosStoreService {
         &self,
         request: Request<thanos::SeriesRequest>,
     ) -> Result<Response<Self::SeriesStream>, Status> {
+        let snapshot = self.state.load().await;
         let request = request.into_inner();
         let matchers = compile_matchers(&request.matchers)?;
         let request_hints = decode_series_request_hints(request.hints.as_ref())?;
@@ -246,7 +355,7 @@ impl Store for ThanosStoreService {
         let abort_on_error = request.partial_response_disabled
             || request.partial_response_strategy == thanos::PartialResponseStrategy::Abort as i32;
 
-        let selected_blocks = self.selected_blocks(
+        let selected_blocks = snapshot.selected_blocks(
             request.min_time,
             request.max_time,
             request.max_resolution_window,
@@ -260,7 +369,9 @@ impl Store for ThanosStoreService {
         let selected_block_count = selected_blocks.len();
         let mut groups =
             BTreeMap::<(String, String, Vec<(String, String)>), Vec<&ChunkDescriptor>>::new();
-        for descriptor in self.matching_descriptors(request.min_time, request.max_time, &matchers) {
+        for descriptor in
+            snapshot.matching_descriptors(request.min_time, request.max_time, &matchers)
+        {
             if !selected_block_keys.contains(&descriptor.block_key()) {
                 continue;
             }
@@ -310,7 +421,7 @@ impl Store for ThanosStoreService {
             let mut warnings = Vec::new();
             if !request.skip_chunks {
                 for descriptor in descriptors {
-                    match self.encode_chunk(descriptor, &aggregates).await {
+                    match snapshot.encode_chunk(descriptor, &aggregates).await {
                         Ok(Some(chunk)) => chunks.push(chunk),
                         Ok(None) => {}
                         Err(error) if abort_on_error => return Err(error),
@@ -418,12 +529,13 @@ impl Store for ThanosStoreService {
         &self,
         request: Request<thanos::LabelNamesRequest>,
     ) -> Result<Response<thanos::LabelNamesResponse>, Status> {
+        let snapshot = self.state.load().await;
         let request = request.into_inner();
         let matchers = compile_label_endpoint_matchers(&request.matchers)?;
         let request_hints = decode_label_names_request_hints(request.hints.as_ref())?;
         let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
         let blocks =
-            self.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
+            snapshot.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
         let block_keys = blocks
             .iter()
             .map(|block| block.key())
@@ -446,7 +558,7 @@ impl Store for ThanosStoreService {
             .iter()
             .collect::<BTreeSet<_>>();
         let has_matchers = !matchers.is_empty();
-        let names = self
+        let names = snapshot
             .descriptors
             .iter()
             .filter(|descriptor| {
@@ -487,6 +599,7 @@ impl Store for ThanosStoreService {
         &self,
         request: Request<thanos::LabelValuesRequest>,
     ) -> Result<Response<thanos::LabelValuesResponse>, Status> {
+        let snapshot = self.state.load().await;
         let request = request.into_inner();
         let matchers = compile_label_endpoint_matchers(&request.matchers)?;
         if request.without_replica_labels.contains(&request.label) {
@@ -495,13 +608,13 @@ impl Store for ThanosStoreService {
         let request_hints = decode_label_values_request_hints(request.hints.as_ref())?;
         let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
         let blocks =
-            self.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
+            snapshot.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
         let block_keys = blocks
             .iter()
             .map(|block| block.key())
             .collect::<BTreeSet<_>>();
         let has_matchers = !matchers.is_empty();
-        let mut values = self
+        let mut values = snapshot
             .descriptors
             .iter()
             .filter(|descriptor| {
@@ -545,27 +658,28 @@ impl info::info_server::Info for ThanosStoreService {
         &self,
         _request: Request<info::InfoRequest>,
     ) -> Result<Response<info::InfoResponse>, Status> {
-        Ok(Response::new(self.info_response()))
+        let snapshot = self.state.load().await;
+        Ok(Response::new(snapshot.info_response()))
     }
 }
 
-impl ThanosStoreService {
+impl ReaderSnapshot {
     async fn encode_chunk(
         &self,
         descriptor: &ChunkDescriptor,
         aggregates: &BTreeSet<i32>,
     ) -> Result<Option<AggrChunk>, Status> {
-        let repository = self
-            .storage
+        let operator = self
+            .operators
             .get(&descriptor.repository_uri)
             .ok_or_else(|| {
                 Status::internal(format!(
-                    "no storage repository for repository {:?}",
+                    "no object-store operator for repository {:?}",
                     descriptor.repository_uri
                 ))
             })?;
         let chunk = chunk_reader::read_encoded_chunk(
-            repository.as_ref(),
+            operator,
             &descriptor.chunk_file_path,
             descriptor.chunk_file_offset,
         )
@@ -1396,28 +1510,37 @@ mod tests {
     #[tokio::test]
     async fn generated_clients_discover_and_query_the_store_service() {
         let service = ThanosStoreService {
-            descriptors: Arc::new(vec![ChunkDescriptor {
-                repository_uri: "file:///blocks".to_owned(),
-                block_ulid: "block".to_owned(),
-                chunk_file_path: "unused-when-skipping-chunks".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 100,
-                chunk_maxt: 200,
-                labels: BTreeMap::from([
-                    ("__name__".to_owned(), "up".to_owned()),
-                    ("cluster".to_owned(), "test".to_owned()),
-                ]),
-            }]),
-            blocks: Arc::new(vec![BlockMetadata {
-                repository_uri: "file:///blocks".to_owned(),
-                block_ulid: "block".to_owned(),
-                min_time: 100,
-                max_time: 200,
-                downsample_resolution: 0,
-                external_labels: BTreeMap::from([("cluster".to_owned(), "test".to_owned())]),
-                compaction_sources: vec!["block".to_owned()],
-            }]),
-            storage: RepositoryRegistry::empty(),
+            state: SharedReaderState {
+                snapshot: Arc::new(RwLock::new(Arc::new(ReaderSnapshot {
+                    context: SessionContext::new(),
+                    descriptors: vec![ChunkDescriptor {
+                        repository_uri: "file:///blocks".to_owned(),
+                        block_ulid: "block".to_owned(),
+                        chunk_file_path: "unused-when-skipping-chunks".to_owned(),
+                        chunk_file_offset: 0,
+                        chunk_mint: 100,
+                        chunk_maxt: 200,
+                        labels: BTreeMap::from([
+                            ("__name__".to_owned(), "up".to_owned()),
+                            ("cluster".to_owned(), "test".to_owned()),
+                        ]),
+                    }],
+                    blocks: vec![BlockMetadata {
+                        repository_uri: "file:///blocks".to_owned(),
+                        block_ulid: "block".to_owned(),
+                        min_time: 100,
+                        max_time: 200,
+                        downsample_resolution: 0,
+                        external_labels: BTreeMap::from([(
+                            "cluster".to_owned(),
+                            "test".to_owned(),
+                        )]),
+                        compaction_sources: vec!["block".to_owned()],
+                    }],
+                    operators: BTreeMap::new(),
+                    _cache_generation: None,
+                }))),
+            },
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

@@ -1,0 +1,29 @@
+# Rust build outputs and tooling
+target/
+**/*.rs.bk
+rustc-ice-*.txt
+*.pdb
+*.profraw
+
+# Go build outputs, test artifacts, and workspace files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+vendor/
+go.work
+go.work.sum
+
+# Local configuration and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/

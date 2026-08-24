@@ -1,4 +1,6 @@
 listen_addr = "127.0.0.1:4100"
+metrics_listen_addr = "127.0.0.1:9090"
+index_cache_location = "target/index_cache"
 
 [[repositories]]
 name = "local"

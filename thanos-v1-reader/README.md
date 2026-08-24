@@ -40,14 +40,31 @@ will monitor and use to answer queries:
 
 ```toml
 listen_addr = "127.0.0.1:50051"
+metrics_listen_addr = "127.0.0.1:9090"
+index_cache_location = "target"
 
 [[repositories]]
 name = "local-fixtures"
 uri = "file://../thanos-block-gen/target"
 ```
 
-Each repository needs a non-empty `name` and `uri`. Repository URIs are currently loaded and
-logged at startup; reading their block data is the next implementation step.
+Each repository needs a non-empty `name` and `uri`. The reader uses OpenDAL for repository
+access. Before accepting requests, it scans all repository `meta.json` files and writes a single
+Parquet block index to `block_index.parquet` under `index_cache_location`.
+
+The Prometheus scrape endpoint listens on `metrics_listen_addr` and serves metrics at
+`/metrics`. OpenDAL operations are recorded with OpenDAL's metrics layer and traced with its
+OpenTelemetry layer. Configure standard `OTEL_EXPORTER_OTLP_*` environment variables to send
+traces to an OTLP collector. Set `METRICS_LISTEN_ADDR` to temporarily override the configured
+metrics endpoint address.
+
+Logging defaults to `debug`. Override it with `RUST_LOG`:
+
+```bash
+RUST_LOG=info cargo run
+RUST_LOG=debug cargo run
+RUST_LOG=thanos_v1_reader=debug,datafusion=info cargo run
+```
 
 The server listens on the configured address. Set `FLIGHT_LISTEN_ADDR` to override it temporarily:
 
@@ -61,10 +78,12 @@ This scaffold implements Flight SQL statement queries. A client sends `CommandSt
 through `GetFlightInfo`; the server plans it with DataFusion and returns a Flight SQL statement
 ticket. Supplying that ticket to `DoGet` streams the Arrow record batches.
 
-At startup, the server registers an in-memory `metrics` table:
+At startup, the server registers the generated `block_index` Parquet file:
 
 ```sql
-SELECT timestamp_ms, metric, value FROM metrics WHERE metric = 'up'
+SELECT block_ulid, min_time, max_time, downsample_resolution
+FROM block_index
+WHERE external_labels_map['cluster'] = 'dummy'
 ```
 
 ## Flight SQL CLI

@@ -140,6 +140,8 @@ struct ChunkIndexRow {
     repository_uri: String,
     block_ulid: String,
     block_path: String,
+    downsample_resolution: i64,
+    metric_name: String,
     chunk_file_path: String,
     chunk_ref: u64,
     chunk_file_seq: u32,
@@ -153,13 +155,41 @@ struct ChunkIndexRow {
     labels_json: String,
 }
 
+/// The DataFusion table schema discovered for one Prometheus metric name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricTableSchema {
+    pub name: String,
+    pub label_columns: BTreeSet<String>,
+}
+
+impl MetricTableSchema {
+    pub fn arrow_schema(&self) -> Arc<Schema> {
+        let mut fields = vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Float64, true),
+            Field::new("downsample_resolution", DataType::Int64, false),
+        ];
+        fields.extend(
+            self.label_columns
+                .iter()
+                .map(|label| Field::new(label, DataType::Utf8, false)),
+        );
+        Arc::new(Schema::new(fields))
+    }
+}
+
 /// Rebuild the block index from all configured repositories and write it through OpenDAL.
 pub async fn build_block_index(
     repositories: &[ThanosRepositoryConfig],
     index_cache_location: &str,
-) -> Result<(), BoxError> {
+) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut rows = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
+    let mut metric_labels = BTreeMap::new();
 
     for repository in repositories {
         let operator = repository_operator(&repository.uri)?;
@@ -192,6 +222,7 @@ pub async fn build_block_index(
             let index = operator.read(&index_path).await?;
             let series = tsdb_index::parse(index.to_bytes().as_ref())?;
             let series_count = series.len();
+            collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
             let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
             let chunk_count = chunk_rows.len();
             let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
@@ -228,7 +259,13 @@ pub async fn build_block_index(
 
     let bytes = block_parquet_bytes(rows)?;
     write_local_file(&block_index_file_path(index_cache_location), bytes).await?;
-    Ok(())
+    Ok(metric_labels
+        .into_iter()
+        .map(|(name, label_columns)| MetricTableSchema {
+            name,
+            label_columns,
+        })
+        .collect())
 }
 
 /// Return the generated block-index parquet location for a configured cache directory.
@@ -369,7 +406,16 @@ fn chunk_rows(
             .last()
             .map(|chunk| chunk.maxt)
             .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
-        let labels_json = serde_json::to_string(&series.labels)?;
+        let metric_name = series
+            .labels
+            .get("__name__")
+            .ok_or_else(|| invalid_data("series is missing __name__ label".to_owned()))?
+            .clone();
+        let mut labels = series.labels.clone();
+        for (name, value) in &meta.thanos.labels {
+            labels.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+        let labels_json = serde_json::to_string(&labels)?;
 
         for chunk in series.chunks {
             let chunk_file_seq = (chunk.reference >> 32) as u32;
@@ -379,7 +425,11 @@ fn chunk_rows(
                 repository_uri: repository.uri.clone(),
                 block_ulid: meta.ulid.clone(),
                 block_path: block_path.to_owned(),
-                chunk_file_path: format!("{block_path}/chunks/{chunk_file_seq:06}"),
+                downsample_resolution: meta.thanos.downsample.resolution,
+                metric_name: metric_name.clone(),
+                // TSDB chunk references use a zero-based segment sequence while block
+                // segment filenames begin at 000001.
+                chunk_file_path: format!("{block_path}/chunks/{:06}", chunk_file_seq + 1),
                 chunk_ref: chunk.reference,
                 chunk_file_seq,
                 chunk_file_offset,
@@ -388,12 +438,35 @@ fn chunk_rows(
                 series_maxt,
                 chunk_mint: chunk.mint,
                 chunk_maxt: chunk.maxt,
-                labels: series.labels.clone(),
+                labels: labels.clone(),
                 labels_json: labels_json.clone(),
             });
         }
     }
     Ok(rows)
+}
+
+fn collect_metric_labels(
+    metric_labels: &mut BTreeMap<String, BTreeSet<String>>,
+    external_labels: &BTreeMap<String, String>,
+    series: &[Series],
+) {
+    for series in series {
+        let Some(metric_name) = series.labels.get("__name__") else {
+            continue;
+        };
+        metric_labels
+            .entry(metric_name.clone())
+            .or_default()
+            .extend(
+                series
+                    .labels
+                    .keys()
+                    .chain(external_labels.keys())
+                    .filter(|label| label.as_str() != "__name__")
+                    .cloned(),
+            );
+    }
 }
 
 fn block_parquet_bytes(rows: Vec<BlockIndexRow>) -> Result<Vec<u8>, BoxError> {
@@ -624,6 +697,8 @@ fn chunk_schema() -> Arc<Schema> {
         Field::new("repository_uri", DataType::Utf8, false),
         Field::new("block_ulid", DataType::Utf8, false),
         Field::new("block_path", DataType::Utf8, false),
+        Field::new("downsample_resolution", DataType::Int64, false),
+        Field::new("metric_name", DataType::Utf8, false),
         Field::new("chunk_file_path", DataType::Utf8, false),
         Field::new("chunk_ref", DataType::UInt64, false),
         Field::new("chunk_file_seq", DataType::UInt32, false),
@@ -672,6 +747,16 @@ fn chunk_record_batch(
                 .map(|row| row.block_path.as_str())
                 .collect::<Vec<_>>(),
         )),
+        Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|row| row.downsample_resolution)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.metric_name.as_str())
+                .collect::<Vec<_>>(),
+        )),
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| row.chunk_file_path.as_str())
@@ -716,7 +801,7 @@ fn chunk_record_batch(
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
-fn repository_operator(uri: &str) -> Result<Operator, BoxError> {
+pub(crate) fn repository_operator(uri: &str) -> Result<Operator, BoxError> {
     let root = uri
         .strip_prefix("file://")
         .ok_or_else(|| invalid_data(format!("unsupported repository URI {uri:?}; use file://")))?;
@@ -774,6 +859,8 @@ mod tests {
             repository_uri: "file:///repository".to_owned(),
             block_ulid: "01M0SQFT00EQ1D78Q8Y8EFD0BZ".to_owned(),
             block_path: "01M0SQFT00EQ1D78Q8Y8EFD0BZ".to_owned(),
+            downsample_resolution: 300_000,
+            metric_name: "up".to_owned(),
             chunk_file_path: "01M0SQFT00EQ1D78Q8Y8EFD0BZ/chunks/000001".to_owned(),
             chunk_ref: (1 << 32) + 8,
             chunk_file_seq: 1,
@@ -809,6 +896,101 @@ mod tests {
         for column in metadata.row_group(0).columns() {
             assert!(column.statistics().is_some(), "{column:?}");
         }
+    }
+
+    #[test]
+    fn metric_schema_collects_all_labels_except_metric_name() {
+        let series = vec![
+            Series {
+                reference: 1,
+                labels: BTreeMap::from([
+                    ("__name__".to_owned(), "requests_total".to_owned()),
+                    ("job".to_owned(), "reader".to_owned()),
+                    ("pod".to_owned(), "one".to_owned()),
+                ]),
+                chunks: Vec::new(),
+            },
+            Series {
+                reference: 2,
+                labels: BTreeMap::from([
+                    ("__name__".to_owned(), "requests_total".to_owned()),
+                    ("instance".to_owned(), "localhost".to_owned()),
+                    ("job".to_owned(), "reader".to_owned()),
+                ]),
+                chunks: Vec::new(),
+            },
+        ];
+        let mut metric_labels = BTreeMap::new();
+
+        collect_metric_labels(
+            &mut metric_labels,
+            &BTreeMap::from([("cluster".to_owned(), "production".to_owned())]),
+            &series,
+        );
+
+        assert_eq!(
+            metric_labels["requests_total"],
+            BTreeSet::from([
+                "cluster".to_owned(),
+                "instance".to_owned(),
+                "job".to_owned(),
+                "pod".to_owned(),
+            ])
+        );
+        let schema = MetricTableSchema {
+            name: "requests_total".to_owned(),
+            label_columns: metric_labels.remove("requests_total").unwrap(),
+        }
+        .arrow_schema();
+        assert_eq!(
+            schema
+                .field_with_name("downsample_resolution")
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
+        assert!(schema.field_with_name("__name__").is_err());
+        assert!(!schema.field_with_name("cluster").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn chunk_index_labels_include_block_external_labels() {
+        let meta = BlockMeta {
+            ulid: "01M0SQFT00EQ1D78Q8Y8EFD0BZ".to_owned(),
+            min_time: 100,
+            max_time: 200,
+            version: 1,
+            stats: BlockStats::default(),
+            compaction: Compaction::default(),
+            thanos: ThanosMeta {
+                labels: BTreeMap::from([("cluster".to_owned(), "production".to_owned())]),
+                ..ThanosMeta::default()
+            },
+        };
+        let repository = ThanosRepositoryConfig {
+            name: "repository".to_owned(),
+            uri: "file:///repository".to_owned(),
+        };
+        let series = vec![Series {
+            reference: 16,
+            labels: BTreeMap::from([
+                ("__name__".to_owned(), "up".to_owned()),
+                ("job".to_owned(), "reader".to_owned()),
+            ]),
+            chunks: vec![tsdb_index::Chunk {
+                mint: 100,
+                maxt: 200,
+                reference: (1 << 32) + 8,
+            }],
+        }];
+
+        let rows = chunk_rows(&repository, &meta, &meta.ulid, series).unwrap();
+
+        assert_eq!(rows[0].labels["cluster"], "production");
+        assert_eq!(
+            rows[0].labels_json,
+            r#"{"__name__":"up","cluster":"production","job":"reader"}"#
+        );
     }
 
     #[test]

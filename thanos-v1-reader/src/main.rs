@@ -1,15 +1,21 @@
 mod block_index;
+mod chunk_reader;
 mod config;
 mod flight_service;
+mod metric_table;
 mod tsdb_index;
 
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, sync::Arc};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use axum::{Router, extract::State, routing::get};
-use block_index::{block_index_file_path, build_block_index, chunk_index_directory_path};
+use block_index::{
+    MetricTableSchema, block_index_file_path, build_block_index, chunk_index_directory_path,
+};
 use config::ReaderConfig;
 use datafusion::{
+    catalog::MemorySchemaProvider,
+    common::TableReference,
     execution::SessionStateBuilder,
     prelude::{ParquetReadOptions, SessionConfig, SessionContext},
 };
@@ -18,6 +24,7 @@ use datafusion_tracing::{
     instrument_with_info_spans,
 };
 use flight_service::DataFusionFlightService;
+use metric_table::MetricTableProvider;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use opentelemetry::{global, trace::TracerProvider as _};
 use opentelemetry_otlp::SpanExporter;
@@ -49,7 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "configured Thanos repository"
         );
     }
-    build_block_index(&config.repositories, &config.index_cache_location).await?;
+    let metric_table_schemas =
+        build_block_index(&config.repositories, &config.index_cache_location).await?;
     let block_index_path = block_index_file_path(&config.index_cache_location);
     let chunk_index_path = chunk_index_directory_path(&config.index_cache_location);
     tracing::info!(
@@ -58,7 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(path = %chunk_index_path, "generated Thanos chunks indexes");
 
-    let context = index_context(&block_index_path, &chunk_index_path).await?;
+    let context = index_context(
+        &block_index_path,
+        &chunk_index_path,
+        &metric_table_schemas,
+        &config.repositories,
+    )
+    .await?;
     let service = DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
     tracing::info!(
         address = %metrics_address,
@@ -117,6 +131,8 @@ async fn prometheus_metrics(State(handle): State<PrometheusHandle>) -> String {
 async fn index_context(
     block_index_path: &str,
     chunk_index_path: &str,
+    metric_table_schemas: &[MetricTableSchema],
+    repositories: &[config::ThanosRepositoryConfig],
 ) -> Result<SessionContext, datafusion::error::DataFusionError> {
     let execution_options = InstrumentationOptions::builder()
         .record_metrics(true)
@@ -139,5 +155,132 @@ async fn index_context(
     context
         .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
         .await?;
+    register_metric_tables(&context, metric_table_schemas, repositories).await?;
     Ok(context)
+}
+
+async fn register_metric_tables(
+    context: &SessionContext,
+    metric_table_schemas: &[MetricTableSchema],
+    repositories: &[config::ThanosRepositoryConfig],
+) -> Result<(), datafusion::error::DataFusionError> {
+    let catalog = context.catalog("datafusion").ok_or_else(|| {
+        datafusion::error::DataFusionError::Internal("default catalog is missing".to_owned())
+    })?;
+    catalog.register_schema("metrics", Arc::new(MemorySchemaProvider::new()))?;
+
+    let chunk_provider = context.table_provider("chunks").await?;
+    for metric_table_schema in metric_table_schemas {
+        let table = MetricTableProvider::new(
+            metric_table_schema.clone(),
+            chunk_provider.clone(),
+            repositories,
+        )?;
+        context.register_table(
+            TableReference::full("datafusion", "metrics", metric_table_schema.name.as_str()),
+            Arc::new(table),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn registers_metric_table_in_metrics_schema() {
+        let context = SessionContext::new();
+        context
+            .register_table(
+                "chunks",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(
+                        Arc::new(arrow::datatypes::Schema::empty()),
+                        vec![vec![]],
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        register_metric_tables(
+            &context,
+            &[MetricTableSchema {
+                name: "dummy_requests_total".to_owned(),
+                label_columns: BTreeSet::from(["job".to_owned(), "pod".to_owned()]),
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let table = context
+            .table_provider("metrics.dummy_requests_total")
+            .await
+            .unwrap();
+        let schema = table.schema();
+        assert!(schema.field_with_name("job").is_ok());
+        assert!(schema.field_with_name("pod").is_ok());
+        assert_eq!(
+            schema
+                .field_with_name("downsample_resolution")
+                .unwrap()
+                .data_type(),
+            &arrow::datatypes::DataType::Int64
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_counter_samples_from_fixture_chunk_cache() {
+        let fixture_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen/target");
+        if !fixture_root.exists() {
+            return;
+        }
+        let cache = std::env::temp_dir().join(format!(
+            "thanos-v1-reader-metric-query-{}",
+            std::process::id()
+        ));
+        let repository = config::ThanosRepositoryConfig {
+            name: "fixtures".to_owned(),
+            uri: format!("file://{}", fixture_root.display()),
+        };
+        let schemas = build_block_index(&[repository], cache.to_str().unwrap())
+            .await
+            .unwrap();
+        let context = index_context(
+            &block_index_file_path(cache.to_str().unwrap()),
+            &chunk_index_directory_path(cache.to_str().unwrap()),
+            &schemas,
+            &[config::ThanosRepositoryConfig {
+                name: "fixtures".to_owned(),
+                uri: format!("file://{}", fixture_root.display()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let batches = context
+            .sql(
+                "SELECT timestamp, value, downsample_resolution, \"cluster\" \
+                 FROM metrics.dummy_requests_total \
+                 WHERE downsample_resolution = 0 \
+                 LIMIT 1",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(arrow::record_batch::RecordBatch::num_rows)
+                .sum::<usize>(),
+            1
+        );
+        std::fs::remove_dir_all(cache).unwrap();
+    }
 }

@@ -4170,6 +4170,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "xxhash-rust",
 ]
 
 [[package]]

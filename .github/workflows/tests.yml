@@ -81,3 +81,4 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-e2e-
       - run: cargo test --test counter_parity
+      - run: cargo test --test native_histogram_parity

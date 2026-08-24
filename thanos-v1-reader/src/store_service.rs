@@ -6,7 +6,7 @@ use std::{
 };
 
 use arrow::{
-    array::{Array, Int64Array, StringArray, UInt64Array},
+    array::{Array, Int64Array, StringArray, StringViewArray, UInt64Array},
     record_batch::RecordBatch,
 };
 use datafusion::prelude::SessionContext;
@@ -362,9 +362,17 @@ impl ThanosStoreService {
         };
         match chunk {
             EncodedChunk::Xor(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
-                result.raw = Some(xor_chunk(data));
+                result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::Xor));
             }
-            EncodedChunk::Xor(_) => return Ok(None),
+            EncodedChunk::Histogram(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
+                result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::Histogram));
+            }
+            EncodedChunk::FloatHistogram(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
+                result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::FloatHistogram));
+            }
+            EncodedChunk::Xor(_) | EncodedChunk::Histogram(_) | EncodedChunk::FloatHistogram(_) => {
+                return Ok(None);
+            }
             EncodedChunk::Aggregate {
                 count,
                 sum,
@@ -393,11 +401,12 @@ impl ThanosStoreService {
     }
 }
 
-fn xor_chunk(data: Vec<u8>) -> Chunk {
+fn raw_chunk(data: Vec<u8>, encoding: thanos::chunk::Encoding) -> Chunk {
+    let hash = xxhash_rust::xxh64::xxh64(&data, 0);
     Chunk {
-        r#type: thanos::chunk::Encoding::Xor as i32,
+        r#type: encoding as i32,
         data,
-        hash: 0,
+        hash,
     }
 }
 
@@ -410,7 +419,7 @@ fn aggregate_chunk(
         .contains(&(aggregate as i32))
         .then_some(data)
         .flatten()
-        .map(xor_chunk)
+        .map(|data| raw_chunk(data, thanos::chunk::Encoding::Xor))
 }
 
 fn reject_unsupported_series_options(request: &thanos::SeriesRequest) -> Result<(), Status> {
@@ -567,13 +576,13 @@ fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, B
     (0..batch.num_rows())
         .map(|index| {
             Ok(ChunkDescriptor {
-                repository_uri: repository_uri.value(index).to_owned(),
-                chunk_file_path: chunk_file_path.value(index).to_owned(),
+                repository_uri: string_value(repository_uri, index)?.to_owned(),
+                chunk_file_path: string_value(chunk_file_path, index)?.to_owned(),
                 chunk_file_offset: chunk_file_offset.value(index),
                 chunk_mint: chunk_mint.value(index),
                 chunk_maxt: chunk_maxt.value(index),
                 downsample_resolution: downsample_resolution.value(index),
-                labels: serde_json::from_str(labels_json.value(index))?,
+                labels: serde_json::from_str(string_value(labels_json, index)?)?,
             })
         })
         .collect()
@@ -588,19 +597,32 @@ fn blocks_from_batch(batch: &RecordBatch) -> Result<Vec<BlockMetadata>, BoxError
             Ok(BlockMetadata {
                 min_time: min_time.value(index),
                 max_time: max_time.value(index),
-                external_labels: serde_json::from_str(external_labels.value(index))?,
+                external_labels: serde_json::from_str(string_value(external_labels, index)?)?,
             })
         })
         .collect()
 }
 
-fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, BoxError> {
-    batch
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a dyn Array, BoxError> {
+    let array = batch
         .column_by_name(name)
         .ok_or_else(|| format!("missing column {name:?}"))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("column {name:?} has an unexpected type").into())
+        .as_ref();
+    if array.as_any().is::<StringArray>() || array.as_any().is::<StringViewArray>() {
+        Ok(array)
+    } else {
+        Err(format!("column {name:?} has an unexpected type").into())
+    }
+}
+
+fn string_value(array: &dyn Array, index: usize) -> Result<&str, BoxError> {
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(array.value(index));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(array.value(index));
+    }
+    Err("array has an unexpected string type".into())
 }
 
 fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array, BoxError> {

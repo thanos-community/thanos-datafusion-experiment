@@ -117,9 +117,9 @@ thanos query \
   --endpoint=127.0.0.1:50051
 ```
 
-The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR chunks. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
+The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR, histogram, and float-histogram chunks with Go-compatible chunk hashes. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, XOR and aggregate XOR chunks, and startup-time index construction. It does not support native histogram chunks, StoreAPI sharding, opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
+Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, aggregate XOR chunks, and startup-time index construction. It does not support native histogram aggregate slots, StoreAPI sharding, opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
 
 ## Flight SQL CLI
 

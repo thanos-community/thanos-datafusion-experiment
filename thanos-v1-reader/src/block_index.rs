@@ -55,7 +55,7 @@ struct BlockStats {
     num_samples: u64,
     #[serde(rename = "numFloatSamples")]
     num_float_samples: u64,
-    #[serde(rename = "numHistogramSamples")]
+    #[serde(rename = "numHistogramSamples", default)]
     num_histogram_samples: u64,
     #[serde(rename = "numSeries")]
     num_series: u64,

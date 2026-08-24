@@ -6,7 +6,7 @@ use std::{
 };
 
 use arrow::{
-    array::{Array, Int64Array, StringArray, StringViewArray, UInt64Array},
+    array::{Array, ArrayRef, Int64Array, StringArray, StringViewArray, UInt64Array},
     record_batch::RecordBatch,
 };
 use datafusion::prelude::SessionContext;
@@ -576,13 +576,13 @@ fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, B
     (0..batch.num_rows())
         .map(|index| {
             Ok(ChunkDescriptor {
-                repository_uri: string_value(repository_uri, index)?.to_owned(),
-                chunk_file_path: string_value(chunk_file_path, index)?.to_owned(),
+                repository_uri: string_value(repository_uri.as_ref(), index)?,
+                chunk_file_path: string_value(chunk_file_path.as_ref(), index)?,
                 chunk_file_offset: chunk_file_offset.value(index),
                 chunk_mint: chunk_mint.value(index),
                 chunk_maxt: chunk_maxt.value(index),
                 downsample_resolution: downsample_resolution.value(index),
-                labels: serde_json::from_str(string_value(labels_json, index)?)?,
+                labels: serde_json::from_str(&string_value(labels_json.as_ref(), index)?)?,
             })
         })
         .collect()
@@ -597,32 +597,30 @@ fn blocks_from_batch(batch: &RecordBatch) -> Result<Vec<BlockMetadata>, BoxError
             Ok(BlockMetadata {
                 min_time: min_time.value(index),
                 max_time: max_time.value(index),
-                external_labels: serde_json::from_str(string_value(external_labels, index)?)?,
+                external_labels: serde_json::from_str(&string_value(
+                    external_labels.as_ref(),
+                    index,
+                )?)?,
             })
         })
         .collect()
 }
 
-fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a dyn Array, BoxError> {
-    let array = batch
+fn string_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef, BoxError> {
+    batch
         .column_by_name(name)
-        .ok_or_else(|| format!("missing column {name:?}"))?
-        .as_ref();
-    if array.as_any().is::<StringArray>() || array.as_any().is::<StringViewArray>() {
-        Ok(array)
-    } else {
-        Err(format!("column {name:?} has an unexpected type").into())
-    }
+        .cloned()
+        .ok_or_else(|| format!("missing column {name:?}").into())
 }
 
-fn string_value(array: &dyn Array, index: usize) -> Result<&str, BoxError> {
+fn string_value(array: &dyn Array, index: usize) -> Result<String, BoxError> {
     if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(array.value(index));
+        return Ok(array.value(index).to_owned());
     }
     if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
-        return Ok(array.value(index));
+        return Ok(array.value(index).to_owned());
     }
-    Err("array has an unexpected string type".into())
+    Err("expected a UTF-8 column".into())
 }
 
 fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array, BoxError> {

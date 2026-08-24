@@ -155,8 +155,11 @@ as `hintspb.SeriesResponseHints`.
 semantics across every overlapping resolution.
 `Info` reports the loaded store's external label sets, global time range, merged per-TSDB ranges,
 and the sharding and replica-label capabilities implemented by the reader.
+The binary rebuilds its loaded-block view at `block_sync_interval` (default `15m`). Refreshes stage
+and validate a complete cache generation before one atomic publication shared by StoreAPI and
+Flight SQL requests; a failed refresh leaves the previous healthy snapshot active.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, native histogram SUM/COUNTER aggregate slots, and startup-time index construction. It does not support projection hints and does not refresh the block index while running.
+Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, and native histogram SUM/COUNTER aggregate slots. It does not support projection hints. Block refresh currently treats any incomplete/corrupt candidate as a failed atomic generation; deletion-mark delay and object-store consistency-delay policies are not implemented.
 
 ## Flight SQL CLI
 

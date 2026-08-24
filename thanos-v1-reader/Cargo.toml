@@ -51,6 +51,10 @@ path = "e2e/storeapi_label_endpoints_parity.rs"
 name = "storeapi_info_parity"
 path = "e2e/storeapi_info_parity.rs"
 
+[[test]]
+name = "dynamic_block_refresh_parity"
+path = "e2e/dynamic_block_refresh_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }
@@ -60,6 +64,7 @@ crc = "3.4.0"
 datafusion = "54.1.0"
 datafusion-tracing = "54.0.0"
 futures = "0.3.34"
+humantime-serde = "1.1.1"
 metrics-exporter-prometheus = "0.18.3"
 opendal = { version = "0.58.2", features = ["layers-metrics", "layers-otel-trace", "services-fs"] }
 opentelemetry = "0.32.0"

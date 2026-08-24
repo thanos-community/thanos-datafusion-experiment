@@ -11,6 +11,7 @@ use tonic::transport::Server;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub mod block_index;
+pub mod block_sync;
 pub mod chunk_reader;
 pub mod config;
 pub mod flight_service;
@@ -106,7 +107,7 @@ pub async fn register_metric_tables(
 const LISTEN_ADDR_ENV_VAR: &str = "FLIGHT_LISTEN_ADDR";
 const METRICS_LISTEN_ADDR_ENV_VAR: &str = "METRICS_LISTEN_ADDR";
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing()?;
     let prometheus_handle = PrometheusBuilder::new().install_recorder()?;
 
@@ -141,8 +142,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let store_service =
         store_service::ThanosStoreService::new(context.clone(), &config.repositories).await?;
-    let service =
-        flight_service::DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
+    let refresher = block_sync::BlockRefresher::new(
+        store_service.shared_state(),
+        &config.repositories,
+        &config.index_cache_location,
+    );
+    let service = flight_service::DataFusionFlightService::new_shared(
+        store_service.shared_state(),
+        format!("grpc+tcp://{address}"),
+    );
+    let sync_interval = config.block_sync_interval;
+    let refresh_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sync_interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Err(error) = refresher.refresh().await {
+                tracing::warn!(%error, "block refresh failed; retaining previous snapshot");
+            }
+        }
+    });
     tracing::info!(
         address = %metrics_address,
         path = "/metrics",
@@ -150,7 +169,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(%address, "starting DataFusion Arrow Flight server");
 
-    Server::builder()
+    let server_result = Server::builder()
         .add_service(FlightServiceServer::new(service))
         .add_service(thanos_proto::thanos::store_server::StoreServer::new(
             store_service.clone(),
@@ -159,12 +178,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             store_service,
         ))
         .serve(socket_address)
-        .await?;
+        .await;
+    refresh_task.abort();
+    server_result?;
 
     Ok(())
 }
 
-fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
+fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let exporter = SpanExporter::builder().with_tonic().build()?;
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
@@ -184,7 +205,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
 async fn start_metrics_server(
     address: &str,
     prometheus_handle: PrometheusHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(address).await?;
     let app = Router::new()
         .route("/metrics", get(prometheus_metrics))

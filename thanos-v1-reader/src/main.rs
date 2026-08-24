@@ -1,3 +1,4 @@
+mod config;
 mod flight_service;
 
 use std::{env, net::SocketAddr, sync::Arc};
@@ -8,21 +9,31 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::flight_service_server::FlightServiceServer;
+use config::ReaderConfig;
 use datafusion::prelude::SessionContext;
 use flight_service::DataFusionFlightService;
 use tonic::transport::Server;
 
-const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:50051";
+const LISTEN_ADDR_ENV_VAR: &str = "FLIGHT_LISTEN_ADDR";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let address = env::var("FLIGHT_LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.into());
+    let config_path = ReaderConfig::config_path();
+    let config = ReaderConfig::load(&config_path)?;
+    let address = env::var(LISTEN_ADDR_ENV_VAR).unwrap_or(config.listen_addr);
     let socket_address: SocketAddr = address.parse()?;
     let context = example_context()?;
     let service = DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
 
+    for repository in &config.repositories {
+        tracing::info!(
+            name = %repository.name,
+            uri = %repository.uri,
+            "configured Thanos repository"
+        );
+    }
     tracing::info!(%address, "starting DataFusion Arrow Flight server");
 
     Server::builder()

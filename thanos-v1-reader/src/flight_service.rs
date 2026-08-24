@@ -1,15 +1,15 @@
-use std::str;
+use std::{pin::Pin, str};
 
 use arrow_flight::{
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Ticket,
     encode::FlightDataEncoderBuilder,
     flight_service_server::FlightService,
     sql::{CommandStatementQuery, ProstMessageExt, TicketStatementQuery, server::FlightSqlService},
 };
 use datafusion::prelude::SessionContext;
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use prost::Message;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 /// A minimal Flight SQL service backed by a DataFusion session.
 ///
@@ -44,6 +44,19 @@ impl DataFusionFlightService {
 #[tonic::async_trait]
 impl FlightSqlService for DataFusionFlightService {
     type FlightService = Self;
+
+    async fn do_handshake(
+        &self,
+        _request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>, Status>
+    {
+        let response = HandshakeResponse {
+            protocol_version: 0,
+            payload: Default::default(),
+        };
+
+        Ok(Response::new(Box::pin(stream::iter([Ok(response)]))))
+    }
 
     async fn get_flight_info_statement(
         &self,

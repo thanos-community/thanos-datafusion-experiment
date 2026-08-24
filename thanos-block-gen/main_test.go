@@ -131,3 +131,33 @@ func TestAllMetricFamiliesHaveRequestedPodCardinality(t *testing.T) {
 		}
 	}
 }
+
+func TestFixtureLabelValuesAreDistinctAndIdentifiable(t *testing.T) {
+	values := newFixtureLabelValues(config{
+		instances:    2,
+		pods:         3,
+		routes:       4,
+		nativeSeries: 5,
+	})
+
+	for prefix, labels := range map[string][]string{
+		"instance-": values.instances,
+		"pod-":      values.pods,
+		"route-":    values.routes,
+		"series-":   values.series,
+	} {
+		seen := make(map[string]struct{}, len(labels))
+		for _, value := range labels {
+			if !strings.HasPrefix(value, prefix) {
+				t.Errorf("label value %q does not start with %q", value, prefix)
+			}
+			seen[value] = struct{}{}
+		}
+		if len(seen) != len(labels) {
+			t.Errorf("%s labels are not distinct: %v", prefix, labels)
+		}
+	}
+	if !strings.HasPrefix(values.job, "job-") {
+		t.Errorf("job label %q does not start with job-", values.job)
+	}
+}

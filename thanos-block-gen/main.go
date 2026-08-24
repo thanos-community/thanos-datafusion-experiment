@@ -29,6 +29,11 @@ import (
 
 const fiveMinutesMillis int64 = 5 * 60 * 1000
 
+var fixtureLabelDictionary = []string{
+	"amber", "birch", "cobalt", "dahlia", "ember", "falcon", "grove", "harbor",
+	"indigo", "juniper", "kepler", "linden", "marble", "nova", "onyx", "prairie",
+}
+
 type config struct {
 	output         string
 	mint           int64
@@ -357,35 +362,36 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 	classicBounds := []float64{0.1, 0.25, 0.5, 1, math.Inf(1)}
 	step := (cfg.maxt - cfg.mint) / int64(cfg.samples)
 	instances, pods, routes, nativeSeries := cfg.dimensions()
+	fixtureLabels := newFixtureLabelValues(cfg)
 
 	for i := 0; i < cfg.samples; i++ {
 		timestamp := cfg.mint + int64(i)*step
 		app := head.Appender(ctx)
 		for pod := 0; pod < pods; pod++ {
 			instance := pod % instances
-			instanceLabel := fmt.Sprintf("generator-%02d", instance)
-			podLabel := fmt.Sprintf("generator-%03d", pod)
-			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_requests_total", "instance", instanceLabel, "job", "generator", "method", "GET", "pod", podLabel), timestamp, float64(1_000+pod*100+i*7)); err != nil {
+			instanceLabel := fixtureLabels.instances[instance]
+			podLabel := fixtureLabels.pods[pod]
+			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_requests_total", "instance", instanceLabel, "job", fixtureLabels.job, "method", "GET", "pod", podLabel), timestamp, float64(1_000+pod*100+i*7)); err != nil {
 				return err
 			}
-			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_temperature_celsius", "instance", instanceLabel, "job", "generator", "pod", podLabel, "room", "lab"), timestamp, 20+float64(instance)/10+math.Sin(float64(i+pod)/6)*4); err != nil {
+			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_temperature_celsius", "instance", instanceLabel, "job", fixtureLabels.job, "pod", podLabel, "room", "lab"), timestamp, 20+float64(instance)/10+math.Sin(float64(i+pod)/6)*4); err != nil {
 				return err
 			}
 		}
 		for route := 0; route < routes; route++ {
-			routeLabel := fmt.Sprintf("/api/v1/resource/%d", route)
+			routeLabel := fixtureLabels.routes[route]
 			for pod := 0; pod < pods; pod++ {
-				podLabel := fmt.Sprintf("generator-%03d", pod)
+				podLabel := fixtureLabels.pods[pod]
 				observations := float64(i + route + pod + 1)
-				if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_sum", "job", "generator", "pod", podLabel, "route", routeLabel), timestamp, observations*0.42); err != nil {
+				if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_sum", "job", fixtureLabels.job, "pod", podLabel, "route", routeLabel), timestamp, observations*0.42); err != nil {
 					return err
 				}
-				if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_count", "job", "generator", "pod", podLabel, "route", routeLabel), timestamp, observations); err != nil {
+				if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_count", "job", fixtureLabels.job, "pod", podLabel, "route", routeLabel), timestamp, observations); err != nil {
 					return err
 				}
 				for bucketIndex, bound := range classicBounds {
 					count := math.Min(observations, float64((bucketIndex+1)*(i+2)))
-					if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_bucket", "job", "generator", "le", strconv.FormatFloat(bound, 'g', -1, 64), "pod", podLabel, "route", routeLabel), timestamp, count); err != nil {
+					if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_bucket", "job", fixtureLabels.job, "le", strconv.FormatFloat(bound, 'g', -1, 64), "pod", podLabel, "route", routeLabel), timestamp, count); err != nil {
 						return err
 					}
 				}
@@ -393,14 +399,14 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 		}
 
 		for series := 0; series < nativeSeries; series++ {
-			seriesLabel := fmt.Sprintf("native-%02d", series)
+			seriesLabel := fixtureLabels.series[series]
 			for pod := 0; pod < pods; pod++ {
-				podLabel := fmt.Sprintf("generator-%03d", pod)
-				if _, err := app.AppendHistogram(0, labels.FromStrings(labels.MetricName, "dummy_native_histogram", "job", "generator", "pod", podLabel, "series", seriesLabel), timestamp, nativeHistogram(i+series+pod), nil); err != nil {
+				podLabel := fixtureLabels.pods[pod]
+				if _, err := app.AppendHistogram(0, labels.FromStrings(labels.MetricName, "dummy_native_histogram", "job", fixtureLabels.job, "pod", podLabel, "series", seriesLabel), timestamp, nativeHistogram(i+series+pod), nil); err != nil {
 					_ = app.Rollback()
 					return fmt.Errorf("append native histogram: %w", err)
 				}
-				if _, err := app.AppendHistogram(0, labels.FromStrings(labels.MetricName, "dummy_float_native_histogram", "job", "generator", "pod", podLabel, "series", seriesLabel), timestamp, nil, floatNativeHistogram(i+series+pod)); err != nil {
+				if _, err := app.AppendHistogram(0, labels.FromStrings(labels.MetricName, "dummy_float_native_histogram", "job", fixtureLabels.job, "pod", podLabel, "series", seriesLabel), timestamp, nil, floatNativeHistogram(i+series+pod)); err != nil {
 					_ = app.Rollback()
 					return fmt.Errorf("append float native histogram: %w", err)
 				}
@@ -411,6 +417,34 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 		}
 	}
 	return nil
+}
+
+type fixtureLabelValues struct {
+	instances []string
+	job       string
+	pods      []string
+	routes    []string
+	series    []string
+}
+
+func newFixtureLabelValues(cfg config) fixtureLabelValues {
+	instances, pods, routes, nativeSeries := cfg.dimensions()
+	return fixtureLabelValues{
+		instances: labelValues("instance", instances, 1),
+		job:       labelValues("job", 1, 3)[0],
+		pods:      labelValues("pod", pods, 5),
+		routes:    labelValues("route", routes, 7),
+		series:    labelValues("series", nativeSeries, 11),
+	}
+}
+
+func labelValues(prefix string, count, offset int) []string {
+	values := make([]string, count)
+	for index := range values {
+		word := fixtureLabelDictionary[(index*7+offset)%len(fixtureLabelDictionary)]
+		values[index] = fmt.Sprintf("%s-%s-%03d", prefix, word, index)
+	}
+	return values
 }
 
 func appendFloat(app storage.Appender, labels labels.Labels, timestamp int64, value float64) error {

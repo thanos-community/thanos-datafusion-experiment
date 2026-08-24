@@ -1,7 +1,7 @@
 .PHONY: reader-dev reader-watch
 
 OTEL_SDK_DISABLED ?= true
-RUST_LOG ?= debug,opentelemetry_sdk=warn
+RUST_LOG ?= debug,opentelemetry_sdk=warn,datafusion=info
 
 export OTEL_SDK_DISABLED RUST_LOG
 

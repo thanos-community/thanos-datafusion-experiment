@@ -240,10 +240,7 @@ fn parse_series(bytes: &[u8], reference: u64, symbols: &[String]) -> Result<Seri
 }
 
 fn symbol(symbols: &[String], reference: u64) -> Result<&str, IndexError> {
-    let index = usize::try_from(reference)
-        .ok()
-        .and_then(|value| value.checked_sub(1))
-        .ok_or_else(|| error("invalid symbol reference"))?;
+    let index = usize::try_from(reference).map_err(|_| error("invalid symbol reference"))?;
     symbols
         .get(index)
         .map(String::as_str)
@@ -315,4 +312,19 @@ fn align_series(offset: usize) -> Result<usize, IndexError> {
 
 fn error(message: impl Into<String>) -> IndexError {
     IndexError(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::symbol;
+
+    #[test]
+    fn symbol_references_are_zero_based() {
+        let symbols = vec![
+            "__name__".to_owned(),
+            "dummy_temperature_celsius".to_owned(),
+        ];
+        assert_eq!(symbol(&symbols, 0).unwrap(), "__name__");
+        assert_eq!(symbol(&symbols, 1).unwrap(), "dummy_temperature_celsius");
+    }
 }

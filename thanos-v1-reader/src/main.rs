@@ -266,6 +266,8 @@ mod tests {
                 "SELECT timestamp, value, downsample_resolution, \"cluster\" \
                  FROM metrics.dummy_requests_total \
                  WHERE downsample_resolution = 0 \
+                   AND pod ~ '^pod-falcon-000$' \
+                   AND timestamp > to_timestamp_millis(0) \
                  LIMIT 1",
             )
             .await

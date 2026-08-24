@@ -4093,6 +4093,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parquet",
  "prost",
+ "regex",
  "rusty-chunkenc",
  "serde",
  "serde_json",

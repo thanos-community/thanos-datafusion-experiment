@@ -10,9 +10,9 @@ use arrow::{
 };
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{DataFusionError, Result},
+    common::{DataFusionError, Result, ScalarValue},
     execution::TaskContext,
-    logical_expr::{Expr, TableType},
+    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType},
     physical_expr::{EquivalenceProperties, Partitioning},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -22,7 +22,8 @@ use datafusion::{
     },
 };
 use futures::{TryStreamExt, stream};
-use opendal::Operator;
+use opendal::Operator as OpendalOperator;
+use regex::Regex;
 
 use crate::{
     block_index::{MetricTableSchema, repository_operator},
@@ -35,7 +36,7 @@ pub struct MetricTableProvider {
     metric_name: String,
     schema: MetricTableSchema,
     chunk_provider: Arc<dyn TableProvider>,
-    operators: BTreeMap<String, Operator>,
+    operators: BTreeMap<String, OpendalOperator>,
 }
 
 impl MetricTableProvider {
@@ -75,9 +76,18 @@ impl TableProvider for MetricTableProvider {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let filters = filters
+            .iter()
+            .map(parse_filter)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "unsupported filter was pushed into metric scan".to_owned(),
+                )
+            })?;
         let metric_filter = datafusion::logical_expr::col("metric_name")
             .eq(datafusion::logical_expr::lit(self.metric_name.clone()));
         let child = self
@@ -89,9 +99,26 @@ impl TableProvider for MetricTableProvider {
             self.schema.arrow_schema(),
             projection.cloned(),
             self.metric_name.clone(),
+            filters,
             self.metric_name.ends_with("_total"),
             self.operators.clone(),
         )))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if parse_filter(filter).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 }
 
@@ -101,8 +128,9 @@ struct MetricScanExec {
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     metric_name: String,
+    filters: Vec<MetricFilter>,
     counter_metric: bool,
-    operators: BTreeMap<String, Operator>,
+    operators: BTreeMap<String, OpendalOperator>,
     properties: Arc<PlanProperties>,
 }
 
@@ -112,8 +140,9 @@ impl MetricScanExec {
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         metric_name: String,
+        filters: Vec<MetricFilter>,
         counter_metric: bool,
-        operators: BTreeMap<String, Operator>,
+        operators: BTreeMap<String, OpendalOperator>,
     ) -> Self {
         let output_schema = projected_schema(&schema, projection.as_deref());
         let properties = Arc::new(PlanProperties::new(
@@ -127,6 +156,7 @@ impl MetricScanExec {
             schema,
             projection,
             metric_name,
+            filters,
             counter_metric,
             operators,
             properties,
@@ -167,6 +197,7 @@ impl ExecutionPlan for MetricScanExec {
             self.schema.clone(),
             self.projection.clone(),
             self.metric_name.clone(),
+            self.filters.clone(),
             self.counter_metric,
             self.operators.clone(),
         )))
@@ -182,6 +213,7 @@ impl ExecutionPlan for MetricScanExec {
         let metric_schema = self.schema.clone();
         let projection = self.projection.clone();
         let metric_name = self.metric_name.clone();
+        let filters = self.filters.clone();
         let operators = self.operators.clone();
         let counter_metric = self.counter_metric;
         let batch = async move {
@@ -191,6 +223,7 @@ impl ExecutionPlan for MetricScanExec {
                 projection.as_deref(),
                 &operators,
                 &metric_name,
+                &filters,
                 counter_metric,
                 descriptors,
             )
@@ -206,8 +239,9 @@ impl ExecutionPlan for MetricScanExec {
 async fn build_metric_batch(
     schema: &SchemaRef,
     projection: Option<&[usize]>,
-    operators: &BTreeMap<String, Operator>,
+    operators: &BTreeMap<String, OpendalOperator>,
     metric_name: &str,
+    filters: &[MetricFilter],
     counter_metric: bool,
     descriptors: Vec<RecordBatch>,
 ) -> Result<RecordBatch> {
@@ -217,6 +251,8 @@ async fn build_metric_batch(
         let chunk_file_path = string_column(&batch, "chunk_file_path")?;
         let chunk_file_offset = uint64_column(&batch, "chunk_file_offset")?;
         let resolution = int64_column(&batch, "downsample_resolution")?;
+        let chunk_mint = int64_column(&batch, "chunk_mint")?;
+        let chunk_maxt = int64_column(&batch, "chunk_maxt")?;
         let labels_json = string_column(&batch, "labels_json")?;
         let descriptor_metric_name = string_column(&batch, "metric_name")?;
 
@@ -235,6 +271,18 @@ async fn build_metric_batch(
             })?;
             let labels: BTreeMap<String, String> = serde_json::from_str(&labels_json)
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            let descriptor = ChunkDescriptor {
+                mint: chunk_mint.value(index),
+                maxt: chunk_maxt.value(index),
+                downsample_resolution: resolution.value(index),
+                labels: &labels,
+            };
+            if !filters
+                .iter()
+                .all(|filter| filter.matches_descriptor(&descriptor))
+            {
+                continue;
+            }
             let samples = chunk_reader::read_samples(
                 operator,
                 &chunk_file_path,
@@ -244,6 +292,12 @@ async fn build_metric_batch(
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
             for sample in samples {
+                if !filters
+                    .iter()
+                    .all(|filter| filter.matches_sample(&sample, resolution.value(index), &labels))
+                {
+                    continue;
+                }
                 rows.push(MetricRow {
                     timestamp: sample.timestamp,
                     value: sample.value,
@@ -254,6 +308,245 @@ async fn build_metric_batch(
         }
     }
     record_batch(schema, projection, &rows)
+}
+
+#[derive(Debug, Clone)]
+enum MetricFilter {
+    Timestamp {
+        operator: Operator,
+        value: i64,
+    },
+    Resolution {
+        operator: Operator,
+        value: i64,
+    },
+    Label {
+        name: String,
+        operator: Operator,
+        value: String,
+    },
+    LabelRegex {
+        name: String,
+        regex: Regex,
+        negated: bool,
+    },
+}
+
+impl MetricFilter {
+    fn matches_descriptor(&self, descriptor: &ChunkDescriptor<'_>) -> bool {
+        match self {
+            Self::Timestamp { operator, value } => match operator {
+                Operator::Eq => descriptor.mint <= *value && descriptor.maxt >= *value,
+                Operator::Gt => descriptor.maxt > *value,
+                Operator::GtEq => descriptor.maxt >= *value,
+                Operator::Lt => descriptor.mint < *value,
+                Operator::LtEq => descriptor.mint <= *value,
+                _ => false,
+            },
+            Self::Resolution { operator, value } => {
+                compare_i64(descriptor.downsample_resolution, *operator, *value)
+            }
+            Self::Label {
+                name,
+                operator,
+                value,
+            } => compare_str(
+                descriptor
+                    .labels
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                *operator,
+                value,
+            ),
+            Self::LabelRegex {
+                name,
+                regex,
+                negated,
+            } => {
+                regex.is_match(
+                    descriptor
+                        .labels
+                        .get(name)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                ) != *negated
+            }
+        }
+    }
+
+    fn matches_sample(
+        &self,
+        sample: &chunk_reader::Sample,
+        downsample_resolution: i64,
+        labels: &BTreeMap<String, String>,
+    ) -> bool {
+        match self {
+            Self::Timestamp { operator, value } => compare_i64(sample.timestamp, *operator, *value),
+            Self::Resolution { operator, value } => {
+                compare_i64(downsample_resolution, *operator, *value)
+            }
+            Self::Label {
+                name,
+                operator,
+                value,
+            } => compare_str(
+                labels.get(name).map(String::as_str).unwrap_or(""),
+                *operator,
+                value,
+            ),
+            Self::LabelRegex {
+                name,
+                regex,
+                negated,
+            } => regex.is_match(labels.get(name).map(String::as_str).unwrap_or("")) != *negated,
+        }
+    }
+}
+
+struct ChunkDescriptor<'a> {
+    mint: i64,
+    maxt: i64,
+    downsample_resolution: i64,
+    labels: &'a BTreeMap<String, String>,
+}
+
+fn parse_filter(expr: &Expr) -> Option<MetricFilter> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return None;
+    };
+    let (column, operator, value) = if let (Some(column), Some(value)) = (
+        column_name(binary.left.as_ref()),
+        scalar_value(binary.right.as_ref()),
+    ) {
+        (column, binary.op, value)
+    } else if let (Some(column), Some(value)) = (
+        column_name(binary.right.as_ref()),
+        scalar_value(binary.left.as_ref()),
+    ) {
+        (column, reverse_operator(binary.op)?, value)
+    } else {
+        return None;
+    };
+
+    match column.as_str() {
+        "timestamp" => scalar_i64(&value).map(|value| MetricFilter::Timestamp { operator, value }),
+        "downsample_resolution" => {
+            scalar_i64(&value).map(|value| MetricFilter::Resolution { operator, value })
+        }
+        "value" => None,
+        _ => {
+            let value = scalar_string(&value)?;
+            match operator {
+                Operator::Eq | Operator::NotEq => Some(MetricFilter::Label {
+                    name: column,
+                    operator,
+                    value,
+                }),
+                Operator::RegexMatch
+                | Operator::RegexIMatch
+                | Operator::RegexNotMatch
+                | Operator::RegexNotIMatch => {
+                    let case_insensitive =
+                        matches!(operator, Operator::RegexIMatch | Operator::RegexNotIMatch);
+                    let negated =
+                        matches!(operator, Operator::RegexNotMatch | Operator::RegexNotIMatch);
+                    let pattern = if case_insensitive {
+                        format!("(?i:{value})")
+                    } else {
+                        value
+                    };
+                    Regex::new(&pattern)
+                        .ok()
+                        .map(|regex| MetricFilter::LabelRegex {
+                            name: column,
+                            regex,
+                            negated,
+                        })
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(column) => Some(column.name.clone()),
+        Expr::Cast(cast) => column_name(cast.expr.as_ref()),
+        Expr::TryCast(cast) => column_name(cast.expr.as_ref()),
+        _ => None,
+    }
+}
+
+fn scalar_value(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(value, _) => Some(value.clone()),
+        Expr::Cast(cast) => scalar_value(cast.expr.as_ref()),
+        Expr::TryCast(cast) => scalar_value(cast.expr.as_ref()),
+        Expr::ScalarFunction(function)
+            if function.name() == "to_timestamp_millis" && function.args.len() == 1 =>
+        {
+            scalar_i64(&scalar_value(&function.args[0])?)
+                .map(|value| ScalarValue::TimestampMillisecond(Some(value), None))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_i64(value: &ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::Int8(Some(value)) => Some(i64::from(*value)),
+        ScalarValue::Int16(Some(value)) => Some(i64::from(*value)),
+        ScalarValue::Int32(Some(value)) => Some(i64::from(*value)),
+        ScalarValue::Int64(Some(value)) => Some(*value),
+        ScalarValue::UInt8(Some(value)) => Some(i64::from(*value)),
+        ScalarValue::UInt16(Some(value)) => Some(i64::from(*value)),
+        ScalarValue::UInt32(Some(value)) => Some(i64::from(*value)),
+        ScalarValue::UInt64(Some(value)) => i64::try_from(*value).ok(),
+        ScalarValue::TimestampMillisecond(Some(value), _) => Some(*value),
+        _ => None,
+    }
+}
+
+fn scalar_string(value: &ScalarValue) -> Option<String> {
+    match value {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn reverse_operator(operator: Operator) -> Option<Operator> {
+    match operator {
+        Operator::Eq | Operator::NotEq => Some(operator),
+        Operator::Gt => Some(Operator::Lt),
+        Operator::GtEq => Some(Operator::LtEq),
+        Operator::Lt => Some(Operator::Gt),
+        Operator::LtEq => Some(Operator::GtEq),
+        _ => None,
+    }
+}
+
+fn compare_i64(left: i64, operator: Operator, right: i64) -> bool {
+    match operator {
+        Operator::Eq => left == right,
+        Operator::NotEq => left != right,
+        Operator::Gt => left > right,
+        Operator::GtEq => left >= right,
+        Operator::Lt => left < right,
+        Operator::LtEq => left <= right,
+        _ => false,
+    }
+}
+
+fn compare_str(left: &str, operator: Operator, right: &str) -> bool {
+    match operator {
+        Operator::Eq => left == right,
+        Operator::NotEq => left != right,
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
@@ -354,4 +647,67 @@ fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| DataFusionError::Execution(format!("invalid chunk index column {name}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_pruning_uses_timestamp_and_missing_label_semantics() {
+        let labels = BTreeMap::from([("pod".to_owned(), "pod-falcon-000".to_owned())]);
+        let descriptor = ChunkDescriptor {
+            mint: 100,
+            maxt: 200,
+            downsample_resolution: 0,
+            labels: &labels,
+        };
+
+        assert!(
+            MetricFilter::Timestamp {
+                operator: Operator::Gt,
+                value: 150,
+            }
+            .matches_descriptor(&descriptor)
+        );
+        assert!(
+            !MetricFilter::Timestamp {
+                operator: Operator::Gt,
+                value: 200,
+            }
+            .matches_descriptor(&descriptor)
+        );
+        assert!(
+            MetricFilter::Label {
+                name: "missing".to_owned(),
+                operator: Operator::Eq,
+                value: "".to_owned(),
+            }
+            .matches_descriptor(&descriptor)
+        );
+        assert!(
+            !MetricFilter::Label {
+                name: "pod".to_owned(),
+                operator: Operator::Eq,
+                value: "pod-amber-000".to_owned(),
+            }
+            .matches_descriptor(&descriptor)
+        );
+        assert!(
+            MetricFilter::LabelRegex {
+                name: "pod".to_owned(),
+                regex: Regex::new(r"^pod-falc.*$").unwrap(),
+                negated: false,
+            }
+            .matches_descriptor(&descriptor)
+        );
+        assert!(
+            !MetricFilter::LabelRegex {
+                name: "pod".to_owned(),
+                regex: Regex::new(r"^pod-falc.*$").unwrap(),
+                negated: true,
+            }
+            .matches_descriptor(&descriptor)
+        );
+    }
 }

@@ -25,12 +25,25 @@ pub enum EncodedChunk {
     Histogram(Vec<u8>),
     FloatHistogram(Vec<u8>),
     Aggregate {
-        count: Option<Vec<u8>>,
-        sum: Option<Vec<u8>>,
-        min: Option<Vec<u8>>,
-        max: Option<Vec<u8>>,
-        counter: Option<Vec<u8>>,
+        count: Option<EncodedAggregateChunk>,
+        sum: Option<EncodedAggregateChunk>,
+        min: Option<EncodedAggregateChunk>,
+        max: Option<EncodedAggregateChunk>,
+        counter: Option<EncodedAggregateChunk>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedAggregateChunk {
+    pub encoding: EncodedAggregateEncoding,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedAggregateEncoding {
+    Xor,
+    Histogram,
+    FloatHistogram,
 }
 
 pub async fn read_encoded_chunk(
@@ -150,13 +163,20 @@ fn decode_aggregate(payload: &[u8]) -> Result<EncodedChunk, io::Error> {
             .get(..slot_size)
             .ok_or_else(|| invalid_data("truncated aggregate chunk slot payload"))?;
         remaining = &remaining[slot_size..];
-        if slot_data[0] != ENCODING_XOR {
-            return Err(invalid_data(format!(
-                "unsupported aggregate chunk encoding {}",
-                slot_data[0]
-            )));
-        }
-        slots.push(Some(slot_data[1..].to_vec()));
+        let encoding = match slot_data[0] {
+            ENCODING_XOR => EncodedAggregateEncoding::Xor,
+            ENCODING_HISTOGRAM => EncodedAggregateEncoding::Histogram,
+            ENCODING_FLOAT_HISTOGRAM => EncodedAggregateEncoding::FloatHistogram,
+            encoding => {
+                return Err(invalid_data(format!(
+                    "unsupported aggregate chunk encoding {encoding}"
+                )));
+            }
+        };
+        slots.push(Some(EncodedAggregateChunk {
+            encoding,
+            data: slot_data[1..].to_vec(),
+        }));
     }
     if !remaining.is_empty() {
         return Err(invalid_data("unexpected trailing aggregate chunk bytes"));
@@ -328,6 +348,32 @@ mod tests {
                 timestamp: 300,
                 value: 42.0
             }]
+        );
+    }
+
+    #[test]
+    fn exposes_float_histogram_aggregate_slots() {
+        let mut aggregate_payload = vec![0];
+        aggregate_payload.extend_from_slice(&[2, ENCODING_FLOAT_HISTOGRAM, 10, 11]);
+        aggregate_payload.extend_from_slice(&[0, 0]);
+        aggregate_payload.extend_from_slice(&[2, ENCODING_FLOAT_HISTOGRAM, 20, 21]);
+        let aggregate_record = framed_record(ENCODING_AGGR, &aggregate_payload);
+
+        assert_eq!(
+            decode_encoded_record(&aggregate_record).unwrap(),
+            EncodedChunk::Aggregate {
+                count: None,
+                sum: Some(EncodedAggregateChunk {
+                    encoding: EncodedAggregateEncoding::FloatHistogram,
+                    data: vec![10, 11],
+                }),
+                min: None,
+                max: None,
+                counter: Some(EncodedAggregateChunk {
+                    encoding: EncodedAggregateEncoding::FloatHistogram,
+                    data: vec![20, 21],
+                }),
+            }
         );
     }
 

@@ -46,7 +46,7 @@ func TestCreatesRawAndFiveMinuteBlocks(t *testing.T) {
 		t.Fatalf("raw samples = %d, want %d samples for every series", rawMeta.Stats.NumSamples, cfg.seriesCount()*cfg.samples)
 	}
 
-	downsampledID, err := create5mBlock(context.Background(), cfg.output, rawID, rawMeta)
+	downsampledID, _, err := create5mBlock(context.Background(), cfg.output, rawID, rawMeta)
 	if err != nil {
 		t.Fatalf("create 5m block: %v", err)
 	}

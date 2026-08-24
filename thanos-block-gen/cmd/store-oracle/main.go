@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/go-kit/log"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
@@ -26,29 +27,53 @@ type oracleSeries struct {
 }
 
 type oracleChunk struct {
-	MinTime  int64                  `json:"min_time"`
-	MaxTime  int64                  `json:"max_time"`
-	Encoding storepb.Chunk_Encoding `json:"encoding"`
-	Data     string                 `json:"data"`
-	Hash     uint64                 `json:"hash"`
-	Samples  []oracleSample         `json:"samples,omitempty"`
-	Count    *oracleEncodedChunk    `json:"count,omitempty"`
-	Sum      *oracleEncodedChunk    `json:"sum,omitempty"`
-	Min      *oracleEncodedChunk    `json:"min,omitempty"`
-	Max      *oracleEncodedChunk    `json:"max,omitempty"`
-	Counter  *oracleEncodedChunk    `json:"counter,omitempty"`
+	MinTime    int64                   `json:"min_time"`
+	MaxTime    int64                   `json:"max_time"`
+	Encoding   storepb.Chunk_Encoding  `json:"encoding"`
+	Data       string                  `json:"data"`
+	Hash       uint64                  `json:"hash"`
+	Samples    []oracleSample          `json:"samples,omitempty"`
+	Histograms []oracleHistogramSample `json:"histograms,omitempty"`
+	Count      *oracleEncodedChunk     `json:"count,omitempty"`
+	Sum        *oracleEncodedChunk     `json:"sum,omitempty"`
+	Min        *oracleEncodedChunk     `json:"min,omitempty"`
+	Max        *oracleEncodedChunk     `json:"max,omitempty"`
+	Counter    *oracleEncodedChunk     `json:"counter,omitempty"`
 }
 
 type oracleEncodedChunk struct {
-	Encoding storepb.Chunk_Encoding `json:"encoding"`
-	Data     string                 `json:"data"`
-	Hash     uint64                 `json:"hash"`
-	Samples  []oracleSample         `json:"samples"`
+	Encoding   storepb.Chunk_Encoding  `json:"encoding"`
+	Data       string                  `json:"data"`
+	Hash       uint64                  `json:"hash"`
+	Samples    []oracleSample          `json:"samples,omitempty"`
+	Histograms []oracleHistogramSample `json:"histograms,omitempty"`
 }
 
 type oracleSample struct {
 	Timestamp int64  `json:"timestamp"`
 	ValueBits uint64 `json:"value_bits"`
+}
+
+type oracleHistogramSample struct {
+	Timestamp          int64        `json:"timestamp"`
+	Kind               string       `json:"kind"`
+	CounterResetHint   int          `json:"counter_reset_hint"`
+	Schema             int32        `json:"schema"`
+	Count              uint64       `json:"count"`
+	SumBits            uint64       `json:"sum_bits"`
+	ZeroThresholdBits  uint64       `json:"zero_threshold_bits"`
+	ZeroCount          uint64       `json:"zero_count"`
+	PositiveSpans      []oracleSpan `json:"positive_spans"`
+	PositiveBuckets    []int64      `json:"positive_buckets,omitempty"`
+	PositiveBucketBits []uint64     `json:"positive_bucket_bits,omitempty"`
+	NegativeSpans      []oracleSpan `json:"negative_spans"`
+	NegativeBuckets    []int64      `json:"negative_buckets,omitempty"`
+	NegativeBucketBits []uint64     `json:"negative_bucket_bits,omitempty"`
+}
+
+type oracleSpan struct {
+	Offset int32  `json:"offset"`
+	Length uint32 `json:"length"`
 }
 
 type seriesServer struct {
@@ -186,6 +211,7 @@ func run() error {
 				convertedChunk.Data = encoded.Data
 				convertedChunk.Hash = encoded.Hash
 				convertedChunk.Samples = encoded.Samples
+				convertedChunk.Histograms = encoded.Histograms
 			}
 			convertedChunk.Count, err = convertOptionalChunk(chunk.Count)
 			if err != nil {
@@ -234,15 +260,16 @@ func parseAggregates(names string) ([]storepb.Aggr, error) {
 }
 
 func convertChunk(chunk *storepb.Chunk) (oracleEncodedChunk, error) {
-	samples, err := decodeFloatSamples(chunk)
+	samples, histograms, err := decodeSamples(chunk)
 	if err != nil {
 		return oracleEncodedChunk{}, err
 	}
 	return oracleEncodedChunk{
-		Encoding: chunk.Type,
-		Data:     hex.EncodeToString(chunk.Data),
-		Hash:     chunk.Hash,
-		Samples:  samples,
+		Encoding:   chunk.Type,
+		Data:       hex.EncodeToString(chunk.Data),
+		Hash:       chunk.Hash,
+		Samples:    samples,
+		Histograms: histograms,
 	}, nil
 }
 
@@ -257,28 +284,89 @@ func convertOptionalChunk(chunk *storepb.Chunk) (*oracleEncodedChunk, error) {
 	return &converted, nil
 }
 
-func decodeFloatSamples(chunk *storepb.Chunk) ([]oracleSample, error) {
-	if chunk.Type != storepb.Chunk_XOR {
-		return nil, nil
-	}
-	decoded, err := chunkenc.FromData(chunkenc.EncXOR, chunk.Data)
+func decodeSamples(chunk *storepb.Chunk) ([]oracleSample, []oracleHistogramSample, error) {
+	encoding := map[storepb.Chunk_Encoding]chunkenc.Encoding{
+		storepb.Chunk_XOR:             chunkenc.EncXOR,
+		storepb.Chunk_HISTOGRAM:       chunkenc.EncHistogram,
+		storepb.Chunk_FLOAT_HISTOGRAM: chunkenc.EncFloatHistogram,
+	}[chunk.Type]
+	decoded, err := chunkenc.FromData(encoding, chunk.Data)
 	if err != nil {
-		return nil, fmt.Errorf("decode XOR chunk: %w", err)
+		return nil, nil, fmt.Errorf("decode chunk: %w", err)
 	}
 	iterator := decoded.Iterator(nil)
 	var samples []oracleSample
+	var histograms []oracleHistogramSample
 	for valueType := iterator.Next(); valueType != chunkenc.ValNone; valueType = iterator.Next() {
-		if valueType != chunkenc.ValFloat {
-			return nil, fmt.Errorf("XOR chunk returned value type %s", valueType)
+		switch valueType {
+		case chunkenc.ValFloat:
+			timestamp, sampleValue := iterator.At()
+			samples = append(samples, oracleSample{
+				Timestamp: timestamp,
+				ValueBits: math.Float64bits(sampleValue),
+			})
+		case chunkenc.ValHistogram:
+			timestamp, value := iterator.AtHistogram(nil)
+			histograms = append(histograms, integerHistogramSample(timestamp, value))
+		case chunkenc.ValFloatHistogram:
+			timestamp, value := iterator.AtFloatHistogram(nil)
+			histograms = append(histograms, floatHistogramSample(timestamp, value))
+		default:
+			return nil, nil, fmt.Errorf("chunk returned value type %s", valueType)
 		}
-		timestamp, sampleValue := iterator.At()
-		samples = append(samples, oracleSample{
-			Timestamp: timestamp,
-			ValueBits: math.Float64bits(sampleValue),
-		})
 	}
 	if err := iterator.Err(); err != nil {
-		return nil, fmt.Errorf("iterate XOR chunk: %w", err)
+		return nil, nil, fmt.Errorf("iterate chunk: %w", err)
 	}
-	return samples, nil
+	return samples, histograms, nil
+}
+
+func integerHistogramSample(timestamp int64, value *histogram.Histogram) oracleHistogramSample {
+	return oracleHistogramSample{
+		Timestamp:         timestamp,
+		Kind:              "histogram",
+		CounterResetHint:  int(value.CounterResetHint),
+		Schema:            value.Schema,
+		Count:             value.Count,
+		SumBits:           math.Float64bits(value.Sum),
+		ZeroThresholdBits: math.Float64bits(value.ZeroThreshold),
+		ZeroCount:         value.ZeroCount,
+		PositiveSpans:     convertSpans(value.PositiveSpans),
+		PositiveBuckets:   value.PositiveBuckets,
+		NegativeSpans:     convertSpans(value.NegativeSpans),
+		NegativeBuckets:   value.NegativeBuckets,
+	}
+}
+
+func floatHistogramSample(timestamp int64, value *histogram.FloatHistogram) oracleHistogramSample {
+	return oracleHistogramSample{
+		Timestamp:          timestamp,
+		Kind:               "float_histogram",
+		CounterResetHint:   int(value.CounterResetHint),
+		Schema:             value.Schema,
+		Count:              math.Float64bits(value.Count),
+		SumBits:            math.Float64bits(value.Sum),
+		ZeroThresholdBits:  math.Float64bits(value.ZeroThreshold),
+		ZeroCount:          math.Float64bits(value.ZeroCount),
+		PositiveSpans:      convertSpans(value.PositiveSpans),
+		PositiveBucketBits: floatBits(value.PositiveBuckets),
+		NegativeSpans:      convertSpans(value.NegativeSpans),
+		NegativeBucketBits: floatBits(value.NegativeBuckets),
+	}
+}
+
+func convertSpans(spans []histogram.Span) []oracleSpan {
+	converted := make([]oracleSpan, len(spans))
+	for i, span := range spans {
+		converted[i] = oracleSpan{Offset: span.Offset, Length: span.Length}
+	}
+	return converted
+}
+
+func floatBits(values []float64) []uint64 {
+	bits := make([]uint64, len(values))
+	for i, value := range values {
+		bits[i] = math.Float64bits(value)
+	}
+	return bits
 }

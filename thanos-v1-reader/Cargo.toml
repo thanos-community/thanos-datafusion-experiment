@@ -11,6 +11,10 @@ path = "e2e/e2e.rs"
 name = "chunk_io"
 harness = false
 
+[[test]]
+name = "native_histogram_downsample_parity"
+path = "e2e/native_histogram_downsample_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }

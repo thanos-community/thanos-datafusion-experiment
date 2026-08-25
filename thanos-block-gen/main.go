@@ -19,6 +19,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/thanos/pkg/block"
@@ -44,6 +45,7 @@ type config struct {
 	pods           int
 	routes         int
 	nativeSeries   int
+	scalarEdges    bool
 	clean          bool
 	downsample5m   bool
 }
@@ -130,6 +132,7 @@ func parseConfig(args []string) (config, error) {
 	flags.IntVar(&cfg.pods, "pods", cfg.pods, "number of counter and gauge pod series")
 	flags.IntVar(&cfg.routes, "routes", cfg.routes, "number of classic histogram route series")
 	flags.IntVar(&cfg.nativeSeries, "native-series", cfg.nativeSeries, "number of integer and float native histogram series")
+	flags.BoolVar(&cfg.scalarEdges, "scalar-edge-cases", false, "include counter resets, special gauge values, and zero histograms")
 	flags.Var(&externalLabels, "external-label", "external label in name=value form; repeatable")
 	flags.BoolVar(&cfg.clean, "clean", false, "remove the output directory before generating blocks")
 	flags.BoolVar(&cfg.downsample5m, "downsample-5m", true, "also generate a 5-minute downsampled block")
@@ -371,10 +374,27 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 			instance := pod % instances
 			instanceLabel := fixtureLabels.instances[instance]
 			podLabel := fixtureLabels.pods[pod]
-			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_requests_total", "instance", instanceLabel, "job", fixtureLabels.job, "method", "GET", "pod", podLabel), timestamp, float64(1_000+pod*100+i*7)); err != nil {
+			counterValue := float64(1_000 + pod*100 + i*7)
+			if cfg.scalarEdges && i == cfg.samples/2 {
+				counterValue = float64(10 + pod)
+			}
+			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_requests_total", "instance", instanceLabel, "job", fixtureLabels.job, "method", "GET", "pod", podLabel), timestamp, counterValue); err != nil {
 				return err
 			}
-			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_temperature_celsius", "instance", instanceLabel, "job", fixtureLabels.job, "pod", podLabel, "room", "lab"), timestamp, 20+float64(instance)/10+math.Sin(float64(i+pod)/6)*4); err != nil {
+			gaugeValue := 20 + float64(instance)/10 + math.Sin(float64(i+pod)/6)*4
+			if cfg.scalarEdges {
+				switch i {
+				case cfg.samples - 4:
+					gaugeValue = math.Inf(1)
+				case cfg.samples - 3:
+					gaugeValue = math.Inf(-1)
+				case cfg.samples - 2:
+					gaugeValue = math.Copysign(0, -1)
+				case cfg.samples - 1:
+					gaugeValue = math.Float64frombits(value.StaleNaN)
+				}
+			}
+			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_temperature_celsius", "instance", instanceLabel, "job", fixtureLabels.job, "pod", podLabel, "room", "lab"), timestamp, gaugeValue); err != nil {
 				return err
 			}
 		}
@@ -383,6 +403,9 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 			for pod := 0; pod < pods; pod++ {
 				podLabel := fixtureLabels.pods[pod]
 				observations := float64(i + route + pod + 1)
+				if cfg.scalarEdges && i == 0 {
+					observations = 0
+				}
 				if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_sum", "job", fixtureLabels.job, "pod", podLabel, "route", routeLabel), timestamp, observations*0.42); err != nil {
 					return err
 				}

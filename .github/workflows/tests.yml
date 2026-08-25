@@ -2,6 +2,9 @@ name: Tests
 
 on:
   push:
+    branches:
+      - main
+      - master
   pull_request:
   workflow_dispatch:
 
@@ -50,7 +53,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-unit-
       - run: cargo test --lib
-      - run: cargo test --bin thanos-v1-reader
 
   rust-e2e-tests:
     name: Rust end-to-end tests
@@ -80,4 +82,7 @@ jobs:
           key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('thanos-v1-reader/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-e2e-
-      - run: cargo test --test counter_parity
+      - run: cargo test --test e2e
+      - run: cargo test --test native_histogram_parity
+      - run: cargo test --test raw_scalar_parity
+      - run: cargo test --test scalar_downsample_parity

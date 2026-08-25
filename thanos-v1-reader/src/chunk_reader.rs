@@ -6,6 +6,8 @@ use rusty_chunkenc::xor::{XORChunk, read_xor_chunk_data};
 use crate::storage::RangeReader;
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const ENCODING_XOR: u8 = 1;
+const ENCODING_HISTOGRAM: u8 = 2;
+const ENCODING_FLOAT_HISTOGRAM: u8 = 3;
 const ENCODING_AGGR: u8 = 0xff;
 const CRC_SIZE: usize = 4;
 const MAX_UVARINT_SIZE: usize = 5;
@@ -20,6 +22,8 @@ pub struct Sample {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodedChunk {
     Xor(Vec<u8>),
+    Histogram(Vec<u8>),
+    FloatHistogram(Vec<u8>),
     Aggregate {
         count: Option<Vec<u8>>,
         sum: Option<Vec<u8>>,
@@ -88,6 +92,8 @@ pub fn decode_encoded_record(record: &[u8]) -> Result<EncodedChunk, io::Error> {
     let (encoding, payload) = validated_payload(record)?;
     match encoding {
         ENCODING_XOR => Ok(EncodedChunk::Xor(payload.to_vec())),
+        ENCODING_HISTOGRAM => Ok(EncodedChunk::Histogram(payload.to_vec())),
+        ENCODING_FLOAT_HISTOGRAM => Ok(EncodedChunk::FloatHistogram(payload.to_vec())),
         ENCODING_AGGR => decode_aggregate(payload),
         _ => Err(invalid_data(format!(
             "unsupported Prometheus chunk encoding {encoding}"
@@ -280,6 +286,20 @@ mod tests {
             decode_encoded_record(&record).unwrap(),
             EncodedChunk::Xor(record[length_size + 1..length_size + 1 + payload_len].to_vec())
         );
+    }
+
+    #[test]
+    fn exposes_native_histogram_payloads_for_store_api() {
+        for (encoding, expected) in [
+            (ENCODING_HISTOGRAM, EncodedChunk::Histogram(vec![1, 2, 3])),
+            (
+                ENCODING_FLOAT_HISTOGRAM,
+                EncodedChunk::FloatHistogram(vec![1, 2, 3]),
+            ),
+        ] {
+            let record = framed_record(encoding, &[1, 2, 3]);
+            assert_eq!(decode_encoded_record(&record).unwrap(), expected);
+        }
     }
 
     #[test]

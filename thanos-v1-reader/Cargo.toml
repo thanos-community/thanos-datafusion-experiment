@@ -4,8 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [[test]]
-name = "counter_parity"
-path = "e2e/counter_parity.rs"
+name = "e2e"
+path = "e2e/e2e.rs"
+
+[[test]]
+name = "native_histogram_parity"
+path = "e2e/native_histogram_parity.rs"
+
+[[test]]
+name = "raw_scalar_parity"
+path = "e2e/raw_scalar_parity.rs"
+
+[[test]]
+name = "scalar_downsample_parity"
+path = "e2e/scalar_downsample_parity.rs"
 
 [[bench]]
 name = "chunk_io"
@@ -47,6 +59,7 @@ tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh64"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

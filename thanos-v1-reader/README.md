@@ -33,6 +33,56 @@ To use another configuration file, set `THANOS_READER_CONFIG`:
 THANOS_READER_CONFIG=/path/to/reader.toml cargo run
 ```
 
+### Container image
+
+The published image is `ghcr.io/thanos-community/thanos-v1-reader`. Pull the current development
+image with:
+
+```bash
+docker pull ghcr.io/thanos-community/thanos-v1-reader:edge
+```
+
+The container needs three mounts: a reader configuration file, the local Thanos block repository,
+and a writable cache directory for the generated indexes. The current storage model supports only
+`file://` repository URIs, so configure the URI using the repository path inside the container:
+
+```toml
+# reader.toml
+listen_addr = "0.0.0.0:50051"
+metrics_listen_addr = "0.0.0.0:9090"
+index_cache_location = "/var/lib/thanos-v1-reader/cache"
+
+[[repositories]]
+name = "local-blocks"
+uri = "file:///var/lib/thanos-v1-reader/blocks"
+```
+
+For example, with `reader.toml`, a `blocks/` directory containing Thanos blocks, and a writable
+`cache/` directory in the current directory:
+
+```bash
+mkdir -p cache
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -p 50051:50051 \
+  -p 9090:9090 \
+  -e THANOS_READER_CONFIG=/etc/thanos-v1-reader/reader.toml \
+  -v "$(pwd)/reader.toml:/etc/thanos-v1-reader/reader.toml:ro" \
+  -v "$(pwd)/blocks:/var/lib/thanos-v1-reader/blocks:ro" \
+  -v "$(pwd)/cache:/var/lib/thanos-v1-reader/cache" \
+  ghcr.io/thanos-community/thanos-v1-reader:edge
+```
+
+`--user` makes the bind-mounted cache writable on Linux hosts. Omit it only when the cache
+directory is writable by the image's `reader` user (UID `10001`).
+
+The gRPC listener on port `50051` serves Arrow Flight SQL, Thanos StoreAPI, and Thanos Info API;
+the Prometheus metrics endpoint is available at `http://localhost:9090/metrics`. Pin a semantic
+release or `sha-<short-git-sha>` tag rather than `edge` for a reproducible deployment.
+
+The `linux/amd64` image is compiled for `x86-64-v4`, which requires an x86-64-v4 CPU with
+AVX-512 support. On an ARM Mac, Docker automatically selects the `linux/arm64` image variant.
+
 The configuration contains the shared gRPC listen address and the Thanos repositories that the reader
 will index and use to answer queries:
 
@@ -162,12 +212,12 @@ thanos query \
   --endpoint=127.0.0.1:50051
 ```
 
-The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR chunks. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
+The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR, histogram, and float-histogram chunks with Go-compatible chunk hashes. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
 
-Current limitations: the reader is read-only; it supports XOR and aggregate XOR chunks and
-startup-time index construction. It does not support native histogram chunks, StoreAPI sharding,
-opaque hints, projection hints, or replica-label removal, and it does not refresh the block index
-while running.
+Current limitations: the reader is read-only; it supports file, S3, and GCS repositories; raw
+XOR/native-histogram chunks; aggregate XOR chunks; and startup-time index construction. It does
+not support native-histogram aggregate slots, StoreAPI sharding, opaque hints, projection hints,
+or replica-label removal, and it does not refresh the block index while running.
 
 ## Flight SQL CLI
 

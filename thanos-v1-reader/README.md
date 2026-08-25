@@ -40,6 +40,8 @@ will index and use to answer queries:
 listen_addr = "127.0.0.1:50051"
 metrics_listen_addr = "127.0.0.1:9090"
 index_cache_location = "target"
+block_sync_interval = "15m"
+deletion_mark_delay = "24h"
 
 [[repositories]]
 name = "local-fixtures"
@@ -158,8 +160,10 @@ and the sharding and replica-label capabilities implemented by the reader.
 The binary rebuilds its loaded-block view at `block_sync_interval` (default `15m`). Refreshes stage
 and validate a complete cache generation before one atomic publication shared by StoreAPI and
 Flight SQL requests; a failed refresh leaves the previous healthy snapshot active.
+Blocks remain queryable until their `deletion-mark.json` age is strictly greater than
+`deletion_mark_delay` (default `24h`), matching the Store Gateway replacement grace period.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, and native histogram SUM/COUNTER aggregate slots. It does not support projection hints. Block refresh currently treats any incomplete/corrupt candidate as a failed atomic generation; deletion-mark delay and object-store consistency-delay policies are not implemented.
+Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, and native histogram SUM/COUNTER aggregate slots. It does not support projection hints. Block refresh currently treats any incomplete/corrupt candidate as a failed atomic generation; object-store consistency-delay policy is not implemented.
 
 ## Flight SQL CLI
 

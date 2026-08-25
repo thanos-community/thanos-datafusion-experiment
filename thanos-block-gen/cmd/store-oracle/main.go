@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/types"
@@ -148,6 +149,7 @@ func run() error {
 	var endpoint string
 	var label string
 	var seriesMatchers stringFlags
+	var deletionMarkDelay time.Duration
 	flag.StringVar(&bucketDir, "bucket", "", "filesystem bucket containing Thanos blocks")
 	flag.StringVar(&metric, "metric", "", "metric name to query")
 	flag.StringVar(&aggregateNames, "aggregates", "raw", "comma-separated StoreAPI aggregates")
@@ -171,6 +173,7 @@ func run() error {
 	flag.StringVar(&endpoint, "endpoint", "series", "API endpoint: series, label-names, label-values, or info")
 	flag.StringVar(&label, "label", "", "label name for the label-values endpoint")
 	flag.Var(&seriesMatchers, "series-matcher", "series matcher in TYPE:name:value form; repeatable")
+	flag.DurationVar(&deletionMarkDelay, "deletion-mark-delay", 24*time.Hour, "grace delay before filtering deletion-marked blocks")
 	flag.Parse()
 	if bucketDir == "" || (endpoint == "series" && metric == "") {
 		return fmt.Errorf("--bucket is required; --metric is required for Series")
@@ -197,7 +200,10 @@ func run() error {
 		block.NewConcurrentLister(logger, instrumentedBucket),
 		cacheDir,
 		nil,
-		[]block.MetadataFilter{block.NewDeduplicateFilter(4)},
+		[]block.MetadataFilter{
+			block.NewIgnoreDeletionMarkFilter(logger, instrumentedBucket, deletionMarkDelay, 4),
+			block.NewDeduplicateFilter(4),
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("create metadata fetcher: %w", err)

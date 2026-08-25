@@ -4,6 +4,7 @@ use std::{
     fs, io,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 use arrow::{
@@ -327,7 +328,21 @@ async fn build_chunk_index(
     index_cache_location: String,
 ) -> Result<BuiltBlockIndex, BoxError> {
     let index_path = format!("{}/index", task.block_path);
+    let started = Instant::now();
+    tracing::info!(
+        repository = %task.repository.name,
+        block_ulid = %task.meta.ulid,
+        block_path = %task.block_path,
+        "starting Thanos block index build"
+    );
     let index = task.storage_repository.read(&index_path).await?;
+    tracing::debug!(
+        repository = %task.repository.name,
+        block_ulid = %task.meta.ulid,
+        index_path = %index_path,
+        index_bytes = index.len(),
+        "downloaded Thanos TSDB index"
+    );
     let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
     let mut metric_labels = BTreeMap::new();
     let (series_count, chunk_count) = write_chunk_index_streaming(
@@ -345,6 +360,14 @@ async fn build_chunk_index(
         task.block_path.clone(),
         task.meta_path,
     )?;
+    tracing::info!(
+        repository = %task.repository.name,
+        block_ulid = %block_ulid,
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        series_count,
+        chunk_count,
+        "finished Thanos block index build"
+    );
     Ok(BuiltBlockIndex {
         row,
         block_ulid,
@@ -524,6 +547,12 @@ fn write_chunk_index_streaming(
             Ok(count) => {
                 chunk_count += count;
                 if rows.len() >= CHUNK_INDEX_BATCH_SIZE {
+                    tracing::debug!(
+                        block_ulid = %meta.ulid,
+                        batch_rows = rows.len(),
+                        total_chunks = chunk_count,
+                        "flushing bounded chunk-index Parquet batch"
+                    );
                     if let Err(error) = flush_chunk_rows(&mut writer, &schema, &mut rows) {
                         write_error = Some(error);
                     }
@@ -538,6 +567,12 @@ fn write_chunk_index_streaming(
         Ok(()) => match write_error {
             Some(error) => Err(error),
             None => {
+                tracing::debug!(
+                    block_ulid = %meta.ulid,
+                    batch_rows = rows.len(),
+                    total_chunks = chunk_count,
+                    "flushing final chunk-index Parquet batch"
+                );
                 flush_chunk_rows(&mut writer, &schema, &mut rows)?;
                 writer.close()?;
                 fs::rename(&temporary_path, path)?;

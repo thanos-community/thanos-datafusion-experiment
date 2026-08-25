@@ -4,6 +4,7 @@ use std::{
     fs, io,
     path::Path,
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arrow::{
@@ -16,7 +17,7 @@ use arrow::{
 };
 use futures::TryStreamExt;
 use opendal::{
-    Operator,
+    ErrorKind, Operator,
     layers::{MetricsLayer, OtelTraceLayer},
     services::Fs,
 };
@@ -25,12 +26,13 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::ThanosRepositoryConfig,
+    config::{DEFAULT_DELETION_MARK_DELAY, ThanosRepositoryConfig},
     tsdb_index::{self, Series},
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
+const DELETION_MARK_VERSION: i32 = 1;
 
 #[derive(Debug, Deserialize)]
 struct BlockMeta {
@@ -47,6 +49,37 @@ struct BlockMeta {
     compaction: Compaction,
     #[serde(default)]
     thanos: ThanosMeta,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeletionMark {
+    #[serde(
+        default,
+        rename = "id",
+        deserialize_with = "deserialize_deletion_mark_id"
+    )]
+    _id: Option<String>,
+    #[serde(default)]
+    version: i32,
+    #[serde(default)]
+    deletion_time: i64,
+}
+
+fn deserialize_deletion_mark_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let id = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &id {
+        let bytes = value.as_bytes();
+        // Thanos uses oklog/ulid's non-strict text decoder here. It validates only the encoded
+        // length and the leading overflow bits; the marker ID is otherwise not compared to its
+        // containing block.
+        if bytes.len() != 26 || bytes[0] > b'7' {
+            return Err(serde::de::Error::custom("invalid deletion-mark ULID"));
+        }
+    }
+    Ok(id)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,6 +281,22 @@ pub async fn build_block_index(
     repositories: &[ThanosRepositoryConfig],
     index_cache_location: &str,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
+    build_block_index_at(
+        repositories,
+        index_cache_location,
+        DEFAULT_DELETION_MARK_DELAY,
+        SystemTime::now(),
+    )
+    .await
+}
+
+/// Rebuild the index using the Store Gateway deletion-mark grace policy at a fixed clock instant.
+pub async fn build_block_index_at(
+    repositories: &[ThanosRepositoryConfig],
+    index_cache_location: &str,
+    deletion_mark_delay: Duration,
+    now: SystemTime,
+) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut rows = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
     let mut metric_labels = BTreeMap::new();
@@ -267,17 +316,18 @@ pub async fn build_block_index(
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
-            if block_has_deletion_mark(&operator, &block_path).await? {
+            let contents = operator.read(&meta_path).await?;
+            let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
+            if block_is_past_deletion_delay(&operator, &block_path, deletion_mark_delay, now)
+                .await?
+            {
                 tracing::debug!(
                     repository = %repository.name,
                     block_path = %block_path,
-                    "skipping deleted Thanos block"
+                    "skipping Thanos block past deletion-mark grace delay"
                 );
                 continue;
             }
-
-            let contents = operator.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
             discovered.push((repository, operator.clone(), meta_path, block_path, meta));
         }
     }
@@ -909,14 +959,44 @@ pub(crate) fn repository_operator(uri: &str) -> Result<Operator, BoxError> {
         .layer(OtelTraceLayer::new()))
 }
 
-async fn block_has_deletion_mark(operator: &Operator, block_path: &str) -> Result<bool, BoxError> {
+async fn block_is_past_deletion_delay(
+    operator: &Operator,
+    block_path: &str,
+    delay: Duration,
+    now: SystemTime,
+) -> Result<bool, BoxError> {
     let deletion_mark_path = if block_path.is_empty() {
         DELETION_MARK_FILE_NAME.to_owned()
     } else {
         format!("{block_path}/{DELETION_MARK_FILE_NAME}")
     };
 
-    Ok(operator.exists(&deletion_mark_path).await?)
+    let contents = match operator.read(&deletion_mark_path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mark: DeletionMark = match serde_json::from_slice(contents.to_bytes().as_ref()) {
+        Ok(mark) => mark,
+        Err(error) => {
+            tracing::warn!(
+                path = %deletion_mark_path,
+                %error,
+                "ignoring malformed deletion mark"
+            );
+            return Ok(false);
+        }
+    };
+    if mark.version != DELETION_MARK_VERSION {
+        return Err(invalid_data(format!(
+            "unexpected deletion-mark file version {}, expected {DELETION_MARK_VERSION}",
+            mark.version
+        ))
+        .into());
+    }
+    let now_seconds = now.duration_since(UNIX_EPOCH)?.as_secs_f64();
+    let age_seconds = now_seconds - mark.deletion_time as f64;
+    Ok(age_seconds > delay.as_secs_f64())
 }
 
 async fn write_local_file(path: &str, bytes: Vec<u8>) -> Result<(), BoxError> {
@@ -949,6 +1029,25 @@ fn invalid_data(message: String) -> io::Error {
 mod tests {
     use super::*;
     use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+
+    #[test]
+    fn deletion_mark_decoding_matches_go_marker_defaults() {
+        let missing_fields: DeletionMark = serde_json::from_str("{}").unwrap();
+        assert!(missing_fields._id.is_none());
+        assert_eq!(missing_fields.version, 0);
+        assert_eq!(missing_fields.deletion_time, 0);
+
+        let null_id: DeletionMark =
+            serde_json::from_str(r#"{"id":null,"version":1,"deletion_time":0}"#).unwrap();
+        assert!(null_id._id.is_none());
+
+        assert!(
+            serde_json::from_str::<DeletionMark>(
+                r#"{"id":"not-a-ulid","version":1,"deletion_time":0}"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn chunk_parquet_contains_row_group_statistics_and_page_indexes() {

@@ -126,8 +126,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "configured Thanos repository"
         );
     }
-    let metric_table_schemas =
-        block_index::build_block_index(&config.repositories, &config.index_cache_location).await?;
+    let metric_table_schemas = block_index::build_block_index_at(
+        &config.repositories,
+        &config.index_cache_location,
+        config.deletion_mark_delay,
+        std::time::SystemTime::now(),
+    )
+    .await?;
     let block_index_path = block_index::block_index_file_path(&config.index_cache_location);
     let chunk_index_path = block_index::chunk_index_directory_path(&config.index_cache_location);
     tracing::info!(path = %block_index_path, "generated Thanos blocks index");
@@ -142,10 +147,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
     let store_service =
         store_service::ThanosStoreService::new(context.clone(), &config.repositories).await?;
-    let refresher = block_sync::BlockRefresher::new(
+    let refresher = block_sync::BlockRefresher::new_with_policy(
         store_service.shared_state(),
         &config.repositories,
         &config.index_cache_location,
+        config.deletion_mark_delay,
     );
     let service = flight_service::DataFusionFlightService::new_shared(
         store_service.shared_state(),

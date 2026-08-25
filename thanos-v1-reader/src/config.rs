@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 pub const DEFAULT_CONFIG_PATH: &str = "dev.toml";
 pub const CONFIG_PATH_ENV_VAR: &str = "THANOS_READER_CONFIG";
+pub const DEFAULT_DELETION_MARK_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_METRICS_LISTEN_ADDR: &str = "127.0.0.1:9090";
 
 #[derive(Debug, Deserialize)]
@@ -18,6 +19,8 @@ pub struct ReaderConfig {
     #[serde(default = "default_metrics_listen_addr")]
     pub metrics_listen_addr: String,
     pub index_cache_location: String,
+    #[serde(default = "default_deletion_mark_delay", with = "humantime_serde")]
+    pub deletion_mark_delay: Duration,
     #[serde(default = "default_block_sync_interval", with = "humantime_serde")]
     pub block_sync_interval: Duration,
     #[serde(default)]
@@ -86,12 +89,16 @@ fn default_block_sync_interval() -> Duration {
     Duration::from_secs(15 * 60)
 }
 
+fn default_deletion_mark_delay() -> Duration {
+    DEFAULT_DELETION_MARK_DELAY
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_block_sync_interval_and_defaults_to_fifteen_minutes() {
+    fn parses_refresh_policy_and_applies_go_defaults() {
         let base = r#"
 listen_addr = "127.0.0.1:4100"
 index_cache_location = "cache"
@@ -101,11 +108,26 @@ uri = "file:///blocks"
 "#;
         let default: ReaderConfig = toml::from_str(base).unwrap();
         assert_eq!(default.block_sync_interval, Duration::from_secs(15 * 60));
+        assert_eq!(default.deletion_mark_delay, DEFAULT_DELETION_MARK_DELAY);
         default.validate().unwrap();
 
-        let configured: ReaderConfig =
-            toml::from_str(&format!("block_sync_interval = \"30s\"\n{base}")).unwrap();
+        let configured: ReaderConfig = toml::from_str(
+            r#"
+listen_addr = "127.0.0.1:4100"
+index_cache_location = "cache"
+block_sync_interval = "30s"
+deletion_mark_delay = "2h"
+[[repositories]]
+name = "test"
+uri = "file:///blocks"
+"#,
+        )
+        .unwrap();
         assert_eq!(configured.block_sync_interval, Duration::from_secs(30));
+        assert_eq!(
+            configured.deletion_mark_delay,
+            Duration::from_secs(2 * 60 * 60)
+        );
         configured.validate().unwrap();
     }
 }

@@ -1,0 +1,41 @@
+name: test-e2e
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-e2e-tests:
+    name: Rust end-to-end tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: thanos-v1-reader
+    env:
+      OTEL_SDK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: thanos-block-gen/go.mod
+          cache: true
+          cache-dependency-path: thanos-block-gen/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thanos-v1-reader -> target
+      - run: cargo test --test e2e

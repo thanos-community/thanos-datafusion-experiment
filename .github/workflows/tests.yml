@@ -47,15 +47,10 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "29.x"
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            thanos-v1-reader/target
-          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('thanos-v1-reader/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-unit-
+          workspaces: thanos-v1-reader -> target
+          cache-targets: false
       - run: cargo test --lib
       - name: Show sccache stats
         if: always()
@@ -83,15 +78,10 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "29.x"
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            thanos-v1-reader/target
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('thanos-v1-reader/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-e2e-
+          workspaces: thanos-v1-reader -> target
+          cache-targets: false
       - run: cargo test --test e2e
       - name: Show sccache stats
         if: always()

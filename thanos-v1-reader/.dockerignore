@@ -1,0 +1,9 @@
+# Keep the build context limited to the crate inputs needed by Cargo and build.rs.
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!src/**
+!proto/
+!proto/**

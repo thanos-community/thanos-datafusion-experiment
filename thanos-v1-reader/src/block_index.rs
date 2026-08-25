@@ -238,7 +238,7 @@ pub async fn build_block_index(
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
             if block_has_deletion_mark(storage_repository.operator(), &block_path).await? {
-                tracing::debug!(
+                tracing::trace!(
                     repository = %repository.name,
                     block_path = %block_path,
                     "skipping deleted Thanos block"

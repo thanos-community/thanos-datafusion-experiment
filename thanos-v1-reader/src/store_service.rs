@@ -88,6 +88,7 @@ struct ChunkDescriptor {
     chunk_mint: i64,
     chunk_maxt: i64,
     labels: BTreeMap<String, String>,
+    internal_labels: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -388,6 +389,7 @@ impl Store for ThanosStoreService {
         let labels_to_remove = request
             .without_replica_labels
             .iter()
+            .map(String::as_str)
             .collect::<BTreeSet<_>>();
         let mut block_counts = BTreeMap::<(String, String), usize>::new();
         let mut visible_groups =
@@ -395,7 +397,7 @@ impl Store for ThanosStoreService {
         for ((repository_uri, block_ulid, original_labels), descriptors) in groups {
             let visible_labels = original_labels
                 .into_iter()
-                .filter(|(name, _)| !labels_to_remove.contains(name))
+                .filter(|(name, _)| !labels_to_remove.contains(name.as_str()))
                 .collect::<Vec<_>>();
             if !matches_shard(&visible_labels, request.shard_info.as_ref()) {
                 continue;
@@ -536,52 +538,52 @@ impl Store for ThanosStoreService {
         let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
         let blocks =
             snapshot.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
-        let block_keys = blocks
-            .iter()
-            .map(|block| block.key())
-            .collect::<BTreeSet<_>>();
-        let external_names = blocks
-            .iter()
-            .map(|block| {
-                (
-                    block.key(),
-                    block
-                        .external_labels
-                        .keys()
-                        .cloned()
-                        .collect::<BTreeSet<_>>(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let labels_to_remove = request
             .without_replica_labels
             .iter()
+            .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        let has_matchers = !matchers.is_empty();
-        let names = snapshot
-            .descriptors
-            .iter()
-            .filter(|descriptor| {
-                block_keys.contains(&descriptor.block_key())
-                    && (!has_matchers
-                        || (overlaps(
-                            descriptor.chunk_mint,
-                            descriptor.chunk_maxt,
-                            request.start,
-                            request.end,
-                        ) && matches_label_endpoint_all(&descriptor.labels, &matchers)))
-            })
-            .flat_map(|descriptor| {
-                descriptor.labels.keys().filter(|name| {
-                    !labels_to_remove.contains(name)
-                        || (!has_matchers
-                            && !external_names
-                                .get(&descriptor.block_key())
-                                .is_some_and(|names| names.contains(*name)))
-                })
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let mut names = BTreeSet::new();
+        for block in &blocks {
+            let has_internal_matchers = matchers
+                .iter()
+                .any(|matcher| !block.external_labels.contains_key(matcher_name(matcher)));
+            for descriptor in snapshot
+                .descriptors
+                .iter()
+                .filter(|descriptor| descriptor.block_key() == block.key())
+            {
+                if has_internal_matchers {
+                    if !overlaps(
+                        descriptor.chunk_mint,
+                        descriptor.chunk_maxt,
+                        request.start,
+                        request.end,
+                    ) || !matches_label_endpoint_all(&descriptor.labels, &matchers)
+                    {
+                        continue;
+                    }
+                    names.extend(
+                        descriptor
+                            .labels
+                            .keys()
+                            .filter(|name| !labels_to_remove.contains(name.as_str()))
+                            .cloned(),
+                    );
+                } else {
+                    names.extend(descriptor.internal_labels.keys().cloned());
+                }
+            }
+            if !has_internal_matchers {
+                names.extend(
+                    block
+                        .external_labels
+                        .keys()
+                        .filter(|name| !labels_to_remove.contains(name.as_str()))
+                        .cloned(),
+                );
+            }
+        }
         Ok(Response::new(thanos::LabelNamesResponse {
             names: take_label_limit(names, request.limit),
             warnings: vec![],
@@ -609,33 +611,44 @@ impl Store for ThanosStoreService {
         let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
         let blocks =
             snapshot.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
-        let block_keys = blocks
-            .iter()
-            .map(|block| block.key())
-            .collect::<BTreeSet<_>>();
-        let has_matchers = !matchers.is_empty();
-        let mut values = snapshot
-            .descriptors
-            .iter()
-            .filter(|descriptor| {
-                block_keys.contains(&descriptor.block_key())
-                    && (!has_matchers
-                        || (overlaps(
-                            descriptor.chunk_mint,
-                            descriptor.chunk_maxt,
-                            request.start,
-                            request.end,
-                        ) && matches_label_endpoint_all(&descriptor.labels, &matchers)))
-            })
-            .filter_map(|descriptor| {
-                descriptor
-                    .labels
+        let mut values = BTreeSet::new();
+        for block in &blocks {
+            let has_internal_matchers = matchers
+                .iter()
+                .any(|matcher| !block.external_labels.contains_key(matcher_name(matcher)));
+            for descriptor in snapshot
+                .descriptors
+                .iter()
+                .filter(|descriptor| descriptor.block_key() == block.key())
+            {
+                let value = if has_internal_matchers {
+                    if !overlaps(
+                        descriptor.chunk_mint,
+                        descriptor.chunk_maxt,
+                        request.start,
+                        request.end,
+                    ) || !matches_label_endpoint_all(&descriptor.labels, &matchers)
+                    {
+                        continue;
+                    }
+                    descriptor.labels.get(&request.label)
+                } else {
+                    descriptor.internal_labels.get(&request.label)
+                };
+                if let Some(value) = value.filter(|value| !value.is_empty()) {
+                    values.insert(value.clone());
+                }
+            }
+            if !has_internal_matchers
+                && let Some(value) = block
+                    .external_labels
                     .get(&request.label)
-                    .filter(|value| !has_matchers || !value.is_empty())
-                    .cloned()
-            })
-            .collect::<BTreeSet<_>>();
-        if !has_matchers && request.label.is_empty() && !blocks.is_empty() {
+                    .filter(|value| !value.is_empty())
+            {
+                values.insert(value.clone());
+            }
+        }
+        if matchers.is_empty() && request.label.is_empty() && !blocks.is_empty() {
             values.insert(String::new());
         }
         Ok(Response::new(thanos::LabelValuesResponse {
@@ -1223,7 +1236,7 @@ async fn load_descriptors(context: &SessionContext) -> Result<Vec<ChunkDescripto
     let batches = context
         .sql(
             "SELECT repository_uri, block_ulid, chunk_file_path, chunk_file_offset, chunk_mint, \
-             chunk_maxt, labels_json FROM chunks",
+             chunk_maxt, labels_json, internal_labels_json FROM chunks",
         )
         .await?
         .collect()
@@ -1259,6 +1272,7 @@ fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, B
     let chunk_mint = int64_column(batch, "chunk_mint")?;
     let chunk_maxt = int64_column(batch, "chunk_maxt")?;
     let labels_json = string_column(batch, "labels_json")?;
+    let internal_labels_json = string_column(batch, "internal_labels_json")?;
     (0..batch.num_rows())
         .map(|index| {
             Ok(ChunkDescriptor {
@@ -1269,6 +1283,10 @@ fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, B
                 chunk_mint: chunk_mint.value(index),
                 chunk_maxt: chunk_maxt.value(index),
                 labels: serde_json::from_str(&string_value(labels_json.as_ref(), index)?)?,
+                internal_labels: serde_json::from_str(&string_value(
+                    internal_labels_json.as_ref(),
+                    index,
+                )?)?,
             })
         })
         .collect()
@@ -1524,6 +1542,7 @@ mod tests {
                             ("__name__".to_owned(), "up".to_owned()),
                             ("cluster".to_owned(), "test".to_owned()),
                         ]),
+                        internal_labels: BTreeMap::from([("__name__".to_owned(), "up".to_owned())]),
                     }],
                     blocks: vec![BlockMetadata {
                         repository_uri: "file:///blocks".to_owned(),

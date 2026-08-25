@@ -187,6 +187,7 @@ struct ChunkIndexRow {
     chunk_maxt: i64,
     labels: BTreeMap<String, String>,
     labels_json: String,
+    internal_labels_json: String,
 }
 
 /// The DataFusion table schema discovered for one Prometheus metric name.
@@ -601,9 +602,10 @@ fn chunk_rows(
             .get("__name__")
             .ok_or_else(|| invalid_data("series is missing __name__ label".to_owned()))?
             .clone();
+        let internal_labels_json = serde_json::to_string(&series.labels)?;
         let mut labels = series.labels.clone();
         for (name, value) in &meta.thanos.labels {
-            labels.entry(name.clone()).or_insert_with(|| value.clone());
+            labels.insert(name.clone(), value.clone());
         }
         let labels_json = serde_json::to_string(&labels)?;
 
@@ -630,6 +632,7 @@ fn chunk_rows(
                 chunk_maxt: chunk.maxt,
                 labels: labels.clone(),
                 labels_json: labels_json.clone(),
+                internal_labels_json: internal_labels_json.clone(),
             });
         }
     }
@@ -900,6 +903,7 @@ pub fn chunk_index_schema() -> Arc<Schema> {
         Field::new("chunk_maxt", DataType::Int64, false),
         Field::new("labels", DataType::Map(map_entries, false), false),
         Field::new("labels_json", DataType::Utf8, false),
+        Field::new("internal_labels_json", DataType::Utf8, false),
     ]))
 }
 
@@ -984,6 +988,11 @@ fn chunk_record_batch(
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| row.labels_json.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.internal_labels_json.as_str())
                 .collect::<Vec<_>>(),
         )),
     ];
@@ -1193,6 +1202,7 @@ mod tests {
                 ("job".to_owned(), "reader".to_owned()),
             ]),
             labels_json: r#"{"__name__":"up","job":"reader"}"#.to_owned(),
+            internal_labels_json: r#"{"__name__":"up","job":"reader"}"#.to_owned(),
         };
         let path = std::env::temp_dir().join(format!(
             "thanos-v1-reader-chunk-index-{}.parquet",

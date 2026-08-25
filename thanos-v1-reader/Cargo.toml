@@ -63,6 +63,10 @@ path = "e2e/deletion_mark_parity.rs"
 name = "consistency_delay_parity"
 path = "e2e/consistency_delay_parity.rs"
 
+[[test]]
+name = "external_label_collision_parity"
+path = "e2e/external_label_collision_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }

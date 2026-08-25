@@ -22,8 +22,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     mkdir src \
     && printf 'fn main() {}\n' > src/main.rs \
     && case "${TARGETARCH}" in \
-        amd64) export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C target-cpu=x86-64-v4" ;; \
-        arm64) ;; \
+        amd64) export CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v4" ;; \
+        arm64) export CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu ;; \
         *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && cargo build --release --locked \
@@ -34,12 +34,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,id=thanos-v1-reader-target-${TARGETARCH},target=/app/target \
     case "${TARGETARCH}" in \
-        amd64) export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C target-cpu=x86-64-v4" ;; \
-        arm64) ;; \
+        amd64) export CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v4" ;; \
+        arm64) export CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu ;; \
         *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && cargo build --release --locked \
-    && cp target/release/thanos-v1-reader /app/thanos-v1-reader
+    && cp "target/${CARGO_BUILD_TARGET}/release/thanos-v1-reader" /app/thanos-v1-reader
 
 FROM debian:bookworm-slim AS runtime
 

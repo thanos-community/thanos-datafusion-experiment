@@ -317,7 +317,7 @@ impl Store for ThanosStoreService {
             .matching_descriptors(request.start, request.end, &matchers)
             .await?
             .into_iter()
-            .flat_map(|descriptor| descriptor.labels.keys().cloned())
+            .flat_map(|descriptor| descriptor.labels.into_keys())
             .collect::<BTreeSet<_>>();
         Ok(Response::new(thanos::LabelNamesResponse {
             names: take_limit(names, request.limit)?,

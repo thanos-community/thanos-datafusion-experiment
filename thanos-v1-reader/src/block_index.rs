@@ -4,6 +4,7 @@ use std::{
     fs, io,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 use arrow::{
@@ -195,9 +196,16 @@ pub async fn build_block_index(
     let mut active_block_ulids = BTreeSet::new();
     let mut metric_labels = BTreeMap::new();
 
+    metrics::gauge!("thanos_reader_block_index_total_blocks").set(0.0);
+    metrics::gauge!("thanos_reader_block_index_processed_blocks").set(0.0);
+
     for repository in repositories {
         let storage_repository = storage.require(&repository.uri)?;
-        let mut lister = storage_repository.operator().lister_with("").recursive(true).await?;
+        let mut lister = storage_repository
+            .operator()
+            .lister_with("")
+            .recursive(true)
+            .await?;
 
         while let Some(entry) = lister.try_next().await? {
             if !entry.path().ends_with("meta.json") {
@@ -218,41 +226,69 @@ pub async fn build_block_index(
                 continue;
             }
 
-            let contents = storage_repository.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
-                tracing::error!(
+            metrics::gauge!("thanos_reader_block_index_total_blocks").increment(1.0);
+            let block_processing_started = Instant::now();
+            let result = async {
+                let contents = storage_repository.read(&meta_path).await?;
+                let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
+                    tracing::error!(
+                        repository = %repository.name,
+                        repository_uri = %repository.uri,
+                        block_path = %block_path,
+                        meta_path = %meta_path,
+                        error = %error,
+                        "failed to parse Thanos block metadata"
+                    );
+                    error
+                })?;
+                active_block_ulids.insert(meta.ulid.clone());
+
+                let index_path = format!("{block_path}/index");
+                let index = storage_repository.read(&index_path).await?;
+                let series = tsdb_index::parse(&index)?;
+                let series_count = series.len();
+                collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
+                let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
+                let chunk_count = chunk_rows.len();
+                let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
+                write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
+                tracing::debug!(
                     repository = %repository.name,
-                    repository_uri = %repository.uri,
+                    block_ulid = %meta.ulid,
                     block_path = %block_path,
-                    meta_path = %meta_path,
-                    error = %error,
-                    "failed to parse Thanos block metadata"
+                    index_path = %index_path,
+                    chunk_index_path = %chunk_index_path,
+                    series_count,
+                    chunk_count,
+                    "processed Thanos block into expanded chunk parquet index"
                 );
-                error
-            })?;
-            active_block_ulids.insert(meta.ulid.clone());
 
-            let index_path = format!("{block_path}/index");
-            let index = storage_repository.read(&index_path).await?;
-            let series = tsdb_index::parse(&index)?;
-            let series_count = series.len();
-            collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
-            let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
-            let chunk_count = chunk_rows.len();
-            let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
-            write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
-            tracing::debug!(
-                repository = %repository.name,
-                block_ulid = %meta.ulid,
-                block_path = %block_path,
-                index_path = %index_path,
-                chunk_index_path = %chunk_index_path,
-                series_count,
-                chunk_count,
-                "processed Thanos block into expanded chunk parquet index"
-            );
+                index_row(repository, meta, block_path, meta_path)
+            }
+            .await;
+            metrics::histogram!("thanos_reader_block_index_block_processing_duration_seconds")
+                .record(block_processing_started.elapsed());
 
-            rows.push(index_row(repository, meta, block_path, meta_path)?);
+            match result {
+                Ok(row) => {
+                    metrics::counter!("thanos_reader_block_index_blocks_processed_total")
+                        .increment(1);
+                    metrics::gauge!("thanos_reader_block_index_processed_blocks").increment(1.0);
+                    rows.push(row);
+                }
+                Err(error) => {
+                    metrics::counter!("thanos_reader_block_index_block_processing_errors_total")
+                        .increment(1);
+                    tracing::error!(
+                        repository = %repository.name,
+                        repository_uri = %repository.uri,
+                        block_path = %block_path,
+                        error = %error,
+                        "failed to process Thanos block into expanded chunk parquet index"
+                    );
+                    return Err(error);
+                }
+            }
         }
     }
 

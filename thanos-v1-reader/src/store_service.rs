@@ -188,7 +188,7 @@ impl ThanosStoreService {
                 min_time,
                 max_time,
                 supports_sharding: true,
-                supports_without_replica_labels: false,
+                supports_without_replica_labels: true,
                 tsdb_infos,
             }),
             rules: None,
@@ -222,36 +222,54 @@ impl Store for ThanosStoreService {
             request.max_time,
             request.max_resolution_window,
         );
-        let mut groups = BTreeMap::<Vec<(String, String)>, Vec<&ChunkDescriptor>>::new();
+        let mut groups =
+            BTreeMap::<(String, String, Vec<(String, String)>), Vec<&ChunkDescriptor>>::new();
         for descriptor in self.matching_descriptors(request.min_time, request.max_time, &matchers) {
             if !selected_blocks.contains(&descriptor.block_key()) {
                 continue;
             }
             groups
-                .entry(labels_key(&descriptor.labels))
+                .entry((
+                    descriptor.repository_uri.clone(),
+                    descriptor.block_ulid.clone(),
+                    labels_key(&descriptor.labels),
+                ))
                 .or_default()
                 .push(descriptor);
         }
 
-        let mut series_responses = Vec::new();
-        let mut warning_responses = Vec::new();
-        for (label_key, mut descriptors) in groups {
-            if !matches_shard(&label_key, request.shard_info.as_ref()) {
+        let labels_to_remove = request
+            .without_replica_labels
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let mut block_counts = BTreeMap::<(String, String), usize>::new();
+        let mut visible_groups =
+            BTreeMap::<(Vec<(String, String)>, String, String), Vec<&ChunkDescriptor>>::new();
+        for ((repository_uri, block_ulid, original_labels), descriptors) in groups {
+            let visible_labels = original_labels
+                .into_iter()
+                .filter(|(name, _)| !labels_to_remove.contains(name))
+                .collect::<Vec<_>>();
+            if !matches_shard(&visible_labels, request.shard_info.as_ref()) {
                 continue;
             }
-            if series_responses.len() >= limit {
-                break;
+            let count = block_counts
+                .entry((repository_uri.clone(), block_ulid.clone()))
+                .or_default();
+            if *count >= limit {
+                continue;
             }
-            descriptors.sort_by_key(|descriptor| (descriptor.chunk_mint, descriptor.chunk_maxt));
+            *count += 1;
+            visible_groups
+                .entry((visible_labels, repository_uri, block_ulid))
+                .or_default()
+                .extend(descriptors);
+        }
 
-            let labels = descriptors[0]
-                .labels
-                .iter()
-                .map(|(name, value)| Label {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect();
+        let mut merged_groups = BTreeMap::<Vec<(String, String)>, Vec<Vec<AggrChunk>>>::new();
+        let mut warning_responses = Vec::new();
+        for ((visible_labels, _, _), mut descriptors) in visible_groups {
+            descriptors.sort_by_key(|descriptor| (descriptor.chunk_mint, descriptor.chunk_maxt));
             let mut chunks = Vec::new();
             let mut warnings = Vec::new();
             if !request.skip_chunks {
@@ -267,17 +285,37 @@ impl Store for ThanosStoreService {
                         }),
                     }
                 }
+                chunks.sort_by(|left, right| match compare_aggr_chunks(left, right) {
+                    value if value > 0 => std::cmp::Ordering::Less,
+                    value if value < 0 => std::cmp::Ordering::Greater,
+                    _ => std::cmp::Ordering::Equal,
+                });
+                chunks.dedup_by(|left, right| compare_aggr_chunks(left, right) == 0);
             }
             if request.skip_chunks || !chunks.is_empty() {
-                series_responses.push(SeriesResponse {
-                    result: Some(thanos::series_response::Result::Series(Series {
-                        labels,
-                        chunks,
-                    })),
-                });
+                merged_groups
+                    .entry(visible_labels)
+                    .or_default()
+                    .push(chunks);
             }
             warning_responses.extend(warnings);
         }
+
+        let series_responses = merged_groups
+            .into_iter()
+            .map(|(labels, chunk_sets)| {
+                let chunks = chunk_sets.into_iter().fold(Vec::new(), merge_chunks);
+                SeriesResponse {
+                    result: Some(thanos::series_response::Result::Series(Series {
+                        labels: labels
+                            .into_iter()
+                            .map(|(name, value)| Label { name, value })
+                            .collect(),
+                        chunks,
+                    })),
+                }
+            })
+            .collect::<Vec<_>>();
 
         let batch_size = usize::try_from(request.response_batch_size)
             .ok()
@@ -464,10 +502,8 @@ fn aggregate_chunk(
 }
 
 fn reject_unsupported_series_options(request: &thanos::SeriesRequest) -> Result<(), Status> {
-    if request.hints.is_some() || !request.without_replica_labels.is_empty() {
-        return Err(Status::unimplemented(
-            "opaque hints and replica-label removal are not supported",
-        ));
+    if request.hints.is_some() {
+        return Err(Status::unimplemented("opaque hints are not supported"));
     }
     Ok(())
 }
@@ -489,6 +525,80 @@ fn matches_shard(labels: &[(String, String)], shard_info: Option<&thanos::ShardI
     }
     xxhash_rust::xxh64::xxh64(&bytes, 0) % shard_info.total_shards as u64
         == shard_info.shard_index as u64
+}
+
+fn merge_chunks(left: Vec<AggrChunk>, right: Vec<AggrChunk>) -> Vec<AggrChunk> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match compare_aggr_chunks(&left[left_index], &right[right_index]) {
+            value if value > 0 => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+            }
+            value if value < 0 => {
+                merged.push(right[right_index].clone());
+                right_index += 1;
+            }
+            _ => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&left[left_index..]);
+    merged.extend_from_slice(&right[right_index..]);
+    merged
+}
+
+fn compare_aggr_chunks(left: &AggrChunk, right: &AggrChunk) -> i32 {
+    if left.min_time != right.min_time {
+        return if left.min_time < right.min_time {
+            1
+        } else {
+            -1
+        };
+    }
+    if left.max_time != right.max_time {
+        return if left.max_time < right.max_time {
+            1
+        } else {
+            -1
+        };
+    }
+    for (left, right) in [
+        (&left.raw, &right.raw),
+        (&left.count, &right.count),
+        (&left.sum, &right.sum),
+        (&left.min, &right.min),
+        (&left.max, &right.max),
+        (&left.counter, &right.counter),
+    ] {
+        let comparison = compare_chunks(left.as_ref(), right.as_ref());
+        if comparison != 0 {
+            return comparison;
+        }
+    }
+    0
+}
+
+fn compare_chunks(left: Option<&Chunk>, right: Option<&Chunk>) -> i32 {
+    match (left, right) {
+        (None, None) => 0,
+        (Some(_), None) => 1,
+        (None, Some(_)) => -1,
+        (Some(left), Some(right)) => {
+            if left.r#type != right.r#type {
+                return if left.r#type < right.r#type { 1 } else { -1 };
+            }
+            match left.data.cmp(&right.data) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
+    }
 }
 
 fn reject_unsupported_label_options(
@@ -1032,6 +1142,7 @@ mod tests {
         let store_info = info.store.unwrap();
         assert_eq!(store_info.min_time, 100);
         assert!(store_info.supports_sharding);
+        assert!(store_info.supports_without_replica_labels);
 
         let mut store_client = StoreClient::connect(endpoint).await.unwrap();
         let mut stream = store_client

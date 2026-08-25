@@ -63,7 +63,7 @@ func TestThanosV1ReaderStoreAPIConformance(t *testing.T) {
 		if response.Store.MinTime != conformanceMinTime || response.Store.MaxTime != conformanceMaxTime {
 			t.Fatalf("store range = [%d, %d], want [%d, %d]", response.Store.MinTime, response.Store.MaxTime, conformanceMinTime, conformanceMaxTime)
 		}
-		if !response.Store.SupportsSharding || response.Store.SupportsWithoutReplicaLabels {
+		if !response.Store.SupportsSharding || !response.Store.SupportsWithoutReplicaLabels {
 			t.Fatal("reader StoreAPI capability advertisement is incorrect")
 		}
 		if got := labelSets(response.LabelSets); !equalStrings(got, []string{"region=eu-west"}) {
@@ -114,6 +114,19 @@ func TestThanosV1ReaderStoreAPIConformance(t *testing.T) {
 			if len(result.Chunks) == 0 || result.Chunks[0].Raw == nil || len(result.Chunks[0].Raw.Data) == 0 {
 				t.Fatalf("Series returned no raw XOR chunk: %#v", result.Chunks)
 			}
+		}
+	})
+
+	t.Run("Series replica label removal", func(t *testing.T) {
+		series := querySeries(t, ctx, store, &storepb.SeriesRequest{
+			MinTime:              conformanceMinTime,
+			MaxTime:              conformanceMaxTime,
+			Matchers:             []storepb.LabelMatcher{matcher(storepb.LabelMatcher_EQ, "n", "1")},
+			SkipChunks:           true,
+			WithoutReplicaLabels: []string{"i"},
+		})
+		if got := seriesLabels(series); !equalStrings(got, []string{"__name__=up,n=1,region=eu-west"}) {
+			t.Fatalf("labels after replica removal = %v", got)
 		}
 	})
 

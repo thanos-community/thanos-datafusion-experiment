@@ -138,6 +138,12 @@ thanos query \
 
 The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR, histogram, and float-histogram chunks with Go-compatible chunk hashes. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
 
+When resolutions coexist, StoreAPI selection matches BucketStore's block-set algorithm: it uses
+the coarsest resolution within `max_resolution_window` and recursively fills uncovered time
+ranges from finer resolutions. Blocks whose compaction sources are fully covered by a newer
+same-label, same-resolution block are filtered at startup. Other same-resolution overlaps are
+retained, as they are by Go BucketStore.
+
 Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, native histogram SUM/COUNTER aggregate slots, and startup-time index construction. It does not support StoreAPI sharding, opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
 
 ## Flight SQL CLI

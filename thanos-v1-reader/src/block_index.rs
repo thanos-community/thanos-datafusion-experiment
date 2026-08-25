@@ -295,6 +295,8 @@ pub async fn build_block_index(
         concurrency = index_build_concurrency,
         "building Thanos block indexes concurrently"
     );
+    metrics::gauge!("thanos_reader_block_index_total_blocks").set(tasks.len() as f64);
+    metrics::gauge!("thanos_reader_block_index_processed_blocks").set(0.0);
     let built_indexes = stream::iter(tasks)
         .map(|task| build_chunk_index(task, index_cache_location.to_owned()))
         .buffer_unordered(index_build_concurrency)
@@ -364,49 +366,72 @@ async fn build_chunk_index(
         block_path = %task.block_path,
         "starting Thanos block index build"
     );
-    let index = task.storage_repository.read(&index_path).await?;
-    tracing::debug!(
-        repository = %task.repository.name,
-        block_ulid = %task.meta.ulid,
-        index_path = %index_path,
-        index_bytes = index.len(),
-        "downloaded Thanos TSDB index"
-    );
-    let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
-    let mut metric_labels = BTreeMap::new();
-    let (series_count, chunk_count) = write_chunk_index_streaming(
-        &task.repository,
-        &task.meta,
-        &task.block_path,
-        &index,
-        &chunk_index_path,
-        &mut metric_labels,
-    )?;
-    let block_ulid = task.meta.ulid.clone();
-    let row = index_row(
-        &task.repository,
-        task.meta,
-        task.block_path.clone(),
-        task.meta_path,
-    )?;
-    tracing::info!(
-        repository = %task.repository.name,
-        block_ulid = %block_ulid,
-        elapsed_seconds = started.elapsed().as_secs_f64(),
-        series_count,
-        chunk_count,
-        "finished Thanos block index build"
-    );
-    Ok(BuiltBlockIndex {
-        row,
-        block_ulid,
-        block_path: task.block_path,
-        index_path,
-        chunk_index_path,
-        series_count,
-        chunk_count,
-        metric_labels,
-    })
+    let result = async {
+        let index = task.storage_repository.read(&index_path).await?;
+        tracing::debug!(
+            repository = %task.repository.name,
+            block_ulid = %task.meta.ulid,
+            index_path = %index_path,
+            index_bytes = index.len(),
+            "downloaded Thanos TSDB index"
+        );
+        let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
+        let mut metric_labels = BTreeMap::new();
+        let (series_count, chunk_count) = write_chunk_index_streaming(
+            &task.repository,
+            &task.meta,
+            &task.block_path,
+            &index,
+            &chunk_index_path,
+            &mut metric_labels,
+        )?;
+        let block_ulid = task.meta.ulid.clone();
+        let row = index_row(
+            &task.repository,
+            task.meta,
+            task.block_path.clone(),
+            task.meta_path,
+        )?;
+        tracing::info!(
+            repository = %task.repository.name,
+            block_ulid = %block_ulid,
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            series_count,
+            chunk_count,
+            "finished Thanos block index build"
+        );
+        Ok(BuiltBlockIndex {
+            row,
+            block_ulid,
+            block_path: task.block_path,
+            index_path: index_path.clone(),
+            chunk_index_path,
+            series_count,
+            chunk_count,
+            metric_labels,
+        })
+    }
+    .await;
+
+    metrics::histogram!("thanos_reader_block_index_block_processing_duration_seconds")
+        .record(started.elapsed());
+    match result {
+        Ok(built_index) => {
+            metrics::counter!("thanos_reader_block_index_blocks_processed_total").increment(1);
+            metrics::gauge!("thanos_reader_block_index_processed_blocks").increment(1.0);
+            Ok(built_index)
+        }
+        Err(error) => {
+            metrics::counter!("thanos_reader_block_index_block_processing_errors_total")
+                .increment(1);
+            tracing::error!(
+                index_path = %index_path,
+                error = %error,
+                "failed to process Thanos block into expanded chunk parquet index"
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Return the generated block-index parquet location for a configured cache directory.

@@ -3,16 +3,11 @@ use std::collections::BTreeMap;
 use futures::StreamExt;
 use serde::Deserialize;
 use thanos_v1_reader::{
-    block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
-    config::ThanosRepositoryConfig,
-    index_context,
     store_service::ThanosStoreService,
     thanos_proto::thanos::{
         self, Aggr, LabelMatcher, PartialResponseStrategy, store_server::Store,
     },
 };
-
-const RESOLUTION_5M: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct OracleSeries {
@@ -52,61 +47,7 @@ struct OracleSample {
 
 #[tokio::test]
 async fn scalar_downsample_aggregates_match_go_bucket_store() {
-    let root = std::env::temp_dir().join(format!(
-        "thanos-v1-reader-downsample-e2e-{}",
-        std::process::id()
-    ));
-    let blocks = root.join("blocks");
-    let cache = root.join("cache");
-    let generator_directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
-    let status = std::process::Command::new("go")
-        .args([
-            "run",
-            ".",
-            "--output",
-            blocks.to_str().unwrap(),
-            "--clean",
-            "--mint",
-            "1700000000000",
-            "--maxt",
-            "1700003600000",
-            "--samples",
-            "240",
-            "--instances",
-            "2",
-            "--pods",
-            "2",
-            "--routes",
-            "2",
-            "--native-series",
-            "1",
-            "--scalar-edge-cases",
-            "--downsample-5m=true",
-        ])
-        .current_dir(&generator_directory)
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    let repository = ThanosRepositoryConfig {
-        name: "e2e".to_owned(),
-        uri: format!("file://{}", blocks.display()),
-    };
-    let schemas = build_block_index(std::slice::from_ref(&repository), cache.to_str().unwrap())
-        .await
-        .unwrap();
-    let context = index_context(
-        &block_index_file_path(cache.to_str().unwrap()),
-        &chunk_index_directory_path(cache.to_str().unwrap()),
-        &schemas,
-        std::slice::from_ref(&repository),
-    )
-    .await
-    .unwrap();
-    let service = ThanosStoreService::new(context.clone(), std::slice::from_ref(&repository))
-        .await
-        .unwrap();
+    let (context, service) = crate::fixture::store_service("downsample-cache").await;
     let aggregates = [Aggr::Count, Aggr::Sum, Aggr::Min, Aggr::Max, Aggr::Counter];
 
     for (metric, expected_series) in [
@@ -116,14 +57,13 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
         ("dummy_request_duration_seconds_count", 4),
         ("dummy_request_duration_seconds_sum", 4),
     ] {
-        let expected = go_bucket_store_series(
-            &generator_directory,
-            &blocks,
+        let expected = crate::fixture::go_bucket_store_series(
             metric,
-            "count,sum,min,max,counter",
-            RESOLUTION_5M,
+            Some("count,sum,min,max,counter"),
+            Some(crate::fixture::RESOLUTION_5M),
         );
-        let actual = reader_series(&service, metric, &aggregates, RESOLUTION_5M).await;
+        let actual =
+            reader_series(&service, metric, &aggregates, crate::fixture::RESOLUTION_5M).await;
         assert_eq!(
             actual, expected,
             "downsampled StoreAPI mismatch for {metric}"
@@ -148,15 +88,18 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
         );
     }
 
-    let counter = go_bucket_store_series(
-        &generator_directory,
-        &blocks,
+    let counter = crate::fixture::go_bucket_store_series(
         "dummy_requests_total",
-        "count,sum,min,max,counter",
-        RESOLUTION_5M,
+        Some("count,sum,min,max,counter"),
+        Some(crate::fixture::RESOLUTION_5M),
     );
     let expected_counter_values = aggregate_values(&counter, |chunk| chunk.counter.as_ref());
-    let actual_counter_values = query_values(&context, "dummy_requests_total", RESOLUTION_5M).await;
+    let actual_counter_values = query_values(
+        &context,
+        "dummy_requests_total",
+        crate::fixture::RESOLUTION_5M,
+    )
+    .await;
     assert_eq!(actual_counter_values, expected_counter_values);
     assert!(
         expected_counter_values
@@ -171,12 +114,10 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
         "counter aggregate must not contain stale markers"
     );
 
-    let gauge = go_bucket_store_series(
-        &generator_directory,
-        &blocks,
+    let gauge = crate::fixture::go_bucket_store_series(
         "dummy_temperature_celsius",
-        "count,sum,min,max,counter",
-        RESOLUTION_5M,
+        Some("count,sum,min,max,counter"),
+        Some(crate::fixture::RESOLUTION_5M),
     );
     let gauge_values = [
         aggregate_values(&gauge, |chunk| chunk.count.as_ref()),
@@ -203,12 +144,10 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
             .any(|(_, bits)| *bits == f64::INFINITY.to_bits())
     );
 
-    let histogram_count = go_bucket_store_series(
-        &generator_directory,
-        &blocks,
+    let histogram_count = crate::fixture::go_bucket_store_series(
         "dummy_request_duration_seconds_count",
-        "count,sum,min,max,counter",
-        RESOLUTION_5M,
+        Some("count,sum,min,max,counter"),
+        Some(crate::fixture::RESOLUTION_5M),
     );
     assert!(
         aggregate_values(&histogram_count, |chunk| chunk.min.as_ref())
@@ -217,13 +156,8 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
         "classic histogram zero-count window must survive downsampling"
     );
 
-    let expected_raw_fallback = go_bucket_store_series(
-        &generator_directory,
-        &blocks,
-        "dummy_requests_total",
-        "count",
-        0,
-    );
+    let expected_raw_fallback =
+        crate::fixture::go_bucket_store_series("dummy_requests_total", Some("count"), Some(0));
     let actual_raw_fallback =
         reader_series(&service, "dummy_requests_total", &[Aggr::Count], 0).await;
     assert_eq!(actual_raw_fallback, expected_raw_fallback);
@@ -237,40 +171,6 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
                 && chunk.counter.is_none()
         })
     }));
-
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-fn go_bucket_store_series(
-    generator_directory: &std::path::Path,
-    blocks: &std::path::Path,
-    metric: &str,
-    aggregates: &str,
-    max_resolution: i64,
-) -> Vec<OracleSeries> {
-    let output = std::process::Command::new("go")
-        .args([
-            "run",
-            "-tags=slicelabels",
-            "./cmd/store-oracle",
-            "--bucket",
-            blocks.to_str().unwrap(),
-            "--metric",
-            metric,
-            "--aggregates",
-            aggregates,
-            "--max-resolution",
-            &max_resolution.to_string(),
-        ])
-        .current_dir(generator_directory)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "Go BucketStore oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 async fn reader_series(

@@ -3,16 +3,11 @@ use std::collections::BTreeMap;
 use futures::StreamExt;
 use serde::Deserialize;
 use thanos_v1_reader::{
-    block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
-    config::ThanosRepositoryConfig,
-    index_context,
     store_service::ThanosStoreService,
     thanos_proto::thanos::{
         self, Aggr, LabelMatcher, PartialResponseStrategy, store_server::Store,
     },
 };
-
-const SAMPLE_COUNT: usize = 240;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct OracleSeries {
@@ -38,62 +33,7 @@ struct OracleSample {
 
 #[tokio::test]
 async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
-    let root = std::env::temp_dir().join(format!(
-        "thanos-v1-reader-scalar-e2e-{}",
-        std::process::id()
-    ));
-    let blocks = root.join("blocks");
-    let cache = root.join("cache");
-    let generator_directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
-    let sample_count = SAMPLE_COUNT.to_string();
-    let status = std::process::Command::new("go")
-        .args([
-            "run",
-            ".",
-            "--output",
-            blocks.to_str().unwrap(),
-            "--clean",
-            "--mint",
-            "1700000000000",
-            "--maxt",
-            "1700003600000",
-            "--samples",
-            &sample_count,
-            "--instances",
-            "2",
-            "--pods",
-            "2",
-            "--routes",
-            "2",
-            "--native-series",
-            "1",
-            "--scalar-edge-cases",
-            "--downsample-5m=false",
-        ])
-        .current_dir(&generator_directory)
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    let repository = ThanosRepositoryConfig {
-        name: "e2e".to_owned(),
-        uri: format!("file://{}", blocks.display()),
-    };
-    let schemas = build_block_index(std::slice::from_ref(&repository), cache.to_str().unwrap())
-        .await
-        .unwrap();
-    let context = index_context(
-        &block_index_file_path(cache.to_str().unwrap()),
-        &chunk_index_directory_path(cache.to_str().unwrap()),
-        &schemas,
-        std::slice::from_ref(&repository),
-    )
-    .await
-    .unwrap();
-    let service = ThanosStoreService::new(context.clone(), std::slice::from_ref(&repository))
-        .await
-        .unwrap();
+    let (context, service) = crate::fixture::store_service("raw-scalar-cache").await;
 
     for (metric, expected_series) in [
         ("dummy_requests_total", 2),
@@ -102,7 +42,7 @@ async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
         ("dummy_request_duration_seconds_count", 4),
         ("dummy_request_duration_seconds_sum", 4),
     ] {
-        let expected = go_bucket_store_series(&generator_directory, &blocks, metric);
+        let expected = crate::fixture::go_bucket_store_series(metric, None, None);
         let actual = reader_series(&service, metric).await;
         assert_eq!(actual, expected, "StoreAPI mismatch for {metric}");
         assert_eq!(actual.len(), expected_series, "series count for {metric}");
@@ -122,7 +62,7 @@ async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
                 .flat_map(|series| &series.chunks)
                 .map(|chunk| chunk.samples.len())
                 .sum::<usize>(),
-            expected_series * SAMPLE_COUNT,
+            expected_series * crate::fixture::SAMPLE_COUNT,
             "decoded sample count for {metric}"
         );
 
@@ -153,7 +93,7 @@ async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
         }
     }
 
-    let gauge = go_bucket_store_series(&generator_directory, &blocks, "dummy_temperature_celsius");
+    let gauge = crate::fixture::go_bucket_store_series("dummy_temperature_celsius", None, None);
     let gauge_bits = oracle_values(&gauge)
         .into_iter()
         .map(|(_, bits)| bits)
@@ -169,34 +109,6 @@ async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
             "missing gauge edge {expected:#x}"
         );
     }
-
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-fn go_bucket_store_series(
-    generator_directory: &std::path::Path,
-    blocks: &std::path::Path,
-    metric: &str,
-) -> Vec<OracleSeries> {
-    let output = std::process::Command::new("go")
-        .args([
-            "run",
-            "-tags=slicelabels",
-            "./cmd/store-oracle",
-            "--bucket",
-            blocks.to_str().unwrap(),
-            "--metric",
-            metric,
-        ])
-        .current_dir(generator_directory)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "Go BucketStore oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 async fn reader_series(service: &ThanosStoreService, metric: &str) -> Vec<OracleSeries> {

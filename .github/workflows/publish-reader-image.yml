@@ -23,7 +23,10 @@ name: Reader image
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # `pull_request` builds trusted same-repository heads, while `pull_request_target`
+  # handles forks. Both events fire for an internal PR; keeping them in separate
+  # groups prevents the skipped target run from cancelling the real image build.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

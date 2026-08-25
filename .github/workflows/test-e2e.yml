@@ -1,4 +1,4 @@
-name: Tests
+name: test-e2e
 
 on:
   push:
@@ -16,38 +16,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  go-tests:
-    name: Go tests
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: thanos-block-gen
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: thanos-block-gen/go.mod
-          cache: true
-          cache-dependency-path: thanos-block-gen/go.sum
-      - run: go test ./...
-
-  rust-unit-tests:
-    name: Rust unit tests
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: thanos-v1-reader
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "29.x"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: thanos-v1-reader -> target
-      - run: cargo test --lib
-
   rust-e2e-tests:
     name: Rust end-to-end tests
     runs-on: ubuntu-latest
@@ -71,3 +39,24 @@ jobs:
         with:
           workspaces: thanos-v1-reader -> target
       - run: cargo test --test e2e
+
+  store-api-conformance:
+    name: StoreAPI conformance
+    runs-on: ubuntu-latest
+    env:
+      OTEL_SDK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: thanos-block-gen/go.mod
+          cache: true
+          cache-dependency-path: thanos-block-gen/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thanos-v1-reader -> target
+      - run: make store-api-conformance-test

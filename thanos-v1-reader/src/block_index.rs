@@ -4,7 +4,7 @@ use std::{
     fs, io,
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arrow::{
@@ -15,7 +15,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{
     Operator,
     layers::{MetricsLayer, OtelTraceLayer},
@@ -33,6 +33,8 @@ use crate::{
 
 type BoxError = Box<dyn Error>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
+/// Keep index construction well below the reader's 48 GiB production memory limit.
+const CHUNK_INDEX_BATCH_SIZE: usize = 50_000;
 
 #[derive(Debug, Deserialize)]
 struct BlockMeta {
@@ -159,6 +161,25 @@ struct ChunkIndexRow {
     labels_json: String,
 }
 
+struct BlockBuildTask {
+    repository: ThanosRepositoryConfig,
+    storage_repository: std::sync::Arc<crate::storage::Repository>,
+    meta: BlockMeta,
+    block_path: String,
+    meta_path: String,
+}
+
+struct BuiltBlockIndex {
+    row: BlockIndexRow,
+    block_ulid: String,
+    block_path: String,
+    index_path: String,
+    chunk_index_path: String,
+    series_count: usize,
+    chunk_count: usize,
+    metric_labels: BTreeMap<String, BTreeSet<String>>,
+}
+
 /// The DataFusion table schema discovered for one Prometheus metric name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricTableSchema {
@@ -191,13 +212,12 @@ pub async fn build_block_index(
     repositories: &[ThanosRepositoryConfig],
     index_cache_location: &str,
     storage: &RepositoryRegistry,
+    index_build_concurrency: usize,
+    block_max_age: Option<Duration>,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
-    let mut rows = Vec::new();
+    let mut tasks = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
-    let mut metric_labels = BTreeMap::new();
-
-    metrics::gauge!("thanos_reader_block_index_total_blocks").set(0.0);
-    metrics::gauge!("thanos_reader_block_index_processed_blocks").set(0.0);
+    let mut skipped_old_blocks = 0usize;
 
     for repository in repositories {
         let storage_repository = storage.require(&repository.uri)?;
@@ -218,7 +238,7 @@ pub async fn build_block_index(
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
             if block_has_deletion_mark(storage_repository.operator(), &block_path).await? {
-                tracing::debug!(
+                tracing::trace!(
                     repository = %repository.name,
                     block_path = %block_path,
                     "skipping deleted Thanos block"
@@ -226,70 +246,77 @@ pub async fn build_block_index(
                 continue;
             }
 
-            metrics::gauge!("thanos_reader_block_index_total_blocks").increment(1.0);
-            let block_processing_started = Instant::now();
-            let result = async {
-                let contents = storage_repository.read(&meta_path).await?;
-                let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
-                    tracing::error!(
-                        repository = %repository.name,
-                        repository_uri = %repository.uri,
-                        block_path = %block_path,
-                        meta_path = %meta_path,
-                        error = %error,
-                        "failed to parse Thanos block metadata"
-                    );
-                    error
-                })?;
-                active_block_ulids.insert(meta.ulid.clone());
-
-                let index_path = format!("{block_path}/index");
-                let index = storage_repository.read(&index_path).await?;
-                let series = tsdb_index::parse(&index)?;
-                let series_count = series.len();
-                collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
-                let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
-                let chunk_count = chunk_rows.len();
-                let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
-                write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
+            let contents = storage_repository.read(&meta_path).await?;
+            let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
+                tracing::error!(
+                    repository = %repository.name,
+                    repository_uri = %repository.uri,
+                    block_path = %block_path,
+                    meta_path = %meta_path,
+                    error = %error,
+                    "failed to parse Thanos block metadata"
+                );
+                error
+            })?;
+            if block_is_older_than(&meta, block_max_age)? {
+                skipped_old_blocks += 1;
                 tracing::debug!(
                     repository = %repository.name,
                     block_ulid = %meta.ulid,
                     block_path = %block_path,
-                    index_path = %index_path,
-                    chunk_index_path = %chunk_index_path,
-                    series_count,
-                    chunk_count,
-                    "processed Thanos block into expanded chunk parquet index"
+                    max_time = meta.max_time,
+                    max_age = ?block_max_age,
+                    "skipping Thanos block older than configured maximum age"
                 );
-
-                index_row(repository, meta, block_path.clone(), meta_path)
+                continue;
             }
-            .await;
-            metrics::histogram!("thanos_reader_block_index_block_processing_duration_seconds")
-                .record(block_processing_started.elapsed());
+            active_block_ulids.insert(meta.ulid.clone());
 
-            match result {
-                Ok(row) => {
-                    metrics::counter!("thanos_reader_block_index_blocks_processed_total")
-                        .increment(1);
-                    metrics::gauge!("thanos_reader_block_index_processed_blocks").increment(1.0);
-                    rows.push(row);
-                }
-                Err(error) => {
-                    metrics::counter!("thanos_reader_block_index_block_processing_errors_total")
-                        .increment(1);
-                    tracing::error!(
-                        repository = %repository.name,
-                        repository_uri = %repository.uri,
-                        block_path = %block_path,
-                        error = %error,
-                        "failed to process Thanos block into expanded chunk parquet index"
-                    );
-                    return Err(error);
-                }
-            }
+            tasks.push(BlockBuildTask {
+                repository: repository.clone(),
+                storage_repository: storage_repository.clone(),
+                meta,
+                block_path,
+                meta_path,
+            });
         }
+    }
+
+    if skipped_old_blocks > 0 {
+        tracing::info!(
+            skipped_old_blocks,
+            max_age = ?block_max_age,
+            "skipped Thanos blocks older than configured maximum age"
+        );
+    }
+
+    tracing::info!(
+        blocks = tasks.len(),
+        concurrency = index_build_concurrency,
+        "building Thanos block indexes concurrently"
+    );
+    metrics::gauge!("thanos_reader_block_index_total_blocks").set(tasks.len() as f64);
+    metrics::gauge!("thanos_reader_block_index_processed_blocks").set(0.0);
+    let built_indexes = stream::iter(tasks)
+        .map(|task| build_chunk_index(task, index_cache_location.to_owned()))
+        .buffer_unordered(index_build_concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut rows = Vec::with_capacity(built_indexes.len());
+    let mut metric_labels = BTreeMap::new();
+    for built in built_indexes {
+        tracing::debug!(
+            repository = %built.row.repository_name,
+            block_ulid = %built.block_ulid,
+            block_path = %built.block_path,
+            index_path = %built.index_path,
+            chunk_index_path = %built.chunk_index_path,
+            series_count = built.series_count,
+            chunk_count = built.chunk_count,
+            "processed Thanos block into expanded chunk parquet index"
+        );
+        merge_metric_labels(&mut metric_labels, built.metric_labels);
+        rows.push(built.row);
     }
 
     cleanup_chunk_index_files(index_cache_location, &active_block_ulids)?;
@@ -316,6 +343,95 @@ pub async fn build_block_index(
             label_columns,
         })
         .collect())
+}
+
+fn block_is_older_than(meta: &BlockMeta, max_age: Option<Duration>) -> Result<bool, BoxError> {
+    let Some(max_age) = max_age else {
+        return Ok(false);
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let cutoff = now.saturating_sub(max_age).as_millis();
+    Ok(i128::from(meta.max_time) < i128::try_from(cutoff)?)
+}
+
+async fn build_chunk_index(
+    task: BlockBuildTask,
+    index_cache_location: String,
+) -> Result<BuiltBlockIndex, BoxError> {
+    let index_path = format!("{}/index", task.block_path);
+    let started = Instant::now();
+    tracing::info!(
+        repository = %task.repository.name,
+        block_ulid = %task.meta.ulid,
+        block_path = %task.block_path,
+        "starting Thanos block index build"
+    );
+    let result = async {
+        let index = task.storage_repository.read(&index_path).await?;
+        tracing::debug!(
+            repository = %task.repository.name,
+            block_ulid = %task.meta.ulid,
+            index_path = %index_path,
+            index_bytes = index.len(),
+            "downloaded Thanos TSDB index"
+        );
+        let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
+        let mut metric_labels = BTreeMap::new();
+        let (series_count, chunk_count) = write_chunk_index_streaming(
+            &task.repository,
+            &task.meta,
+            &task.block_path,
+            &index,
+            &chunk_index_path,
+            &mut metric_labels,
+        )?;
+        let block_ulid = task.meta.ulid.clone();
+        let row = index_row(
+            &task.repository,
+            task.meta,
+            task.block_path.clone(),
+            task.meta_path,
+        )?;
+        tracing::info!(
+            repository = %task.repository.name,
+            block_ulid = %block_ulid,
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            series_count,
+            chunk_count,
+            "finished Thanos block index build"
+        );
+        Ok(BuiltBlockIndex {
+            row,
+            block_ulid,
+            block_path: task.block_path,
+            index_path: index_path.clone(),
+            chunk_index_path,
+            series_count,
+            chunk_count,
+            metric_labels,
+        })
+    }
+    .await;
+
+    metrics::histogram!("thanos_reader_block_index_block_processing_duration_seconds")
+        .record(started.elapsed());
+    match result {
+        Ok(built_index) => {
+            metrics::counter!("thanos_reader_block_index_blocks_processed_total").increment(1);
+            metrics::gauge!("thanos_reader_block_index_processed_blocks").increment(1.0);
+            Ok(built_index)
+        }
+        Err(error) => {
+            metrics::counter!("thanos_reader_block_index_block_processing_errors_total")
+                .increment(1);
+            tracing::error!(
+                index_path = %index_path,
+                error = %error,
+                "failed to process Thanos block into expanded chunk parquet index"
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Return the generated block-index parquet location for a configured cache directory.
@@ -438,62 +554,158 @@ fn index_row(
     })
 }
 
-fn chunk_rows(
+/// Expand a single block's TSDB index into Parquet without holding the block's full series,
+/// expanded chunks, or encoded Parquet bytes in memory at once.
+fn write_chunk_index_streaming(
     repository: &ThanosRepositoryConfig,
     meta: &BlockMeta,
     block_path: &str,
-    series: Vec<Series>,
-) -> Result<Vec<ChunkIndexRow>, BoxError> {
-    let mut rows = Vec::new();
-    for series in series {
-        let series_mint = series
-            .chunks
-            .first()
-            .map(|chunk| chunk.mint)
-            .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
-        let series_maxt = series
-            .chunks
-            .last()
-            .map(|chunk| chunk.maxt)
-            .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
-        let metric_name = series
-            .labels
-            .get("__name__")
-            .ok_or_else(|| invalid_data("series is missing __name__ label".to_owned()))?
-            .clone();
-        let mut labels = series.labels.clone();
-        for (name, value) in &meta.thanos.labels {
-            labels.entry(name.clone()).or_insert_with(|| value.clone());
-        }
-        let labels_json = serde_json::to_string(&labels)?;
-
-        for chunk in series.chunks {
-            let chunk_file_seq = (chunk.reference >> 32) as u32;
-            let chunk_file_offset = chunk.reference & u64::from(u32::MAX);
-            rows.push(ChunkIndexRow {
-                repository_name: repository.name.clone(),
-                repository_uri: repository.uri.clone(),
-                block_ulid: meta.ulid.clone(),
-                block_path: block_path.to_owned(),
-                downsample_resolution: meta.thanos.downsample.resolution,
-                metric_name: metric_name.clone(),
-                // TSDB chunk references use a zero-based segment sequence while block
-                // segment filenames begin at 000001.
-                chunk_file_path: format!("{block_path}/chunks/{:06}", chunk_file_seq + 1),
-                chunk_ref: chunk.reference,
-                chunk_file_seq,
-                chunk_file_offset,
-                series_ref: series.reference,
-                series_mint,
-                series_maxt,
-                chunk_mint: chunk.mint,
-                chunk_maxt: chunk.maxt,
-                labels: labels.clone(),
-                labels_json: labels_json.clone(),
-            });
-        }
+    index: &[u8],
+    chunk_index_path: &str,
+    metric_labels: &mut BTreeMap<String, BTreeSet<String>>,
+) -> Result<(usize, usize), BoxError> {
+    let path = Path::new(
+        chunk_index_path
+            .strip_prefix("file://")
+            .unwrap_or(chunk_index_path),
+    );
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid_data(format!("invalid chunk index path {path:?}")))?;
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
     }
-    Ok(rows)
+    let temporary_path = path.with_file_name(format!("{}.partial", file_name.to_string_lossy()));
+    let file = fs::File::create(&temporary_path)?;
+    let schema = chunk_schema();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(parquet_properties()))?;
+    let mut rows = Vec::with_capacity(CHUNK_INDEX_BATCH_SIZE);
+    let mut series_count = 0;
+    let mut chunk_count = 0;
+    let mut write_error: Option<BoxError> = None;
+
+    let parsed = tsdb_index::parse_each(index, |series| {
+        if write_error.is_some() {
+            return;
+        }
+        series_count += 1;
+        collect_metric_labels(
+            metric_labels,
+            &meta.thanos.labels,
+            std::slice::from_ref(&series),
+        );
+        match append_chunk_rows(repository, meta, block_path, series, &mut rows) {
+            Ok(count) => {
+                chunk_count += count;
+                if rows.len() >= CHUNK_INDEX_BATCH_SIZE {
+                    tracing::info!(
+                        block_ulid = %meta.ulid,
+                        batch_rows = rows.len(),
+                        total_chunks = chunk_count,
+                        "flushing bounded chunk-index Parquet batch"
+                    );
+                    if let Err(error) = flush_chunk_rows(&mut writer, &schema, &mut rows) {
+                        write_error = Some(error);
+                    }
+                }
+            }
+            Err(error) => write_error = Some(error),
+        }
+    });
+
+    let result = match parsed {
+        Err(error) => Err(Box::new(error) as BoxError),
+        Ok(()) => match write_error {
+            Some(error) => Err(error),
+            None => {
+                tracing::info!(
+                    block_ulid = %meta.ulid,
+                    batch_rows = rows.len(),
+                    total_chunks = chunk_count,
+                    "flushing final chunk-index Parquet batch"
+                );
+                flush_chunk_rows(&mut writer, &schema, &mut rows)?;
+                writer.close()?;
+                fs::rename(&temporary_path, path)?;
+                Ok((series_count, chunk_count))
+            }
+        },
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn append_chunk_rows(
+    repository: &ThanosRepositoryConfig,
+    meta: &BlockMeta,
+    block_path: &str,
+    series: Series,
+    rows: &mut Vec<ChunkIndexRow>,
+) -> Result<usize, BoxError> {
+    let series_mint = series
+        .chunks
+        .first()
+        .map(|chunk| chunk.mint)
+        .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+    let series_maxt = series
+        .chunks
+        .last()
+        .map(|chunk| chunk.maxt)
+        .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+    let metric_name = series
+        .labels
+        .get("__name__")
+        .ok_or_else(|| invalid_data("series is missing __name__ label".to_owned()))?
+        .clone();
+    let mut labels = series.labels;
+    for (name, value) in &meta.thanos.labels {
+        labels.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    let labels_json = serde_json::to_string(&labels)?;
+    let count = series.chunks.len();
+    for chunk in series.chunks {
+        let chunk_file_seq = (chunk.reference >> 32) as u32;
+        let chunk_file_offset = chunk.reference & u64::from(u32::MAX);
+        rows.push(ChunkIndexRow {
+            repository_name: repository.name.clone(),
+            repository_uri: repository.uri.clone(),
+            block_ulid: meta.ulid.clone(),
+            block_path: block_path.to_owned(),
+            downsample_resolution: meta.thanos.downsample.resolution,
+            metric_name: metric_name.clone(),
+            chunk_file_path: format!("{block_path}/chunks/{:06}", chunk_file_seq + 1),
+            chunk_ref: chunk.reference,
+            chunk_file_seq,
+            chunk_file_offset,
+            series_ref: series.reference,
+            series_mint,
+            series_maxt,
+            chunk_mint: chunk.mint,
+            chunk_maxt: chunk.maxt,
+            labels: labels.clone(),
+            labels_json: labels_json.clone(),
+        });
+    }
+    Ok(count)
+}
+
+fn flush_chunk_rows(
+    writer: &mut ArrowWriter<fs::File>,
+    schema: &Arc<Schema>,
+    rows: &mut Vec<ChunkIndexRow>,
+) -> Result<(), BoxError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writer.write(&chunk_record_batch(schema, rows)?)?;
+    writer.flush()?;
+    rows.clear();
+    Ok(())
 }
 
 fn collect_metric_labels(
@@ -519,12 +731,22 @@ fn collect_metric_labels(
     }
 }
 
+fn merge_metric_labels(
+    target: &mut BTreeMap<String, BTreeSet<String>>,
+    source: BTreeMap<String, BTreeSet<String>>,
+) {
+    for (metric, labels) in source {
+        target.entry(metric).or_default().extend(labels);
+    }
+}
+
 fn block_parquet_bytes(rows: Vec<BlockIndexRow>) -> Result<Vec<u8>, BoxError> {
     let schema = block_schema();
     let batch = block_record_batch(&schema, &rows)?;
     parquet_bytes(schema, batch)
 }
 
+#[cfg(test)]
 fn chunk_parquet_bytes(rows: Vec<ChunkIndexRow>) -> Result<Vec<u8>, BoxError> {
     let schema = chunk_schema();
     let batch = chunk_record_batch(&schema, &rows)?;
@@ -547,7 +769,7 @@ fn parquet_properties() -> WriterProperties {
         .set_write_page_header_statistics(true)
         .set_statistics_truncate_length(None)
         .set_column_index_truncate_length(None)
-        .set_max_row_group_row_count(Some(usize::MAX))
+        .set_max_row_group_row_count(Some(CHUNK_INDEX_BATCH_SIZE))
         .build()
 }
 
@@ -943,6 +1165,8 @@ mod tests {
             &[repository],
             root.path().join("cache").to_str().unwrap(),
             &storage,
+            StorageConfig::default().index_build_concurrency,
+            None,
         )
         .await
         .unwrap();
@@ -1084,7 +1308,15 @@ mod tests {
             }],
         }];
 
-        let rows = chunk_rows(&repository, &meta, &meta.ulid, series).unwrap();
+        let mut rows = Vec::new();
+        append_chunk_rows(
+            &repository,
+            &meta,
+            &meta.ulid,
+            series.into_iter().next().unwrap(),
+            &mut rows,
+        )
+        .unwrap();
 
         assert_eq!(rows[0].labels["cluster"], "production");
         assert_eq!(

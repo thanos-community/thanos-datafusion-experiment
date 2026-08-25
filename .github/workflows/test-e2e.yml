@@ -39,3 +39,24 @@ jobs:
         with:
           workspaces: thanos-v1-reader -> target
       - run: cargo test --test e2e
+
+  store-api-conformance:
+    name: StoreAPI conformance
+    runs-on: ubuntu-latest
+    env:
+      OTEL_SDK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: thanos-block-gen/go.mod
+          cache: true
+          cache-dependency-path: thanos-block-gen/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thanos-v1-reader -> target
+      - run: make store-api-conformance-test

@@ -14,7 +14,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{
     Operator,
     layers::{MetricsLayer, OtelTraceLayer},
@@ -34,6 +34,9 @@ type BoxError = Box<dyn Error>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
 /// Keep index construction well below the reader's 48 GiB production memory limit.
 const CHUNK_INDEX_BATCH_SIZE: usize = 50_000;
+/// Each worker holds one downloaded TSDB index and one bounded Parquet batch. Eight workers
+/// keep a 12-vCPU reader busy while leaving substantial headroom below its 48 GiB limit.
+const INDEX_BUILD_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Deserialize)]
 struct BlockMeta {
@@ -160,6 +163,25 @@ struct ChunkIndexRow {
     labels_json: String,
 }
 
+struct BlockBuildTask {
+    repository: ThanosRepositoryConfig,
+    storage_repository: std::sync::Arc<crate::storage::Repository>,
+    meta: BlockMeta,
+    block_path: String,
+    meta_path: String,
+}
+
+struct BuiltBlockIndex {
+    row: BlockIndexRow,
+    block_ulid: String,
+    block_path: String,
+    index_path: String,
+    chunk_index_path: String,
+    series_count: usize,
+    chunk_count: usize,
+    metric_labels: BTreeMap<String, BTreeSet<String>>,
+}
+
 /// The DataFusion table schema discovered for one Prometheus metric name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricTableSchema {
@@ -193,9 +215,8 @@ pub async fn build_block_index(
     index_cache_location: &str,
     storage: &RepositoryRegistry,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
-    let mut rows = Vec::new();
+    let mut tasks = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
-    let mut metric_labels = BTreeMap::new();
 
     for repository in repositories {
         let storage_repository = storage.require(&repository.uri)?;
@@ -238,30 +259,41 @@ pub async fn build_block_index(
             })?;
             active_block_ulids.insert(meta.ulid.clone());
 
-            let index_path = format!("{block_path}/index");
-            let index = storage_repository.read(&index_path).await?;
-            let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
-            let (series_count, chunk_count) = write_chunk_index_streaming(
-                repository,
-                &meta,
-                &block_path,
-                &index,
-                &chunk_index_path,
-                &mut metric_labels,
-            )?;
-            tracing::debug!(
-                repository = %repository.name,
-                block_ulid = %meta.ulid,
-                block_path = %block_path,
-                index_path = %index_path,
-                chunk_index_path = %chunk_index_path,
-                series_count,
-                chunk_count,
-                "processed Thanos block into expanded chunk parquet index"
-            );
-
-            rows.push(index_row(repository, meta, block_path, meta_path)?);
+            tasks.push(BlockBuildTask {
+                repository: repository.clone(),
+                storage_repository: storage_repository.clone(),
+                meta,
+                block_path,
+                meta_path,
+            });
         }
+    }
+
+    tracing::info!(
+        blocks = tasks.len(),
+        concurrency = INDEX_BUILD_CONCURRENCY,
+        "building Thanos block indexes concurrently"
+    );
+    let built_indexes = stream::iter(tasks)
+        .map(|task| build_chunk_index(task, index_cache_location.to_owned()))
+        .buffer_unordered(INDEX_BUILD_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut rows = Vec::with_capacity(built_indexes.len());
+    let mut metric_labels = BTreeMap::new();
+    for built in built_indexes {
+        tracing::debug!(
+            repository = %built.row.repository_name,
+            block_ulid = %built.block_ulid,
+            block_path = %built.block_path,
+            index_path = %built.index_path,
+            chunk_index_path = %built.chunk_index_path,
+            series_count = built.series_count,
+            chunk_count = built.chunk_count,
+            "processed Thanos block into expanded chunk parquet index"
+        );
+        merge_metric_labels(&mut metric_labels, built.metric_labels);
+        rows.push(built.row);
     }
 
     cleanup_chunk_index_files(index_cache_location, &active_block_ulids)?;
@@ -288,6 +320,41 @@ pub async fn build_block_index(
             label_columns,
         })
         .collect())
+}
+
+async fn build_chunk_index(
+    task: BlockBuildTask,
+    index_cache_location: String,
+) -> Result<BuiltBlockIndex, BoxError> {
+    let index_path = format!("{}/index", task.block_path);
+    let index = task.storage_repository.read(&index_path).await?;
+    let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
+    let mut metric_labels = BTreeMap::new();
+    let (series_count, chunk_count) = write_chunk_index_streaming(
+        &task.repository,
+        &task.meta,
+        &task.block_path,
+        &index,
+        &chunk_index_path,
+        &mut metric_labels,
+    )?;
+    let block_ulid = task.meta.ulid.clone();
+    let row = index_row(
+        &task.repository,
+        task.meta,
+        task.block_path.clone(),
+        task.meta_path,
+    )?;
+    Ok(BuiltBlockIndex {
+        row,
+        block_ulid,
+        block_path: task.block_path,
+        index_path,
+        chunk_index_path,
+        series_count,
+        chunk_count,
+        metric_labels,
+    })
 }
 
 /// Return the generated block-index parquet location for a configured cache directory.
@@ -572,6 +639,15 @@ fn collect_metric_labels(
                     .filter(|label| label.as_str() != "__name__")
                     .cloned(),
             );
+    }
+}
+
+fn merge_metric_labels(
+    target: &mut BTreeMap<String, BTreeSet<String>>,
+    source: BTreeMap<String, BTreeSet<String>>,
+) {
+    for (metric, labels) in source {
+        target.entry(metric).or_default().extend(labels);
     }
 }
 

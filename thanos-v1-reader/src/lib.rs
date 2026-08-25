@@ -16,6 +16,7 @@ pub mod config;
 pub mod flight_service;
 pub mod metric_table;
 pub mod store_service;
+pub mod storage;
 pub mod thanos_proto;
 pub mod tsdb_index;
 
@@ -34,12 +35,14 @@ use datafusion_tracing::{
     instrument_with_info_spans,
 };
 use metric_table::MetricTableProvider;
+use storage::RepositoryRegistry;
 
 pub async fn index_context(
     block_index_path: &str,
     chunk_index_path: &str,
     metric_table_schemas: &[MetricTableSchema],
     repositories: &[ThanosRepositoryConfig],
+    storage: RepositoryRegistry,
 ) -> Result<SessionContext, datafusion::error::DataFusionError> {
     let execution_options = InstrumentationOptions::builder()
         .record_metrics(true)
@@ -62,14 +65,15 @@ pub async fn index_context(
     context
         .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
         .await?;
-    register_metric_tables(&context, metric_table_schemas, repositories).await?;
+    register_metric_tables(&context, metric_table_schemas, repositories, storage).await?;
     Ok(context)
 }
 
 pub async fn register_metric_tables(
     context: &SessionContext,
     metric_table_schemas: &[MetricTableSchema],
-    repositories: &[ThanosRepositoryConfig],
+    _repositories: &[ThanosRepositoryConfig],
+    storage: RepositoryRegistry,
 ) -> Result<(), datafusion::error::DataFusionError> {
     let catalog = context.catalog("datafusion").ok_or_else(|| {
         datafusion::error::DataFusionError::Internal("default catalog is missing".to_owned())
@@ -81,7 +85,7 @@ pub async fn register_metric_tables(
         let table = MetricTableProvider::new(
             metric_table_schema.clone(),
             chunk_provider.clone(),
-            repositories,
+            storage.clone(),
         )?;
         context.register_table(
             TableReference::full("datafusion", "metrics", metric_table_schema.name.as_str()),
@@ -100,6 +104,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_path = config::ReaderConfig::config_path();
     let config = config::ReaderConfig::load(&config_path)?;
+    let storage = RepositoryRegistry::new(&config)?;
     let address = env::var(LISTEN_ADDR_ENV_VAR).unwrap_or(config.listen_addr);
     let metrics_address =
         env::var(METRICS_LISTEN_ADDR_ENV_VAR).unwrap_or(config.metrics_listen_addr);
@@ -114,7 +119,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let metric_table_schemas =
-        block_index::build_block_index(&config.repositories, &config.index_cache_location).await?;
+        block_index::build_block_index(&config.repositories, &config.index_cache_location, &storage)
+            .await?;
     let block_index_path = block_index::block_index_file_path(&config.index_cache_location);
     let chunk_index_path = block_index::chunk_index_directory_path(&config.index_cache_location);
     tracing::info!(path = %block_index_path, "generated Thanos blocks index");
@@ -125,10 +131,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &chunk_index_path,
         &metric_table_schemas,
         &config.repositories,
+        storage.clone(),
     )
     .await?;
     let store_service =
-        store_service::ThanosStoreService::new(context.clone(), &config.repositories).await?;
+        store_service::ThanosStoreService::new(context.clone(), &config.repositories, storage)
+            .await?;
     let service =
         flight_service::DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
     tracing::info!(
@@ -219,6 +227,7 @@ mod tests {
                 label_columns: BTreeSet::from(["job".to_owned(), "pod".to_owned()]),
             }],
             &[],
+            RepositoryRegistry::empty(),
         )
         .await
         .unwrap();
@@ -253,18 +262,27 @@ mod tests {
         let repository = config::ThanosRepositoryConfig {
             name: "fixtures".to_owned(),
             uri: format!("file://{}", fixture_root.display()),
+            s3: None,
+            gcs: None,
         };
-        let schemas = block_index::build_block_index(&[repository], cache.to_str().unwrap())
+        let repositories = vec![repository];
+        let storage = RepositoryRegistry::new(&config::ReaderConfig {
+            listen_addr: "127.0.0.1:1".to_owned(),
+            metrics_listen_addr: "127.0.0.1:2".to_owned(),
+            index_cache_location: cache.display().to_string(),
+            repositories: repositories.clone(),
+            storage: config::StorageConfig::default(),
+        })
+        .unwrap();
+        let schemas = block_index::build_block_index(&repositories, cache.to_str().unwrap(), &storage)
             .await
             .unwrap();
         let context = index_context(
             &block_index::block_index_file_path(cache.to_str().unwrap()),
             &block_index::chunk_index_directory_path(cache.to_str().unwrap()),
             &schemas,
-            &[config::ThanosRepositoryConfig {
-                name: "fixtures".to_owned(),
-                uri: format!("file://{}", fixture_root.display()),
-            }],
+            &repositories,
+            storage,
         )
         .await
         .unwrap();

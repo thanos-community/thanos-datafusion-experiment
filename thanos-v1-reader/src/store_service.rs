@@ -11,15 +11,14 @@ use arrow::{
 };
 use datafusion::prelude::SessionContext;
 use futures::Stream;
-use opendal::Operator;
 use regex::Regex;
 use tokio_stream::iter;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    block_index::repository_operator,
     chunk_reader::{self, EncodedChunk},
     config::ThanosRepositoryConfig,
+    storage::RepositoryRegistry,
     thanos_proto::thanos::{
         self, Aggr, AggrChunk, Chunk, Label, LabelMatcher, Series, SeriesBatch, SeriesResponse,
         info, store_server::Store,
@@ -33,7 +32,7 @@ type SeriesStream = Pin<Box<dyn Stream<Item = Result<SeriesResponse, Status>> + 
 pub struct ThanosStoreService {
     descriptors: Arc<Vec<ChunkDescriptor>>,
     blocks: Arc<Vec<BlockMetadata>>,
-    operators: Arc<BTreeMap<String, Operator>>,
+    storage: RepositoryRegistry,
 }
 
 #[derive(Clone)]
@@ -65,22 +64,15 @@ enum Matcher {
 impl ThanosStoreService {
     pub async fn new(
         context: SessionContext,
-        repositories: &[ThanosRepositoryConfig],
+        _repositories: &[ThanosRepositoryConfig],
+        storage: RepositoryRegistry,
     ) -> Result<Self, BoxError> {
         let descriptors = load_descriptors(&context).await?;
         let blocks = load_blocks(&context).await?;
-        let operators = repositories
-            .iter()
-            .map(|repository| {
-                repository_operator(&repository.uri)
-                    .map(|operator| (repository.uri.clone(), operator))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-
         Ok(Self {
             descriptors: Arc::new(descriptors),
             blocks: Arc::new(blocks),
-            operators: Arc::new(operators),
+            storage,
         })
     }
 
@@ -334,17 +326,17 @@ impl ThanosStoreService {
         descriptor: &ChunkDescriptor,
         aggregates: &BTreeSet<i32>,
     ) -> Result<Option<AggrChunk>, Status> {
-        let operator = self
-            .operators
+        let repository = self
+            .storage
             .get(&descriptor.repository_uri)
             .ok_or_else(|| {
                 Status::internal(format!(
-                    "no object-store operator for repository {:?}",
+                    "no storage repository for repository {:?}",
                     descriptor.repository_uri
                 ))
             })?;
         let chunk = chunk_reader::read_encoded_chunk(
-            operator,
+            repository.as_ref(),
             &descriptor.chunk_file_path,
             descriptor.chunk_file_offset,
         )
@@ -737,7 +729,7 @@ mod tests {
                 max_time: 200,
                 external_labels: BTreeMap::from([("cluster".to_owned(), "test".to_owned())]),
             }]),
-            operators: Arc::new(BTreeMap::new()),
+            storage: RepositoryRegistry::empty(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

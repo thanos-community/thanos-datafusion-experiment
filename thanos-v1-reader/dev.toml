@@ -5,3 +5,19 @@ index_cache_location = "target/index_cache"
 [[repositories]]
 name = "local"
 uri = "file://../thanos-block-gen/target"
+
+[storage]
+request_timeout = "30s"
+max_retries = 3
+max_concurrent_requests = 64
+bulk_read_chunk_size = "8MiB"
+bulk_read_concurrency = 4
+max_concurrent_chunk_reads = 16
+
+# Enable this in production on a node-local persistent volume.
+# [storage.chunk_cache]
+# directory = "/var/cache/thanos-v1-reader/chunks"
+# max_size = "10GiB"
+# page_size = "512KiB"
+# policy = "slru"
+# protected_fraction = 0.8

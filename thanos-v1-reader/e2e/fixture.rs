@@ -6,9 +6,10 @@ use std::{
 use serde::de::DeserializeOwned;
 use thanos_v1_reader::{
     block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
-    config::ThanosRepositoryConfig,
+    config::{ReaderConfig, StorageConfig, ThanosRepositoryConfig},
     index_context,
     store_service::ThanosStoreService,
+    storage::RepositoryRegistry,
 };
 
 pub const MINT: i64 = 1_700_000_000_000;
@@ -81,6 +82,8 @@ impl GeneratedFixture {
         ThanosRepositoryConfig {
             name: "e2e".to_owned(),
             uri: format!("file://{}", self.blocks.display()),
+            s3: None,
+            gcs: None,
         }
     }
 
@@ -93,7 +96,19 @@ pub async fn indexed_context(cache_name: &str) -> datafusion::prelude::SessionCo
     let fixture = generated_fixture();
     let cache = fixture.cache(cache_name);
     let repository = fixture.repository();
-    let schemas = build_block_index(std::slice::from_ref(&repository), cache.to_str().unwrap())
+    let storage = RepositoryRegistry::new(&ReaderConfig {
+        listen_addr: "127.0.0.1:1".to_owned(),
+        metrics_listen_addr: "127.0.0.1:2".to_owned(),
+        index_cache_location: cache.display().to_string(),
+        repositories: vec![repository.clone()],
+        storage: StorageConfig::default(),
+    })
+    .unwrap();
+    let schemas = build_block_index(
+        std::slice::from_ref(&repository),
+        cache.to_str().unwrap(),
+        &storage,
+    )
         .await
         .unwrap();
     index_context(
@@ -101,6 +116,7 @@ pub async fn indexed_context(cache_name: &str) -> datafusion::prelude::SessionCo
         &chunk_index_directory_path(cache.to_str().unwrap()),
         &schemas,
         std::slice::from_ref(&repository),
+        storage,
     )
     .await
     .unwrap()
@@ -112,7 +128,19 @@ pub async fn store_service(
     let fixture = generated_fixture();
     let repository = fixture.repository();
     let context = indexed_context(cache_name).await;
-    let service = ThanosStoreService::new(context.clone(), std::slice::from_ref(&repository))
+    let storage = RepositoryRegistry::new(&ReaderConfig {
+        listen_addr: "127.0.0.1:1".to_owned(),
+        metrics_listen_addr: "127.0.0.1:2".to_owned(),
+        index_cache_location: fixture.cache(cache_name).display().to_string(),
+        repositories: vec![repository.clone()],
+        storage: StorageConfig::default(),
+    })
+    .unwrap();
+    let service = ThanosStoreService::new(
+        context.clone(),
+        std::slice::from_ref(&repository),
+        storage,
+    )
         .await
         .unwrap();
     (context, service)

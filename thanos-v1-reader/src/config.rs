@@ -11,6 +11,7 @@ use serde::Deserialize;
 pub const DEFAULT_CONFIG_PATH: &str = "dev.toml";
 pub const CONFIG_PATH_ENV_VAR: &str = "THANOS_READER_CONFIG";
 pub const DEFAULT_DELETION_MARK_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_CONSISTENCY_DELAY: Duration = Duration::ZERO;
 const DEFAULT_METRICS_LISTEN_ADDR: &str = "127.0.0.1:9090";
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +22,8 @@ pub struct ReaderConfig {
     pub index_cache_location: String,
     #[serde(default = "default_deletion_mark_delay", with = "humantime_serde")]
     pub deletion_mark_delay: Duration,
+    #[serde(default = "default_consistency_delay", with = "humantime_serde")]
+    pub consistency_delay: Duration,
     #[serde(default = "default_block_sync_interval", with = "humantime_serde")]
     pub block_sync_interval: Duration,
     #[serde(default)]
@@ -93,6 +96,10 @@ fn default_deletion_mark_delay() -> Duration {
     DEFAULT_DELETION_MARK_DELAY
 }
 
+fn default_consistency_delay() -> Duration {
+    DEFAULT_CONSISTENCY_DELAY
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +116,7 @@ uri = "file:///blocks"
         let default: ReaderConfig = toml::from_str(base).unwrap();
         assert_eq!(default.block_sync_interval, Duration::from_secs(15 * 60));
         assert_eq!(default.deletion_mark_delay, DEFAULT_DELETION_MARK_DELAY);
+        assert_eq!(default.consistency_delay, DEFAULT_CONSISTENCY_DELAY);
         default.validate().unwrap();
 
         let configured: ReaderConfig = toml::from_str(
@@ -117,6 +125,7 @@ listen_addr = "127.0.0.1:4100"
 index_cache_location = "cache"
 block_sync_interval = "30s"
 deletion_mark_delay = "2h"
+consistency_delay = "10m"
 [[repositories]]
 name = "test"
 uri = "file:///blocks"
@@ -128,6 +137,21 @@ uri = "file:///blocks"
             configured.deletion_mark_delay,
             Duration::from_secs(2 * 60 * 60)
         );
+        assert_eq!(configured.consistency_delay, Duration::from_secs(10 * 60));
         configured.validate().unwrap();
+
+        assert!(
+            toml::from_str::<ReaderConfig>(
+                r#"
+listen_addr = "127.0.0.1:4100"
+index_cache_location = "cache"
+consistency_delay = "-1s"
+[[repositories]]
+name = "test"
+uri = "file:///blocks"
+"#
+            )
+            .is_err()
+        );
     }
 }

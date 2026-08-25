@@ -4155,6 +4155,7 @@ dependencies = [
  "arrow-flight",
  "async-trait",
  "axum",
+ "chrono",
  "crc",
  "datafusion",
  "datafusion-tracing",

@@ -93,3 +93,4 @@ jobs:
       - run: cargo test --test storeapi_info_parity
       - run: cargo test --test dynamic_block_refresh_parity
       - run: cargo test --test deletion_mark_parity
+      - run: cargo test --test consistency_delay_parity

@@ -19,7 +19,7 @@ reader-watch:
 	cd thanos-v1-reader && cargo watch -w src -w Cargo.toml -w dev.toml -x run
 
 e2e-test:
-	cd thanos-v1-reader && cargo test --test e2e --test native_histogram_parity --test raw_scalar_parity --test scalar_downsample_parity --test native_histogram_downsample_parity --test native_histogram_query_parity --test block_selection_parity --test storeapi_shard_parity --test storeapi_replica_label_parity --test storeapi_series_hints_parity --test storeapi_label_endpoints_parity --test storeapi_info_parity --test dynamic_block_refresh_parity --test deletion_mark_parity
+	cd thanos-v1-reader && cargo test --test e2e --test native_histogram_parity --test raw_scalar_parity --test scalar_downsample_parity --test native_histogram_downsample_parity --test native_histogram_query_parity --test block_selection_parity --test storeapi_shard_parity --test storeapi_replica_label_parity --test storeapi_series_hints_parity --test storeapi_label_endpoints_parity --test storeapi_info_parity --test dynamic_block_refresh_parity --test deletion_mark_parity --test consistency_delay_parity
 
 store-api-conformance-test:
 	cd thanos-v1-reader && cargo build --bin thanos-v1-reader

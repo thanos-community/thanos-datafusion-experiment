@@ -3,6 +3,7 @@ metrics_listen_addr = "127.0.0.1:9090"
 index_cache_location = "target/index_cache"
 block_sync_interval = "15m"
 deletion_mark_delay = "24h"
+consistency_delay = "0s"
 
 [[repositories]]
 name = "local"

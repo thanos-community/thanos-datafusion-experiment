@@ -130,6 +130,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config.repositories,
         &config.index_cache_location,
         config.deletion_mark_delay,
+        config.consistency_delay,
         std::time::SystemTime::now(),
     )
     .await?;
@@ -152,6 +153,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config.repositories,
         &config.index_cache_location,
         config.deletion_mark_delay,
+        config.consistency_delay,
     );
     let service = flight_service::DataFusionFlightService::new_shared(
         store_service.shared_state(),

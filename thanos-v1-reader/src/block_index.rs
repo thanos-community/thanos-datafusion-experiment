@@ -15,6 +15,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use chrono::DateTime;
 use futures::TryStreamExt;
 use opendal::{
     ErrorKind, Operator,
@@ -26,7 +27,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{DEFAULT_DELETION_MARK_DELAY, ThanosRepositoryConfig},
+    config::{DEFAULT_CONSISTENCY_DELAY, DEFAULT_DELETION_MARK_DELAY, ThanosRepositoryConfig},
     tsdb_index::{self, Series},
 };
 
@@ -285,16 +286,18 @@ pub async fn build_block_index(
         repositories,
         index_cache_location,
         DEFAULT_DELETION_MARK_DELAY,
+        DEFAULT_CONSISTENCY_DELAY,
         SystemTime::now(),
     )
     .await
 }
 
-/// Rebuild the index using the Store Gateway deletion-mark grace policy at a fixed clock instant.
+/// Rebuild the index using Store Gateway lifecycle filters at a fixed clock instant.
 pub async fn build_block_index_at(
     repositories: &[ThanosRepositoryConfig],
     index_cache_location: &str,
     deletion_mark_delay: Duration,
+    consistency_delay: Duration,
     now: SystemTime,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut rows = Vec::new();
@@ -316,8 +319,47 @@ pub async fn build_block_index_at(
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
+            let Some(block_timestamp_ms) = ulid_timestamp_ms(&block_path) else {
+                tracing::debug!(
+                    repository = %repository.name,
+                    block_path = %block_path,
+                    "ignoring non-block directory"
+                );
+                continue;
+            };
             let contents = operator.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
+            let meta: BlockMeta = match serde_json::from_slice(contents.to_bytes().as_ref()) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(
+                        repository = %repository.name,
+                        block_path = %block_path,
+                        %error,
+                        "ignoring block with corrupt metadata"
+                    );
+                    continue;
+                }
+            };
+            match block_is_too_fresh(&meta, block_timestamp_ms, consistency_delay, now) {
+                Ok(true) => {
+                    tracing::debug!(
+                        repository = %repository.name,
+                        block_path = %block_path,
+                        "skipping Thanos block inside object-store consistency delay"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        repository = %repository.name,
+                        block_path = %block_path,
+                        %error,
+                        "ignoring block with corrupt metadata"
+                    );
+                    continue;
+                }
+            }
             if block_is_past_deletion_delay(&operator, &block_path, deletion_mark_delay, now)
                 .await?
             {
@@ -957,6 +999,85 @@ pub(crate) fn repository_operator(uri: &str) -> Result<Operator, BoxError> {
     Ok(Operator::new(builder)?
         .layer(MetricsLayer::new())
         .layer(OtelTraceLayer::new()))
+}
+
+fn block_is_too_fresh(
+    meta: &BlockMeta,
+    block_timestamp_ms: u64,
+    delay: Duration,
+    now: SystemTime,
+) -> Result<bool, BoxError> {
+    let too_fresh = match meta.thanos.upload_time.as_deref() {
+        Some(value) => {
+            let upload_time = DateTime::parse_from_rfc3339(value).map_err(|error| {
+                invalid_data(format!("invalid Thanos upload_time {value:?}: {error}"))
+            })?;
+            let upload_seconds = upload_time.timestamp();
+            let upload_nanos = upload_time.timestamp_subsec_nanos();
+            if upload_seconds == -62_135_596_800 && upload_nanos == 0 {
+                consistency_delay_from_ulid(block_timestamp_ms, delay, now)?
+            } else {
+                system_time_unix_nanos(now)?
+                    - (i128::from(upload_seconds) * 1_000_000_000 + i128::from(upload_nanos))
+                    < delay.as_nanos() as i128
+            }
+        }
+        None => consistency_delay_from_ulid(block_timestamp_ms, delay, now)?,
+    };
+
+    Ok(too_fresh
+        && !matches!(
+            meta.thanos.source.as_str(),
+            "bucket.repair" | "compactor" | "compactor.repair"
+        ))
+}
+
+fn consistency_delay_from_ulid(
+    block_timestamp_ms: u64,
+    delay: Duration,
+    now: SystemTime,
+) -> Result<bool, BoxError> {
+    let now_ms = u64::try_from(system_time_unix_nanos(now)? / 1_000_000)
+        .map_err(|_| invalid_data("clock is before the Unix epoch".to_owned()))?;
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    Ok(now_ms.wrapping_sub(block_timestamp_ms) < delay_ms)
+}
+
+fn system_time_unix_nanos(time: SystemTime) -> Result<i128, BoxError> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Ok(duration.as_nanos() as i128),
+        Err(error) => Ok(-(error.duration().as_nanos() as i128)),
+    }
+}
+
+fn ulid_timestamp_ms(block_path: &str) -> Option<u64> {
+    let value = block_path.rsplit('/').next()?;
+    let bytes = value.as_bytes();
+    if bytes.len() != 26 || bytes[0] > b'7' {
+        return None;
+    }
+    let decode = |value| match value {
+        b'0'..=b'9' => value - b'0',
+        b'A'..=b'H' => value - b'A' + 10,
+        b'J'..=b'K' => value - b'J' + 18,
+        b'M'..=b'N' => value - b'M' + 20,
+        b'P'..=b'T' => value - b'P' + 22,
+        b'V'..=b'Z' => value - b'V' + 27,
+        b'a'..=b'h' => value - b'a' + 10,
+        b'j'..=b'k' => value - b'j' + 18,
+        b'm'..=b'n' => value - b'm' + 20,
+        b'p'..=b't' => value - b'p' + 22,
+        b'v'..=b'z' => value - b'v' + 27,
+        _ => 0xff,
+    };
+    let mut timestamp = [0_u8; 8];
+    timestamp[2] = (decode(bytes[0]) << 5) | decode(bytes[1]);
+    timestamp[3] = (decode(bytes[2]) << 3) | (decode(bytes[3]) >> 2);
+    timestamp[4] = (decode(bytes[3]) << 6) | (decode(bytes[4]) << 1) | (decode(bytes[5]) >> 4);
+    timestamp[5] = (decode(bytes[5]) << 4) | (decode(bytes[6]) >> 1);
+    timestamp[6] = (decode(bytes[6]) << 7) | (decode(bytes[7]) << 2) | (decode(bytes[8]) >> 3);
+    timestamp[7] = (decode(bytes[8]) << 5) | decode(bytes[9]);
+    Some(u64::from_be_bytes(timestamp))
 }
 
 async fn block_is_past_deletion_delay(

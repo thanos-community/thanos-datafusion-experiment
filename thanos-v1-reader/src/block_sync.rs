@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     block_index::{block_index_file_path, build_block_index_at, chunk_index_directory_path},
-    config::{DEFAULT_DELETION_MARK_DELAY, ThanosRepositoryConfig},
+    config::{DEFAULT_CONSISTENCY_DELAY, DEFAULT_DELETION_MARK_DELAY, ThanosRepositoryConfig},
     index_context,
     store_service::SharedReaderState,
 };
@@ -41,6 +41,7 @@ pub struct BlockRefresher {
     cache_root: PathBuf,
     refresh_lock: Arc<Mutex<()>>,
     deletion_mark_delay: Duration,
+    consistency_delay: Duration,
     clock: Arc<dyn Clock>,
 }
 
@@ -55,6 +56,7 @@ impl BlockRefresher {
             repositories,
             cache_root,
             DEFAULT_DELETION_MARK_DELAY,
+            DEFAULT_CONSISTENCY_DELAY,
             Arc::new(SystemClock),
         )
     }
@@ -64,12 +66,14 @@ impl BlockRefresher {
         repositories: &[ThanosRepositoryConfig],
         cache_root: impl Into<PathBuf>,
         deletion_mark_delay: Duration,
+        consistency_delay: Duration,
     ) -> Self {
         Self::new_with_clock(
             state,
             repositories,
             cache_root,
             deletion_mark_delay,
+            consistency_delay,
             Arc::new(SystemClock),
         )
     }
@@ -79,6 +83,7 @@ impl BlockRefresher {
         repositories: &[ThanosRepositoryConfig],
         cache_root: impl Into<PathBuf>,
         deletion_mark_delay: Duration,
+        consistency_delay: Duration,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -87,6 +92,7 @@ impl BlockRefresher {
             cache_root: cache_root.into(),
             refresh_lock: Arc::new(Mutex::new(())),
             deletion_mark_delay,
+            consistency_delay,
             clock,
         }
     }
@@ -104,6 +110,7 @@ impl BlockRefresher {
                 &self.repositories,
                 &generation_string,
                 self.deletion_mark_delay,
+                self.consistency_delay,
                 self.clock.now(),
             )
             .await?;

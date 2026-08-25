@@ -11,6 +11,7 @@ use thanos_v1_reader::{
     config::ReaderConfig,
     flight_service::DataFusionFlightService,
     index_context,
+    storage::RepositoryRegistry,
     store_service::ThanosStoreService,
     thanos_proto::thanos::{info::info_server::InfoServer, store_server::StoreServer},
 };
@@ -28,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_path = ReaderConfig::config_path();
     let config = ReaderConfig::load(&config_path)?;
+    let storage = RepositoryRegistry::new(&config)?;
     let address = env::var(LISTEN_ADDR_ENV_VAR).unwrap_or(config.listen_addr);
     let metrics_address =
         env::var(METRICS_LISTEN_ADDR_ENV_VAR).unwrap_or(config.metrics_listen_addr);
@@ -42,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let metric_table_schemas =
-        build_block_index(&config.repositories, &config.index_cache_location).await?;
+        build_block_index(&config.repositories, &config.index_cache_location, &storage).await?;
     let block_index_path = block_index_file_path(&config.index_cache_location);
     let chunk_index_path = chunk_index_directory_path(&config.index_cache_location);
     tracing::info!(
@@ -56,9 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &chunk_index_path,
         &metric_table_schemas,
         &config.repositories,
+        storage.clone(),
     )
     .await?;
-    let store_service = ThanosStoreService::new(context.clone(), &config.repositories).await?;
+    let store_service = ThanosStoreService::new(context.clone(), &config.repositories, storage).await?;
     let service = DataFusionFlightService::new(context, format!("grpc+tcp://{address}"));
     tracing::info!(
         address = %metrics_address,
@@ -123,7 +126,23 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::prelude::SessionContext;
-    use thanos_v1_reader::{block_index::MetricTableSchema, config, register_metric_tables};
+    use thanos_v1_reader::{
+        block_index::MetricTableSchema,
+        config::{self, ReaderConfig, StorageConfig},
+        register_metric_tables,
+        storage::RepositoryRegistry,
+    };
+
+    fn storage(repositories: Vec<config::ThanosRepositoryConfig>) -> RepositoryRegistry {
+        RepositoryRegistry::new(&ReaderConfig {
+            listen_addr: "127.0.0.1:1".to_owned(),
+            metrics_listen_addr: "127.0.0.1:2".to_owned(),
+            index_cache_location: "target/test-index".to_owned(),
+            repositories,
+            storage: StorageConfig::default(),
+        })
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn registers_metric_table_in_metrics_schema() {
@@ -147,6 +166,7 @@ mod tests {
                 label_columns: BTreeSet::from(["job".to_owned(), "pod".to_owned()]),
             }],
             &[],
+            storage(vec![]),
         )
         .await
         .unwrap();
@@ -181,18 +201,25 @@ mod tests {
         let repository = config::ThanosRepositoryConfig {
             name: "fixtures".to_owned(),
             uri: format!("file://{}", fixture_root.display()),
+            s3: None,
+            gcs: None,
         };
-        let schemas = build_block_index(&[repository], cache.to_str().unwrap())
+        let storage = storage(vec![repository]);
+        let repositories = vec![config::ThanosRepositoryConfig {
+            name: "fixtures".to_owned(),
+            uri: format!("file://{}", fixture_root.display()),
+            s3: None,
+            gcs: None,
+        }];
+        let schemas = build_block_index(&repositories, cache.to_str().unwrap(), &storage)
             .await
             .unwrap();
         let context = index_context(
             &block_index_file_path(cache.to_str().unwrap()),
             &chunk_index_directory_path(cache.to_str().unwrap()),
             &schemas,
-            &[config::ThanosRepositoryConfig {
-                name: "fixtures".to_owned(),
-                uri: format!("file://{}", fixture_root.display()),
-            }],
+            &repositories,
+            storage,
         )
         .await
         .unwrap();

@@ -55,6 +55,46 @@ writes:
   table. Each row represents one Prometheus chunk and includes its time range, series labels,
   segment file path, and byte offset.
 
+### Production storage
+
+Repositories support `file://`, `s3://bucket/prefix`, and `gs://bucket/prefix` URIs. S3 uses
+the standard AWS credential chain (environment, profile, web identity, or instance role); GCS
+uses Application Default Credentials and workload/VM metadata. Credentials must not be placed in
+the reader configuration.
+
+```toml
+[[repositories]]
+name = "metrics"
+uri = "s3://metrics-blocks/production"
+
+[repositories.s3]
+region = "eu-west-1"
+# endpoint = "http://minio:9000" # development / S3-compatible endpoint
+# virtual_host_style = false
+
+[storage]
+request_timeout = "30s"
+max_retries = 3
+max_concurrent_requests = 64
+max_concurrent_chunk_reads = 16
+bulk_read_chunk_size = "8MiB"
+bulk_read_concurrency = 4
+
+[storage.chunk_cache]
+directory = "/var/cache/thanos-v1-reader/chunks"
+max_size = "10GiB"
+page_size = "16KiB"
+policy = "slru" # or "lru"
+protected_fraction = 0.8
+```
+
+The optional chunk cache stores aligned, immutable segment-file pages on local disk. It uses
+single-flight page loads so simultaneous identical and overlapping chunk reads share object-store
+GETs. SLRU is the default because it resists scan pollution; the configured maximum includes all
+cached page bytes. The cache directory is exclusively locked by one reader process. If cache I/O
+fails after startup, reads fall back to object storage; a cache directory that cannot be created or
+locked prevents startup.
+
 The writer emits Parquet row-group min/max statistics and page-level column indexes. Each
 generated file has a single row group, so its row-group statistics cover the whole file.
 
@@ -63,6 +103,11 @@ The Prometheus scrape endpoint listens on `metrics_listen_addr` and serves metri
 OpenTelemetry layer. Configure standard `OTEL_EXPORTER_OTLP_*` environment variables to send
 traces to an OTLP collector. Set `METRICS_LISTEN_ADDR` to temporarily override the configured
 metrics endpoint address.
+
+Storage metrics include `thanos_reader_chunk_cache_hits_total`,
+`thanos_reader_chunk_cache_misses_total`, and
+`thanos_reader_chunk_cache_evictions_total`; OpenDAL supplies backend operation metrics and OTEL
+spans.
 
 Logging defaults to `debug`. Override it with `RUST_LOG`:
 
@@ -119,7 +164,10 @@ thanos query \
 
 The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR chunks. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, XOR and aggregate XOR chunks, and startup-time index construction. It does not support native histogram chunks, StoreAPI sharding, opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
+Current limitations: the reader is read-only; it supports XOR and aggregate XOR chunks and
+startup-time index construction. It does not support native histogram chunks, StoreAPI sharding,
+opaque hints, projection hints, or replica-label removal, and it does not refresh the block index
+while running.
 
 ## Flight SQL CLI
 

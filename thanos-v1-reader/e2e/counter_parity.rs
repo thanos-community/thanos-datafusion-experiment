@@ -1,7 +1,8 @@
 use thanos_v1_reader::{
     block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
-    config::ThanosRepositoryConfig,
+    config::{ReaderConfig, StorageConfig, ThanosRepositoryConfig},
     index_context,
+    storage::RepositoryRegistry,
 };
 
 #[tokio::test]
@@ -42,18 +43,27 @@ async fn counter_samples_match_generated_block_values() {
     let repository = ThanosRepositoryConfig {
         name: "e2e".to_owned(),
         uri: format!("file://{}", blocks.display()),
+        s3: None,
+        gcs: None,
     };
-    let schemas = build_block_index(&[repository], cache.to_str().unwrap())
+    let repositories = vec![repository];
+    let storage = RepositoryRegistry::new(&ReaderConfig {
+        listen_addr: "127.0.0.1:1".to_owned(),
+        metrics_listen_addr: "127.0.0.1:2".to_owned(),
+        index_cache_location: cache.display().to_string(),
+        repositories: repositories.clone(),
+        storage: StorageConfig::default(),
+    })
+    .unwrap();
+    let schemas = build_block_index(&repositories, cache.to_str().unwrap(), &storage)
         .await
         .unwrap();
     let context = index_context(
         &block_index_file_path(cache.to_str().unwrap()),
         &chunk_index_directory_path(cache.to_str().unwrap()),
         &schemas,
-        &[ThanosRepositoryConfig {
-            name: "e2e".to_owned(),
-            uri: format!("file://{}", blocks.display()),
-        }],
+        &repositories,
+        storage,
     )
     .await
     .unwrap();

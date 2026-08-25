@@ -4,6 +4,7 @@ pub mod config;
 pub mod flight_service;
 pub mod metric_table;
 pub mod store_service;
+pub mod storage;
 pub mod thanos_proto;
 pub mod tsdb_index;
 
@@ -22,12 +23,14 @@ use datafusion_tracing::{
     instrument_with_info_spans,
 };
 use metric_table::MetricTableProvider;
+use storage::RepositoryRegistry;
 
 pub async fn index_context(
     block_index_path: &str,
     chunk_index_path: &str,
     metric_table_schemas: &[MetricTableSchema],
     repositories: &[ThanosRepositoryConfig],
+    storage: RepositoryRegistry,
 ) -> Result<SessionContext, datafusion::error::DataFusionError> {
     let execution_options = InstrumentationOptions::builder()
         .record_metrics(true)
@@ -50,14 +53,15 @@ pub async fn index_context(
     context
         .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
         .await?;
-    register_metric_tables(&context, metric_table_schemas, repositories).await?;
+    register_metric_tables(&context, metric_table_schemas, repositories, storage).await?;
     Ok(context)
 }
 
 pub async fn register_metric_tables(
     context: &SessionContext,
     metric_table_schemas: &[MetricTableSchema],
-    repositories: &[ThanosRepositoryConfig],
+    _repositories: &[ThanosRepositoryConfig],
+    storage: RepositoryRegistry,
 ) -> Result<(), datafusion::error::DataFusionError> {
     let catalog = context.catalog("datafusion").ok_or_else(|| {
         datafusion::error::DataFusionError::Internal("default catalog is missing".to_owned())
@@ -69,7 +73,7 @@ pub async fn register_metric_tables(
         let table = MetricTableProvider::new(
             metric_table_schema.clone(),
             chunk_provider.clone(),
-            repositories,
+            storage.clone(),
         )?;
         context.register_table(
             TableReference::full("datafusion", "metrics", metric_table_schema.name.as_str()),

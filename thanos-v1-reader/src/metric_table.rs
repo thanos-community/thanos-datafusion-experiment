@@ -22,13 +22,12 @@ use datafusion::{
     },
 };
 use futures::{TryStreamExt, stream};
-use opendal::Operator as OpendalOperator;
 use regex::Regex;
 
 use crate::{
-    block_index::{MetricTableSchema, repository_operator},
+    block_index::MetricTableSchema,
     chunk_reader,
-    config::ThanosRepositoryConfig,
+    storage::RepositoryRegistry,
 };
 
 #[derive(Debug)]
@@ -36,28 +35,20 @@ pub struct MetricTableProvider {
     metric_name: String,
     schema: MetricTableSchema,
     chunk_provider: Arc<dyn TableProvider>,
-    operators: BTreeMap<String, OpendalOperator>,
+    storage: RepositoryRegistry,
 }
 
 impl MetricTableProvider {
     pub fn new(
         schema: MetricTableSchema,
         chunk_provider: Arc<dyn TableProvider>,
-        repositories: &[ThanosRepositoryConfig],
+        storage: RepositoryRegistry,
     ) -> Result<Self> {
-        let operators = repositories
-            .iter()
-            .map(|repository| {
-                repository_operator(&repository.uri)
-                    .map(|operator| (repository.uri.clone(), operator))
-                    .map_err(|error| DataFusionError::Execution(error.to_string()))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self {
             metric_name: schema.name.clone(),
             schema,
             chunk_provider,
-            operators,
+            storage,
         })
     }
 }
@@ -101,7 +92,7 @@ impl TableProvider for MetricTableProvider {
             self.metric_name.clone(),
             filters,
             self.metric_name.ends_with("_total"),
-            self.operators.clone(),
+            self.storage.clone(),
         )))
     }
 
@@ -130,7 +121,7 @@ struct MetricScanExec {
     metric_name: String,
     filters: Vec<MetricFilter>,
     counter_metric: bool,
-    operators: BTreeMap<String, OpendalOperator>,
+    storage: RepositoryRegistry,
     properties: Arc<PlanProperties>,
 }
 
@@ -142,7 +133,7 @@ impl MetricScanExec {
         metric_name: String,
         filters: Vec<MetricFilter>,
         counter_metric: bool,
-        operators: BTreeMap<String, OpendalOperator>,
+        storage: RepositoryRegistry,
     ) -> Self {
         let output_schema = projected_schema(&schema, projection.as_deref());
         let properties = Arc::new(PlanProperties::new(
@@ -158,7 +149,7 @@ impl MetricScanExec {
             metric_name,
             filters,
             counter_metric,
-            operators,
+            storage,
             properties,
         }
     }
@@ -199,7 +190,7 @@ impl ExecutionPlan for MetricScanExec {
             self.metric_name.clone(),
             self.filters.clone(),
             self.counter_metric,
-            self.operators.clone(),
+            self.storage.clone(),
         )))
     }
 
@@ -214,14 +205,14 @@ impl ExecutionPlan for MetricScanExec {
         let projection = self.projection.clone();
         let metric_name = self.metric_name.clone();
         let filters = self.filters.clone();
-        let operators = self.operators.clone();
+        let storage = self.storage.clone();
         let counter_metric = self.counter_metric;
         let batch = async move {
             let descriptors = child.try_collect::<Vec<_>>().await?;
             build_metric_batch(
                 &metric_schema,
                 projection.as_deref(),
-                &operators,
+                &storage,
                 &metric_name,
                 &filters,
                 counter_metric,
@@ -239,7 +230,7 @@ impl ExecutionPlan for MetricScanExec {
 async fn build_metric_batch(
     schema: &SchemaRef,
     projection: Option<&[usize]>,
-    operators: &BTreeMap<String, OpendalOperator>,
+    storage: &RepositoryRegistry,
     metric_name: &str,
     filters: &[MetricFilter],
     counter_metric: bool,
@@ -263,9 +254,9 @@ async fn build_metric_batch(
             let repository_uri = string_value(repository_uri.as_ref(), index)?;
             let chunk_file_path = string_value(chunk_file_path.as_ref(), index)?;
             let labels_json = string_value(labels_json.as_ref(), index)?;
-            let operator = operators.get(&repository_uri).ok_or_else(|| {
+            let repository = storage.get(&repository_uri).ok_or_else(|| {
                 DataFusionError::Execution(format!(
-                    "no OpenDAL operator for repository URI {:?}",
+                    "no storage repository for URI {:?}",
                     repository_uri
                 ))
             })?;
@@ -284,7 +275,7 @@ async fn build_metric_batch(
                 continue;
             }
             let samples = chunk_reader::read_samples(
-                operator,
+                repository.as_ref(),
                 &chunk_file_path,
                 chunk_file_offset.value(index),
                 counter_metric,

@@ -7,17 +7,27 @@ edition = "2024"
 name = "counter_parity"
 path = "e2e/counter_parity.rs"
 
+[[bench]]
+name = "chunk_io"
+harness = false
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }
 async-trait = "0.1.92"
 axum = "0.8.9"
+cache-rs = { version = "0.4.0", features = ["concurrent"] }
 crc = "3.4.0"
+dashmap = "6.2.1"
 datafusion = "54.1.0"
 datafusion-tracing = "54.0.0"
+fs2 = "0.4.3"
 futures = "0.3.34"
+hmac = "0.13.0"
+humantime = "2.4.0"
+metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
-opendal = { version = "0.58.2", features = ["layers-metrics", "layers-otel-trace", "services-fs"] }
+opendal = { version = "0.58.2", features = ["layers-concurrent-limit", "layers-metrics", "layers-otel-trace", "layers-retry", "layers-timeout", "services-fs", "services-gcs", "services-s3"] }
 opentelemetry = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = "0.32.1"
@@ -28,7 +38,8 @@ regex = "1.13.1"
 rusty-chunkenc = "0.1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net"] }
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "sync", "fs", "io-util", "time"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 toml = "1"
 tonic = "0.14.6"
@@ -39,3 +50,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+tempfile = "3.27.0"

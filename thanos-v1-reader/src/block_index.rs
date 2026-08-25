@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::ThanosRepositoryConfig,
+    storage::RepositoryRegistry,
     tsdb_index::{self, Series},
 };
 
@@ -186,14 +187,15 @@ impl MetricTableSchema {
 pub async fn build_block_index(
     repositories: &[ThanosRepositoryConfig],
     index_cache_location: &str,
+    storage: &RepositoryRegistry,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut rows = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
     let mut metric_labels = BTreeMap::new();
 
     for repository in repositories {
-        let operator = repository_operator(&repository.uri)?;
-        let mut lister = operator.lister_with("").recursive(true).await?;
+        let storage_repository = storage.require(&repository.uri)?;
+        let mut lister = storage_repository.operator().lister_with("").recursive(true).await?;
 
         while let Some(entry) = lister.try_next().await? {
             if !entry.path().ends_with("meta.json") {
@@ -205,7 +207,7 @@ pub async fn build_block_index(
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
-            if block_has_deletion_mark(&operator, &block_path).await? {
+            if block_has_deletion_mark(storage_repository.operator(), &block_path).await? {
                 tracing::debug!(
                     repository = %repository.name,
                     block_path = %block_path,
@@ -214,13 +216,13 @@ pub async fn build_block_index(
                 continue;
             }
 
-            let contents = operator.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(contents.to_bytes().as_ref())?;
+            let contents = storage_repository.read(&meta_path).await?;
+            let meta: BlockMeta = serde_json::from_slice(&contents)?;
             active_block_ulids.insert(meta.ulid.clone());
 
             let index_path = format!("{block_path}/index");
-            let index = operator.read(&index_path).await?;
-            let series = tsdb_index::parse(index.to_bytes().as_ref())?;
+            let index = storage_repository.read(&index_path).await?;
+            let series = tsdb_index::parse(&index)?;
             let series_count = series.len();
             collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
             let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
@@ -801,16 +803,6 @@ fn chunk_record_batch(
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
-pub(crate) fn repository_operator(uri: &str) -> Result<Operator, BoxError> {
-    let root = uri
-        .strip_prefix("file://")
-        .ok_or_else(|| invalid_data(format!("unsupported repository URI {uri:?}; use file://")))?;
-    let builder = Fs::default().root(root);
-    Ok(Operator::new(builder)?
-        .layer(MetricsLayer::new())
-        .layer(OtelTraceLayer::new()))
-}
-
 async fn block_has_deletion_mark(operator: &Operator, block_path: &str) -> Result<bool, BoxError> {
     let deletion_mark_path = if block_path.is_empty() {
         DELETION_MARK_FILE_NAME.to_owned()
@@ -970,6 +962,8 @@ mod tests {
         let repository = ThanosRepositoryConfig {
             name: "repository".to_owned(),
             uri: "file:///repository".to_owned(),
+            s3: None,
+            gcs: None,
         };
         let series = vec![Series {
             reference: 16,

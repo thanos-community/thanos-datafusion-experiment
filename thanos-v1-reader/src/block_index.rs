@@ -381,14 +381,6 @@ async fn read_block_meta(
         error
     })?;
     if block_is_older_than(&meta, block_max_age)? {
-        tracing::trace!(
-            repository = %task.repository.name,
-            block_ulid = %meta.ulid,
-            block_path = %task.block_path,
-            max_time = meta.max_time,
-            max_age = ?block_max_age,
-            "skipping Thanos block older than configured maximum age"
-        );
         return Ok(MetaReadResult::SkippedOld);
     }
 

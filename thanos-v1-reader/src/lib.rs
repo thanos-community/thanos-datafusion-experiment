@@ -66,6 +66,9 @@ pub async fn index_context(
     context
         .register_parquet("blocks", block_index_path, ParquetReadOptions::default())
         .await?;
+    if metric_table_schemas.is_empty() {
+        return Ok(context);
+    }
     context
         .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
         .await?;

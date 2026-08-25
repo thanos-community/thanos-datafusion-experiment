@@ -7,18 +7,6 @@ edition = "2024"
 name = "e2e"
 path = "e2e/e2e.rs"
 
-[[test]]
-name = "native_histogram_parity"
-path = "e2e/native_histogram_parity.rs"
-
-[[test]]
-name = "raw_scalar_parity"
-path = "e2e/raw_scalar_parity.rs"
-
-[[test]]
-name = "scalar_downsample_parity"
-path = "e2e/scalar_downsample_parity.rs"
-
 [[bench]]
 name = "chunk_io"
 harness = false

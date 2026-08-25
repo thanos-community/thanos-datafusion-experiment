@@ -233,7 +233,7 @@ fn default_bulk_read_chunk_size() -> String { "8MiB".to_owned() }
 fn default_bulk_read_concurrency() -> usize { 4 }
 fn default_max_concurrent_chunk_reads() -> usize { 16 }
 fn default_chunk_cache_max_size() -> String { "10GiB".to_owned() }
-fn default_chunk_cache_page_size() -> String { "16KiB".to_owned() }
+fn default_chunk_cache_page_size() -> String { "512KiB".to_owned() }
 fn default_chunk_cache_policy() -> CachePolicy { CachePolicy::Slru }
 fn default_protected_fraction() -> f64 { 0.8 }
 
@@ -268,6 +268,7 @@ mod tests {
         assert_eq!(storage.request_timeout_duration().unwrap(), Duration::from_secs(30));
         assert_eq!(storage.bulk_read_chunk_size_bytes().unwrap(), 8 * 1024_u64.pow(2));
         assert_eq!(storage.max_concurrent_chunk_reads, 16);
+        assert_eq!(default_chunk_cache_page_size(), "512KiB");
     }
 
     #[test]

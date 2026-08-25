@@ -133,7 +133,7 @@ bulk_read_concurrency = 4
 [storage.chunk_cache]
 directory = "/var/cache/thanos-v1-reader/chunks"
 max_size = "10GiB"
-page_size = "16KiB"
+page_size = "512KiB"
 policy = "slru" # or "lru"
 protected_fraction = 0.8
 ```

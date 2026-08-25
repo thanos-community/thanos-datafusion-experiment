@@ -1,10 +1,10 @@
 use std::io;
 
 use crc::{CRC_32_ISCSI, Crc};
+use opendal::Operator;
 use rusty_chunkenc::xor::{XORChunk, read_xor_chunk_data};
 
 use crate::histogram::{HistogramSample, decode_float_histogram, decode_histogram};
-use crate::storage::RangeReader;
 
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const ENCODING_XOR: u8 = 1;
@@ -77,44 +77,48 @@ pub enum EncodedAggregateEncoding {
 }
 
 pub async fn read_encoded_chunk(
-    reader: &dyn RangeReader,
+    operator: &Operator,
     path: &str,
     offset: u64,
 ) -> Result<EncodedChunk, io::Error> {
-    let record = read_record(reader, path, offset).await?;
+    let record = read_record(operator, path, offset).await?;
     decode_encoded_record(&record)
 }
 
 pub async fn read_samples(
-    reader: &dyn RangeReader,
+    operator: &Operator,
     path: &str,
     offset: u64,
     counter_metric: bool,
     aggregate: Option<AggregateSelection>,
 ) -> Result<Vec<Sample>, io::Error> {
-    let record = read_record(reader, path, offset).await?;
+    let record = read_record(operator, path, offset).await?;
     decode_query_record(&record, counter_metric, aggregate)
 }
 
-async fn read_record(reader: &dyn RangeReader, path: &str, offset: u64) -> Result<Vec<u8>, io::Error> {
-    let prefix = reader
-        .read_range(path, offset..offset + (MAX_UVARINT_SIZE as u64) + 1)
-        .await?;
-    let (payload_len, length_size) = read_uvarint(&prefix)?;
+async fn read_record(operator: &Operator, path: &str, offset: u64) -> Result<Vec<u8>, io::Error> {
+    let prefix = operator
+        .read_with(path)
+        .range(offset..offset + (MAX_UVARINT_SIZE as u64) + 1)
+        .await
+        .map_err(io_error)?;
+    let (payload_len, length_size) = read_uvarint(prefix.to_bytes().as_ref())?;
     let record_len = length_size
         .checked_add(1)
         .and_then(|size| size.checked_add(payload_len))
         .and_then(|size| size.checked_add(CRC_SIZE))
         .ok_or_else(|| invalid_data("chunk record length overflows usize"))?;
-    reader
-        .read_range(
-            path,
+    let record = operator
+        .read_with(path)
+        .range(
             offset
                 ..offset
                     + u64::try_from(record_len)
                         .map_err(|_| invalid_data("chunk record length overflows u64"))?,
         )
         .await
+        .map_err(io_error)?;
+    Ok(record.to_bytes().to_vec())
 }
 
 pub fn decode_record(record: &[u8], counter_metric: bool) -> Result<Vec<Sample>, io::Error> {
@@ -334,6 +338,9 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn io_error(error: opendal::Error) -> io::Error {
+    io::Error::other(error)
+}
 
 #[cfg(test)]
 mod tests {

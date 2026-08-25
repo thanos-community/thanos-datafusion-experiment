@@ -413,7 +413,7 @@ async fn build_chunk_index(
         block_path = %task.block_path,
         "starting Thanos block index build"
     );
-    let result = async {
+    let result: Result<BuiltBlockIndex, BoxError> = async {
         let index = task.storage_repository.read(&index_path).await?;
         tracing::debug!(
             repository = %task.repository.name,

@@ -171,7 +171,9 @@ impl MetricTableSchema {
                 false,
             ),
             Field::new("value", DataType::Float64, true),
+            Field::new("histogram", histogram_data_type(), true),
             Field::new("downsample_resolution", DataType::Int64, false),
+            Field::new("aggregate_kind", DataType::Utf8, false),
         ];
         fields.extend(
             self.label_columns
@@ -180,6 +182,65 @@ impl MetricTableSchema {
         );
         Arc::new(Schema::new(fields))
     }
+}
+
+pub fn histogram_data_type() -> DataType {
+    let span = DataType::Struct(
+        vec![
+            Field::new("offset", DataType::Int32, false),
+            Field::new("length", DataType::UInt32, false),
+        ]
+        .into(),
+    );
+    DataType::Struct(
+        vec![
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("schema", DataType::Int32, false),
+            Field::new("count_int", DataType::UInt64, true),
+            Field::new("count_float", DataType::Float64, true),
+            Field::new("sum", DataType::Float64, false),
+            Field::new("zero_threshold", DataType::Float64, false),
+            Field::new("zero_count_int", DataType::UInt64, true),
+            Field::new("zero_count_float", DataType::Float64, true),
+            Field::new("reset_hint", DataType::UInt8, false),
+            Field::new(
+                "positive_spans",
+                DataType::List(Arc::new(Field::new("item", span.clone(), true))),
+                false,
+            ),
+            Field::new(
+                "negative_spans",
+                DataType::List(Arc::new(Field::new("item", span, true))),
+                false,
+            ),
+            Field::new(
+                "positive_buckets_int",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+            Field::new(
+                "negative_buckets_int",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+            Field::new(
+                "positive_buckets_float",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            ),
+            Field::new(
+                "negative_buckets_float",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            ),
+            Field::new(
+                "custom_values",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                false,
+            ),
+        ]
+        .into(),
+    )
 }
 
 /// Rebuild the block index from all configured repositories and write it through OpenDAL.

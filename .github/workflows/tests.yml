@@ -84,3 +84,4 @@ jobs:
       - run: cargo test --test raw_scalar_parity
       - run: cargo test --test scalar_downsample_parity
       - run: cargo test --test native_histogram_downsample_parity
+      - run: cargo test --test native_histogram_query_parity

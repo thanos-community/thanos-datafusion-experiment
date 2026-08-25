@@ -23,6 +23,10 @@ path = "e2e/scalar_downsample_parity.rs"
 name = "native_histogram_downsample_parity"
 path = "e2e/native_histogram_downsample_parity.rs"
 
+[[test]]
+name = "native_histogram_query_parity"
+path = "e2e/native_histogram_query_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }

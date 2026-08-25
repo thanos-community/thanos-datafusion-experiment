@@ -69,6 +69,7 @@ type oracleHistogramSample struct {
 	NegativeSpans      []oracleSpan `json:"negative_spans"`
 	NegativeBuckets    []int64      `json:"negative_buckets,omitempty"`
 	NegativeBucketBits []uint64     `json:"negative_bucket_bits,omitempty"`
+	CustomValueBits    []uint64     `json:"custom_value_bits,omitempty"`
 }
 
 type oracleSpan struct {
@@ -335,6 +336,7 @@ func integerHistogramSample(timestamp int64, value *histogram.Histogram) oracleH
 		PositiveBuckets:   value.PositiveBuckets,
 		NegativeSpans:     convertSpans(value.NegativeSpans),
 		NegativeBuckets:   value.NegativeBuckets,
+		CustomValueBits:   floatBits(value.CustomValues),
 	}
 }
 
@@ -352,6 +354,7 @@ func floatHistogramSample(timestamp int64, value *histogram.FloatHistogram) orac
 		PositiveBucketBits: floatBits(value.PositiveBuckets),
 		NegativeSpans:      convertSpans(value.NegativeSpans),
 		NegativeBucketBits: floatBits(value.NegativeBuckets),
+		CustomValueBits:    floatBits(value.CustomValues),
 	}
 }
 

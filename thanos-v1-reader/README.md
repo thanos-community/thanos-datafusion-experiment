@@ -108,6 +108,25 @@ WHERE labels['__name__'] = 'up'
   AND chunk_mint <= 1787569890000
 ```
 
+Prometheus metric tables expose one row per sample. Scalar samples populate the nullable
+`value DOUBLE` column. Native histogram samples leave `value` null and populate the nullable
+`histogram STRUCT` column with typed fields for the histogram kind, schema, integer or float
+count and zero count, sum, zero threshold, reset hint, spans, integer or float buckets, and
+custom values. `aggregate_kind` identifies `raw`, `count`, `sum`, or `counter`; COUNT rows
+are scalar XOR samples in `value`. Downsampled native histograms use `counter` by default;
+filter `aggregate_kind = 'sum'` to read the SUM stream:
+
+```sql
+SELECT timestamp, histogram, downsample_resolution, aggregate_kind
+FROM metrics.dummy_native_histogram
+WHERE downsample_resolution = 300000
+  AND aggregate_kind = 'sum'
+```
+
+Raw custom-bucket histogram layouts are decoded into the same typed struct. Current Thanos
+does not downsample custom-bucket native histograms, so the reader does not fabricate
+downsampled custom-bucket streams.
+
 ## Thanos Query
 
 Configure the reader as a Thanos Query store endpoint using its gRPC address:
@@ -119,7 +138,7 @@ thanos query \
 
 The StoreAPI applies time and `=`, `!=`, `=~`, and `!~` label matchers to labels from both the TSDB series and each block's external labels. It streams labels in sorted order and returns validated encoded XOR, histogram, and float-histogram chunks with Go-compatible chunk hashes. It supports raw chunks and downsample aggregate chunk slots (`count`, `sum`, `min`, `max`, and `counter`), StoreAPI result limits, `skip_chunks`, and response batching.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, aggregate XOR chunks, and startup-time index construction. It does not support native histogram aggregate slots, StoreAPI sharding, opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
+Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, native histogram SUM/COUNTER aggregate slots, and startup-time index construction. It does not support StoreAPI sharding, opaque hints, projection hints, or replica-label removal, and it does not refresh the block index while running.
 
 ## Flight SQL CLI
 

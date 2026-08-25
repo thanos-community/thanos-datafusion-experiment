@@ -63,8 +63,8 @@ func TestThanosV1ReaderStoreAPIConformance(t *testing.T) {
 		if response.Store.MinTime != conformanceMinTime || response.Store.MaxTime != conformanceMaxTime {
 			t.Fatalf("store range = [%d, %d], want [%d, %d]", response.Store.MinTime, response.Store.MaxTime, conformanceMinTime, conformanceMaxTime)
 		}
-		if response.Store.SupportsSharding || response.Store.SupportsWithoutReplicaLabels {
-			t.Fatal("reader advertised an unsupported StoreAPI capability")
+		if !response.Store.SupportsSharding || response.Store.SupportsWithoutReplicaLabels {
+			t.Fatal("reader StoreAPI capability advertisement is incorrect")
 		}
 		if got := labelSets(response.LabelSets); !equalStrings(got, []string{"region=eu-west"}) {
 			t.Fatalf("label sets = %v, want [region=eu-west]", got)
@@ -157,16 +157,15 @@ func TestThanosV1ReaderStoreAPIConformance(t *testing.T) {
 		if code := status.Code(err); code.String() != "InvalidArgument" {
 			t.Fatalf("empty label status = %v, want InvalidArgument", code)
 		}
-		stream, err := store.Series(ctx, &storepb.SeriesRequest{
-			MinTime:   conformanceMinTime,
-			MaxTime:   conformanceMaxTime,
-			ShardInfo: &storepb.ShardInfo{ShardIndex: 0, TotalShards: 1},
+		series := querySeries(t, ctx, store, &storepb.SeriesRequest{
+			MinTime:    conformanceMinTime,
+			MaxTime:    conformanceMaxTime,
+			Matchers:   []storepb.LabelMatcher{matcher(storepb.LabelMatcher_RE, "n", ".*")},
+			SkipChunks: true,
+			ShardInfo:  &storepb.ShardInfo{ShardIndex: 0, TotalShards: 1},
 		})
-		if err == nil {
-			_, err = stream.Recv()
-		}
-		if code := status.Code(err); code.String() != "Unimplemented" {
-			t.Fatalf("sharding status = %v, want Unimplemented", code)
+		if len(series) != 5 {
+			t.Fatalf("single shard series = %d, want 5", len(series))
 		}
 	})
 }

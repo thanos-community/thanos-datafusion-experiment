@@ -187,7 +187,7 @@ impl ThanosStoreService {
             store: Some(info::StoreInfo {
                 min_time,
                 max_time,
-                supports_sharding: false,
+                supports_sharding: true,
                 supports_without_replica_labels: false,
                 tsdb_infos,
             }),
@@ -235,7 +235,10 @@ impl Store for ThanosStoreService {
 
         let mut series_responses = Vec::new();
         let mut warning_responses = Vec::new();
-        for (_, mut descriptors) in groups {
+        for (label_key, mut descriptors) in groups {
+            if !matches_shard(&label_key, request.shard_info.as_ref()) {
+                continue;
+            }
             if series_responses.len() >= limit {
                 break;
             }
@@ -461,15 +464,31 @@ fn aggregate_chunk(
 }
 
 fn reject_unsupported_series_options(request: &thanos::SeriesRequest) -> Result<(), Status> {
-    if request.hints.is_some()
-        || request.shard_info.is_some()
-        || !request.without_replica_labels.is_empty()
-    {
+    if request.hints.is_some() || !request.without_replica_labels.is_empty() {
         return Err(Status::unimplemented(
-            "opaque hints, sharding, and replica-label removal are not supported",
+            "opaque hints and replica-label removal are not supported",
         ));
     }
     Ok(())
+}
+
+fn matches_shard(labels: &[(String, String)], shard_info: Option<&thanos::ShardInfo>) -> bool {
+    let Some(shard_info) = shard_info.filter(|shard| shard.total_shards >= 1) else {
+        return true;
+    };
+    let sharding_labels = shard_info.labels.iter().collect::<BTreeSet<_>>();
+    let mut bytes = Vec::new();
+    for (name, value) in labels {
+        let listed = sharding_labels.contains(name);
+        if (shard_info.by && listed) || (!shard_info.by && !listed) {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0xff);
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0xff);
+        }
+    }
+    xxhash_rust::xxh64::xxh64(&bytes, 0) % shard_info.total_shards as u64
+        == shard_info.shard_index as u64
 }
 
 fn reject_unsupported_label_options(
@@ -868,6 +887,61 @@ mod tests {
     }
 
     #[test]
+    fn shard_matching_uses_go_label_hashing_semantics() {
+        let labels = labels_key(&BTreeMap::from([
+            ("pod".to_owned(), "nginx".to_owned()),
+            ("node".to_owned(), "node-1".to_owned()),
+            ("container".to_owned(), "nginx".to_owned()),
+        ]));
+        assert!(matches_shard(&labels, None));
+        assert!(matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 0,
+                total_shards: 0,
+                by: true,
+                labels: vec![],
+            })
+        ));
+        assert!(!matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 0,
+                total_shards: 2,
+                by: true,
+                labels: vec!["pod".to_owned(), "node".to_owned()],
+            })
+        ));
+        assert!(matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 1,
+                total_shards: 2,
+                by: true,
+                labels: vec!["node".to_owned(), "pod".to_owned()],
+            })
+        ));
+        assert!(matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 0,
+                total_shards: 2,
+                by: false,
+                labels: vec!["node".to_owned()],
+            })
+        ));
+        assert!(!matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 2,
+                total_shards: 2,
+                by: false,
+                labels: vec![],
+            })
+        ));
+    }
+
+    #[test]
     fn block_selection_matches_bucket_store_resolution_and_overlap_order() {
         let blocks = [
             block("raw-0", 0, 100, 0),
@@ -955,7 +1029,9 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(info.component_type, "store");
-        assert_eq!(info.store.unwrap().min_time, 100);
+        let store_info = info.store.unwrap();
+        assert_eq!(store_info.min_time, 100);
+        assert!(store_info.supports_sharding);
 
         let mut store_client = StoreClient::connect(endpoint).await.unwrap();
         let mut stream = store_client

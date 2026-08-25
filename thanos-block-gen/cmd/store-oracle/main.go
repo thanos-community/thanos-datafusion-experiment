@@ -115,12 +115,24 @@ func run() error {
 	var maxResolution int64
 	var minTime int64
 	var maxTime int64
+	var shardEnabled bool
+	var shardIndex int64
+	var shardTotal int64
+	var shardBy bool
+	var shardLabels string
+	var wireFormat bool
 	flag.StringVar(&bucketDir, "bucket", "", "filesystem bucket containing Thanos blocks")
 	flag.StringVar(&metric, "metric", "", "metric name to query")
 	flag.StringVar(&aggregateNames, "aggregates", "raw", "comma-separated StoreAPI aggregates")
 	flag.Int64Var(&maxResolution, "max-resolution", 0, "maximum StoreAPI resolution window in milliseconds")
 	flag.Int64Var(&minTime, "min-time", math.MinInt64, "minimum StoreAPI query timestamp")
 	flag.Int64Var(&maxTime, "max-time", math.MaxInt64, "maximum StoreAPI query timestamp")
+	flag.BoolVar(&shardEnabled, "shard-enabled", false, "include ShardInfo in the StoreAPI request")
+	flag.Int64Var(&shardIndex, "shard-index", 0, "ShardInfo shard index")
+	flag.Int64Var(&shardTotal, "shard-total", 1, "ShardInfo total shard count")
+	flag.BoolVar(&shardBy, "shard-by", false, "ShardInfo grouping-by mode")
+	flag.StringVar(&shardLabels, "shard-labels", "", "comma-separated ShardInfo labels")
+	flag.BoolVar(&wireFormat, "wire-format", false, "emit hex-encoded Series protobufs")
 	flag.Parse()
 	if bucketDir == "" || metric == "" {
 		return fmt.Errorf("--bucket and --metric are required")
@@ -179,6 +191,15 @@ func run() error {
 		return err
 	}
 	server := &seriesServer{ctx: context.Background()}
+	var shardInfo *storepb.ShardInfo
+	if shardEnabled {
+		shardInfo = &storepb.ShardInfo{
+			ShardIndex:  shardIndex,
+			TotalShards: shardTotal,
+			By:          shardBy,
+			Labels:      splitNonEmpty(shardLabels),
+		}
+	}
 	if err := bucketStore.Series(&storepb.SeriesRequest{
 		MinTime:                 minTime,
 		MaxTime:                 maxTime,
@@ -186,11 +207,23 @@ func run() error {
 		Aggregates:              aggregates,
 		MaxResolutionWindow:     maxResolution,
 		PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
+		ShardInfo:               shardInfo,
 	}, server); err != nil {
 		return fmt.Errorf("query bucket store: %w", err)
 	}
 	if len(server.warnings) != 0 {
 		return fmt.Errorf("bucket store returned warnings: %v", server.warnings)
+	}
+	if wireFormat {
+		encoded := make([]string, 0, len(server.series))
+		for _, series := range server.series {
+			data, err := series.Marshal()
+			if err != nil {
+				return fmt.Errorf("marshal StoreAPI series: %w", err)
+			}
+			encoded = append(encoded, fmt.Sprintf("%x", data))
+		}
+		return json.NewEncoder(os.Stdout).Encode(encoded)
 	}
 
 	result := make([]oracleSeries, 0, len(server.series))
@@ -262,6 +295,20 @@ func parseAggregates(names string) ([]storepb.Aggr, error) {
 		values = append(values, aggregate)
 	}
 	return values, nil
+}
+
+func splitNonEmpty(value string) []string {
+	if value == "" {
+		return nil
+	}
+	values := strings.Split(value, ",")
+	result := values[:0]
+	for _, item := range values {
+		if item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func convertChunk(chunk *storepb.Chunk) (oracleEncodedChunk, error) {

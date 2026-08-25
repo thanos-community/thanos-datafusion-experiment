@@ -238,7 +238,7 @@ pub async fn build_block_index(
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
             if block_has_deletion_mark(storage_repository.operator(), &block_path).await? {
-                tracing::debug!(
+                tracing::trace!(
                     repository = %repository.name,
                     block_path = %block_path,
                     "skipping deleted Thanos block"
@@ -260,7 +260,7 @@ pub async fn build_block_index(
             })?;
             if block_is_older_than(&meta, block_max_age)? {
                 skipped_old_blocks += 1;
-                tracing::debug!(
+                tracing::trace!(
                     repository = %repository.name,
                     block_ulid = %meta.ulid,
                     block_path = %block_path,

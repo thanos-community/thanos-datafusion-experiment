@@ -217,6 +217,7 @@ pub async fn build_block_index(
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut tasks = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
+    let mut skipped_old_blocks = 0usize;
 
     for repository in repositories {
         let storage_repository = storage.require(&repository.uri)?;
@@ -258,7 +259,8 @@ pub async fn build_block_index(
                 error
             })?;
             if block_is_older_than(&meta, block_max_age)? {
-                tracing::info!(
+                skipped_old_blocks += 1;
+                tracing::debug!(
                     repository = %repository.name,
                     block_ulid = %meta.ulid,
                     block_path = %block_path,
@@ -278,6 +280,14 @@ pub async fn build_block_index(
                 meta_path,
             });
         }
+    }
+
+    if skipped_old_blocks > 0 {
+        tracing::info!(
+            skipped_old_blocks,
+            max_age = ?block_max_age,
+            "skipped Thanos blocks older than configured maximum age"
+        );
     }
 
     tracing::info!(

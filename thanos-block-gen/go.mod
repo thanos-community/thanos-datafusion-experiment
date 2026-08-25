@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/go-kit/log v0.2.1
+	github.com/oklog/ulid/v2 v2.1.1
 	github.com/prometheus/prometheus v0.309.1
 	github.com/thanos-io/objstore v0.0.0-20250804093838-71d60dfee488
 	github.com/thanos-io/thanos v0.42.4
@@ -142,7 +143,6 @@ require (
 	github.com/ncw/swift v1.0.53 // indirect
 	github.com/oklog/run v1.2.0 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
-	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/internal/exp/metrics v0.142.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatautil v0.142.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/deltatocumulativeprocessor v0.142.0 // indirect

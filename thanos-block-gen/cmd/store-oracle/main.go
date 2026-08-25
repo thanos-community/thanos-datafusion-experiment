@@ -14,11 +14,13 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/types"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/thanos/pkg/block"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
@@ -82,6 +84,43 @@ type oracleSpan struct {
 }
 
 type stringFlags []string
+
+type controlledConsistencyDelayFilter struct {
+	reference time.Time
+	filter    *block.ConsistencyDelayMetaFilter
+}
+
+func (f controlledConsistencyDelayFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced block.GaugeVec, modified block.GaugeVec) error {
+	shift := time.Since(f.reference)
+	shiftedIDs := make(map[ulid.ULID]ulid.ULID)
+	for id, meta := range metas {
+		if !meta.Thanos.UploadTime.IsZero() {
+			meta.Thanos.UploadTime = meta.Thanos.UploadTime.Add(shift)
+			continue
+		}
+		shiftedTime := int64(id.Time()) + shift.Milliseconds()
+		if shiftedTime < 0 {
+			return fmt.Errorf("shift controlled ULID %s before Unix epoch", id)
+		}
+		shifted := id
+		if err := shifted.SetTime(uint64(shiftedTime)); err != nil {
+			return fmt.Errorf("shift controlled ULID %s: %w", id, err)
+		}
+		delete(metas, id)
+		metas[shifted] = meta
+		shiftedIDs[shifted] = id
+	}
+	if err := f.filter.Filter(ctx, metas, synced, modified); err != nil {
+		return err
+	}
+	for shifted, original := range shiftedIDs {
+		if meta, ok := metas[shifted]; ok {
+			delete(metas, shifted)
+			metas[original] = meta
+		}
+	}
+	return nil
+}
 
 func (f *stringFlags) String() string {
 	return strings.Join(*f, ",")
@@ -150,6 +189,8 @@ func run() error {
 	var label string
 	var seriesMatchers stringFlags
 	var deletionMarkDelay time.Duration
+	var consistencyDelay time.Duration
+	var consistencyReference string
 	flag.StringVar(&bucketDir, "bucket", "", "filesystem bucket containing Thanos blocks")
 	flag.StringVar(&metric, "metric", "", "metric name to query")
 	flag.StringVar(&aggregateNames, "aggregates", "raw", "comma-separated StoreAPI aggregates")
@@ -174,9 +215,14 @@ func run() error {
 	flag.StringVar(&label, "label", "", "label name for the label-values endpoint")
 	flag.Var(&seriesMatchers, "series-matcher", "series matcher in TYPE:name:value form; repeatable")
 	flag.DurationVar(&deletionMarkDelay, "deletion-mark-delay", 24*time.Hour, "grace delay before filtering deletion-marked blocks")
+	flag.DurationVar(&consistencyDelay, "consistency-delay", 0, "minimum age of non-compacted blocks")
+	flag.StringVar(&consistencyReference, "consistency-reference-time", "", "RFC3339 reference time used by deterministic parity tests")
 	flag.Parse()
 	if bucketDir == "" || (endpoint == "series" && metric == "") {
 		return fmt.Errorf("--bucket is required; --metric is required for Series")
+	}
+	if consistencyDelay < 0 {
+		return fmt.Errorf("--consistency-delay must not be negative")
 	}
 
 	cacheDir, err := os.MkdirTemp("", "thanos-store-oracle-")
@@ -193,6 +239,24 @@ func run() error {
 
 	logger := log.NewNopLogger()
 	instrumentedBucket := objstore.WithNoopInstr(bucket)
+	consistencyFilter := block.NewConsistencyDelayMetaFilterWithoutMetrics(logger, consistencyDelay)
+	var metadataFilters []block.MetadataFilter
+	if consistencyReference == "" {
+		metadataFilters = append(metadataFilters, consistencyFilter)
+	} else {
+		reference, err := time.Parse(time.RFC3339Nano, consistencyReference)
+		if err != nil {
+			return fmt.Errorf("parse --consistency-reference-time: %w", err)
+		}
+		metadataFilters = append(metadataFilters, controlledConsistencyDelayFilter{
+			reference: reference,
+			filter:    consistencyFilter,
+		})
+	}
+	metadataFilters = append(metadataFilters,
+		block.NewIgnoreDeletionMarkFilter(logger, instrumentedBucket, deletionMarkDelay, 4),
+		block.NewDeduplicateFilter(4),
+	)
 	fetcher, err := block.NewMetaFetcher(
 		logger,
 		4,
@@ -200,10 +264,7 @@ func run() error {
 		block.NewConcurrentLister(logger, instrumentedBucket),
 		cacheDir,
 		nil,
-		[]block.MetadataFilter{
-			block.NewIgnoreDeletionMarkFilter(logger, instrumentedBucket, deletionMarkDelay, 4),
-			block.NewDeduplicateFilter(4),
-		},
+		metadataFilters,
 	)
 	if err != nil {
 		return fmt.Errorf("create metadata fetcher: %w", err)

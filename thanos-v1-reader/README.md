@@ -42,6 +42,7 @@ metrics_listen_addr = "127.0.0.1:9090"
 index_cache_location = "target"
 block_sync_interval = "15m"
 deletion_mark_delay = "24h"
+consistency_delay = "0s"
 
 [[repositories]]
 name = "local-fixtures"
@@ -162,8 +163,11 @@ and validate a complete cache generation before one atomic publication shared by
 Flight SQL requests; a failed refresh leaves the previous healthy snapshot active.
 Blocks remain queryable until their `deletion-mark.json` age is strictly greater than
 `deletion_mark_delay` (default `24h`), matching the Store Gateway replacement grace period.
+Fresh sidecar, receive, and ruler blocks remain hidden until their `thanos.upload_time` (or block
+ULID timestamp when upload time is absent) reaches `consistency_delay` (default `0s`), matching
+the Store Gateway object-store consistency policy. Compactor and repair blocks bypass this delay.
 
-Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, and native histogram SUM/COUNTER aggregate slots. It does not support projection hints. Block refresh currently treats any incomplete/corrupt candidate as a failed atomic generation; object-store consistency-delay policy is not implemented.
+Current limitations: the reader is read-only; it supports `file://` repositories, raw XOR/native histogram chunks, scalar aggregate XOR chunks, and native histogram SUM/COUNTER aggregate slots. It does not support projection hints. Malformed block metadata is skipped as a partial block; read, index, or filter failures leave the previous atomic generation active.
 
 ## Flight SQL CLI
 

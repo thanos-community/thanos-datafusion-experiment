@@ -59,11 +59,16 @@ path = "e2e/dynamic_block_refresh_parity.rs"
 name = "deletion_mark_parity"
 path = "e2e/deletion_mark_parity.rs"
 
+[[test]]
+name = "consistency_delay_parity"
+path = "e2e/consistency_delay_parity.rs"
+
 [dependencies]
 arrow = "58.4.0"
 arrow-flight = { version = "58.4.0", features = ["flight-sql"] }
 async-trait = "0.1.92"
 axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 crc = "3.4.0"
 datafusion = "54.1.0"
 datafusion-tracing = "54.0.0"

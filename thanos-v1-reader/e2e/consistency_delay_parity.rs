@@ -9,6 +9,7 @@ use std::{
 };
 
 use arrow::array::{Array, StringArray, StringViewArray};
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
 use prost::Message;
 use thanos_v1_reader::{
@@ -29,7 +30,9 @@ use thanos_v1_reader::{
 
 const START: i64 = 1_700_000_000_000;
 const HOUR_MS: i64 = 60 * 60 * 1000;
+const BASE_SECONDS: u64 = 1_735_689_600;
 const DELAY_SECONDS: u64 = 2 * 60 * 60;
+const DELETION_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug)]
 struct TestClock {
@@ -55,15 +58,17 @@ impl Clock for TestClock {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn deletion_mark_grace_and_refresh_match_go() {
+async fn consistency_delay_refresh_matches_go() {
     let root = std::env::temp_dir().join(format!(
-        "thanos-v1-reader-deletion-e2e-{}",
+        "thanos-v1-reader-consistency-e2e-{}",
         std::process::id()
     ));
     let blocks = root.join("blocks");
     let cache = root.join("cache");
     let generator = Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
+
     let target = generate(&generator, &blocks, START, START + HOUR_MS, "0", true);
+    set_meta_fields(&blocks, &target, Some(BASE_SECONDS as i64), Some("sidecar"));
     let survivor = generate(
         &generator,
         &blocks,
@@ -72,20 +77,23 @@ async fn deletion_mark_grace_and_refresh_match_go() {
         "1",
         false,
     );
+    set_meta_fields(
+        &blocks,
+        &survivor,
+        Some((BASE_SECONDS - DELAY_SECONDS) as i64),
+        Some("sidecar"),
+    );
+
     let repository = ThanosRepositoryConfig {
-        name: "deletion".to_owned(),
+        name: "consistency".to_owned(),
         uri: format!("file://{}", blocks.display()),
     };
-    let base_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let clock = Arc::new(TestClock::new(base_seconds));
+    let clock = Arc::new(TestClock::new(BASE_SECONDS));
     let service = initial_service(
         &repository,
         &cache,
         Duration::from_secs(DELAY_SECONDS),
-        SystemTime::now(),
+        clock.now(),
     )
     .await;
     let state = service.shared_state();
@@ -93,94 +101,35 @@ async fn deletion_mark_grace_and_refresh_match_go() {
         state.clone(),
         std::slice::from_ref(&repository),
         &cache,
+        DELETION_DELAY,
         Duration::from_secs(DELAY_SECONDS),
-        Duration::ZERO,
         clock.clone(),
     );
 
-    assert_go_view(&generator, &blocks, &service, &state, "2h").await;
+    let ids = sql_block_ids(&state).await;
+    assert!(!ids.contains(&target));
+    assert!(ids.contains(&survivor));
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
 
-    write_mark(&blocks, &target, &target, 1, base_seconds as i64);
-    clock.set(base_seconds + DELAY_SECONDS - 1);
-    refresher.refresh().await.unwrap();
-    assert!(sql_block_ids(&state).await.contains(&target));
-    assert_go_view(&generator, &blocks, &service, &state, "2h").await;
-
-    // Go uses a strict greater-than comparison, so the exact boundary remains visible.
-    clock.set(base_seconds + DELAY_SECONDS);
-    refresher.refresh().await.unwrap();
-    assert!(sql_block_ids(&state).await.contains(&target));
-    assert_go_view(&generator, &blocks, &service, &state, "2h").await;
-
-    clock.set(base_seconds + DELAY_SECONDS + 1);
+    clock.set(BASE_SECONDS + DELAY_SECONDS - 1);
     refresher.refresh().await.unwrap();
     assert!(!sql_block_ids(&state).await.contains(&target));
-    assert!(sql_block_ids(&state).await.contains(&survivor));
-    assert_go_view(&generator, &blocks, &service, &state, "0s").await;
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
 
-    // Removing the marker makes the block eligible again on the next complete refresh.
-    std::fs::remove_file(mark_path(&blocks, &target)).unwrap();
+    // The Go filter hides age < delay, so exact equality is mature.
+    clock.set(BASE_SECONDS + DELAY_SECONDS);
     refresher.refresh().await.unwrap();
     assert!(sql_block_ids(&state).await.contains(&target));
-    assert_go_view(&generator, &blocks, &service, &state, "2h").await;
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
 
-    // Future timestamps have negative age and remain visible even with a zero delay.
-    write_mark(
-        &blocks,
-        &target,
-        &target,
-        1,
-        (base_seconds + 10 * 60 * 60) as i64,
-    );
+    clock.set(BASE_SECONDS + DELAY_SECONDS + 1);
     refresher.refresh().await.unwrap();
     assert!(sql_block_ids(&state).await.contains(&target));
-    assert_go_view(&generator, &blocks, &service, &state, "0s").await;
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
 
-    // Invalid marker ULIDs are unmarshal errors even though the marker ID is not matched to its path.
-    write_mark(&blocks, &target, "not-a-ulid", 1, 0);
-    refresher.refresh().await.unwrap();
-    assert!(sql_block_ids(&state).await.contains(&target));
-    assert_go_view(&generator, &blocks, &service, &state, "0s").await;
-
-    // Partial JSON is warned about and ignored by the current Go filter.
-    std::fs::write(mark_path(&blocks, &target), b"{not-json").unwrap();
-    refresher.refresh().await.unwrap();
-    assert!(sql_block_ids(&state).await.contains(&target));
-    assert_go_view(&generator, &blocks, &service, &state, "0s").await;
-
-    // Go defaults a missing deletion_time to Unix zero, and re-reads valid updates each refresh.
-    std::fs::write(
-        mark_path(&blocks, &target),
-        serde_json::to_vec(&serde_json::json!({"id": target, "version": 1})).unwrap(),
-    )
-    .unwrap();
-    refresher.refresh().await.unwrap();
-    assert!(!sql_block_ids(&state).await.contains(&target));
-    assert_go_view(&generator, &blocks, &service, &state, "0s").await;
-
-    std::fs::remove_file(mark_path(&blocks, &target)).unwrap();
-    refresher.refresh().await.unwrap();
-    let healthy = canonical_info(reader_info(&service).await);
-
-    // Unsupported versions fail the staged refresh and retain the healthy published snapshot.
-    write_mark(&blocks, &target, &target, 2, 0);
-    assert!(refresher.refresh().await.is_err());
-    assert_eq!(canonical_info(reader_info(&service).await), healthy);
-    assert!(!go_succeeds(&generator, &blocks, "0s"));
-    std::fs::remove_file(mark_path(&blocks, &target)).unwrap();
-    refresher.refresh().await.unwrap();
-
-    // A non-NotFound marker read failure also aborts publication in both stacks.
-    let healthy = canonical_info(reader_info(&service).await);
-    std::fs::create_dir(mark_path(&blocks, &target)).unwrap();
-    assert!(refresher.refresh().await.is_err());
-    assert_eq!(canonical_info(reader_info(&service).await), healthy);
-    assert!(!go_succeeds(&generator, &blocks, "0s"));
-    std::fs::remove_dir(mark_path(&blocks, &target)).unwrap();
-    refresher.refresh().await.unwrap();
-
-    // Deletion filtering runs before compaction-source deduplication.
-    let source = generate(
+    // Without upload_time, the filter uses the directory ULID timestamp. Go's unsigned
+    // subtraction makes a future ULID visible rather than too fresh.
+    let future_original = generate(
         &generator,
         &blocks,
         START + 2 * HOUR_MS,
@@ -188,29 +137,129 @@ async fn deletion_mark_grace_and_refresh_match_go() {
         "2",
         false,
     );
-    let replacement = generate(
+    let future = rename_with_timestamp(
+        &blocks,
+        &future_original,
+        (BASE_SECONDS + 10 * 60 * 60) * 1000,
+    );
+    set_meta_fields(&blocks, &future, None, Some("sidecar"));
+    refresher.refresh().await.unwrap();
+    assert!(sql_block_ids(&state).await.contains(&future));
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
+
+    // Zero is the Store Gateway default. It admits upload_time at equality and still preserves
+    // the future-ULID fallback behavior.
+    let zero_cache = root.join("zero-cache");
+    let zero_service = initial_service(&repository, &zero_cache, Duration::ZERO, clock.now()).await;
+    let zero_state = zero_service.shared_state();
+    assert!(sql_block_ids(&zero_state).await.contains(&target));
+    assert!(sql_block_ids(&zero_state).await.contains(&future));
+    assert_go_view(
+        &generator,
+        &blocks,
+        &zero_service,
+        &zero_state,
+        "0s",
+        clock.now(),
+    )
+    .await;
+    drop(zero_service);
+    drop(zero_state);
+
+    // A future explicit upload_time has negative age and is too fresh; unlike the future-ULID
+    // fallback, this path uses signed time arithmetic.
+    set_meta_fields(
+        &blocks,
+        &target,
+        Some((BASE_SECONDS + DELAY_SECONDS + 10 * 60 * 60) as i64),
+        Some("sidecar"),
+    );
+    refresher.refresh().await.unwrap();
+    assert!(!sql_block_ids(&state).await.contains(&target));
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
+    set_meta_fields(&blocks, &target, Some(BASE_SECONDS as i64), Some("sidecar"));
+    refresher.refresh().await.unwrap();
+
+    // Consistency runs before deletion filtering and deduplication. A fresh compactor replacement
+    // bypasses consistency; its deletion mark removes it before dedup, retaining the source.
+    let source = generate(
         &generator,
         &blocks,
         START + 3 * HOUR_MS,
         START + 4 * HOUR_MS,
-        "2",
+        "3",
+        false,
+    );
+    set_meta_fields(
+        &blocks,
+        &source,
+        Some((BASE_SECONDS - DELAY_SECONDS) as i64),
+        Some("sidecar"),
+    );
+    let replacement = generate(
+        &generator,
+        &blocks,
+        START + 4 * HOUR_MS,
+        START + 5 * HOUR_MS,
+        "3",
         false,
     );
     make_compaction_replacement(&blocks, &source, &replacement);
-    write_mark(&blocks, &replacement, &replacement, 1, 0);
+    set_meta_fields(
+        &blocks,
+        &replacement,
+        Some((BASE_SECONDS + DELAY_SECONDS + 1) as i64),
+        Some("compactor"),
+    );
+    write_mark(&blocks, &replacement);
     refresher.refresh().await.unwrap();
     let ids = sql_block_ids(&state).await;
     assert!(ids.contains(&source));
     assert!(!ids.contains(&replacement));
-    assert_go_view(&generator, &blocks, &service, &state, "0s").await;
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
 
     std::fs::remove_file(mark_path(&blocks, &replacement)).unwrap();
-    write_mark(&blocks, &source, &source, 1, 0);
     refresher.refresh().await.unwrap();
     let ids = sql_block_ids(&state).await;
     assert!(!ids.contains(&source));
     assert!(ids.contains(&replacement));
-    assert_go_view(&generator, &blocks, &service, &state, "0s").await;
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
+
+    // A fresh non-compactor replacement is removed before dedup, leaving its source active.
+    set_meta_fields(
+        &blocks,
+        &replacement,
+        Some((BASE_SECONDS + DELAY_SECONDS + 1) as i64),
+        Some("sidecar"),
+    );
+    refresher.refresh().await.unwrap();
+    let ids = sql_block_ids(&state).await;
+    assert!(ids.contains(&source));
+    assert!(!ids.contains(&replacement));
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
+
+    // Non-ULID directories are not blocks in the Go lister and are ignored.
+    let invalid = generate(
+        &generator,
+        &blocks,
+        START + 5 * HOUR_MS,
+        START + 6 * HOUR_MS,
+        "4",
+        false,
+    );
+    std::fs::rename(blocks.join(&invalid), blocks.join("not-a-block")).unwrap();
+    refresher.refresh().await.unwrap();
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
+
+    // A malformed upload_time is a corrupt partial meta. Go skips it without failing the sync;
+    // Rust publishes the same valid remainder atomically.
+    set_raw_upload_time(&blocks, &target, serde_json::json!("not-a-time"));
+    refresher.refresh().await.unwrap();
+    assert!(!sql_block_ids(&state).await.contains(&target));
+    assert!(go_succeeds(&generator, &blocks, "2h", clock.now()));
+    assert_go_view(&generator, &blocks, &service, &state, "2h", clock.now()).await;
+    set_meta_fields(&blocks, &target, Some(BASE_SECONDS as i64), Some("sidecar"));
+    refresher.refresh().await.unwrap();
 
     drop(refresher);
     drop(service);
@@ -221,15 +270,15 @@ async fn deletion_mark_grace_and_refresh_match_go() {
 async fn initial_service(
     repository: &ThanosRepositoryConfig,
     cache: &Path,
-    delay: Duration,
+    consistency_delay: Duration,
     now: SystemTime,
 ) -> ThanosStoreService {
     let cache = cache.to_str().unwrap();
     let schemas = build_block_index_at(
         std::slice::from_ref(repository),
         cache,
-        delay,
-        Duration::ZERO,
+        DELETION_DELAY,
+        consistency_delay,
         now,
     )
     .await
@@ -253,25 +302,28 @@ async fn assert_go_view(
     service: &ThanosStoreService,
     state: &SharedReaderState,
     delay: &str,
+    now: SystemTime,
 ) {
     assert_eq!(
         canonical_info(reader_info(service).await),
-        canonical_info(go_info(generator, blocks, delay))
+        canonical_info(go_info(generator, blocks, delay, now))
     );
     assert_eq!(
         canonical_names(reader_names(service).await),
-        canonical_names(go_names(generator, blocks, delay))
+        canonical_names(go_names(generator, blocks, delay, now))
     );
     assert_eq!(
         canonical_values(reader_values(service).await),
-        canonical_values(go_values(generator, blocks, delay))
+        canonical_values(go_values(generator, blocks, delay, now))
     );
     assert_eq!(
         canonical_series(reader_series(service).await),
-        canonical_series(go_series(generator, blocks, delay))
+        canonical_series(go_series(generator, blocks, delay, now))
     );
-    let replicas = sql_replicas(state).await;
-    assert_eq!(replicas, reader_values(service).await.values);
+    assert_eq!(
+        sql_replicas(state).await,
+        reader_values(service).await.values
+    );
 }
 
 async fn reader_info(service: &ThanosStoreService) -> info::InfoResponse {
@@ -347,8 +399,9 @@ async fn sql_replicas(state: &SharedReaderState) -> Vec<String> {
 }
 
 async fn sql_strings(state: &SharedReaderState, query: &str) -> BTreeSet<String> {
-    let snapshot = state.query_snapshot().await;
-    let batches = snapshot
+    let batches = state
+        .query_snapshot()
+        .await
         .context()
         .sql(query)
         .await
@@ -378,16 +431,22 @@ async fn sql_strings(state: &SharedReaderState, query: &str) -> BTreeSet<String>
         .collect()
 }
 
-fn go_info(generator: &Path, blocks: &Path, delay: &str) -> info::InfoResponse {
-    decode_single(go(generator, blocks, delay, &["--endpoint", "info"]).stdout)
+fn go_info(generator: &Path, blocks: &Path, delay: &str, now: SystemTime) -> info::InfoResponse {
+    decode_single(go(generator, blocks, delay, now, &["--endpoint", "info"]).stdout)
 }
 
-fn go_names(generator: &Path, blocks: &Path, delay: &str) -> thanos::LabelNamesResponse {
+fn go_names(
+    generator: &Path,
+    blocks: &Path,
+    delay: &str,
+    now: SystemTime,
+) -> thanos::LabelNamesResponse {
     decode_single(
         go(
             generator,
             blocks,
             delay,
+            now,
             &[
                 "--endpoint",
                 "label-names",
@@ -401,12 +460,18 @@ fn go_names(generator: &Path, blocks: &Path, delay: &str) -> thanos::LabelNamesR
     )
 }
 
-fn go_values(generator: &Path, blocks: &Path, delay: &str) -> thanos::LabelValuesResponse {
+fn go_values(
+    generator: &Path,
+    blocks: &Path,
+    delay: &str,
+    now: SystemTime,
+) -> thanos::LabelValuesResponse {
     decode_single(
         go(
             generator,
             blocks,
             delay,
+            now,
             &[
                 "--endpoint",
                 "label-values",
@@ -422,11 +487,12 @@ fn go_values(generator: &Path, blocks: &Path, delay: &str) -> thanos::LabelValue
     )
 }
 
-fn go_series(generator: &Path, blocks: &Path, delay: &str) -> Vec<SeriesResponse> {
+fn go_series(generator: &Path, blocks: &Path, delay: &str, now: SystemTime) -> Vec<SeriesResponse> {
     let output = go(
         generator,
         blocks,
         delay,
+        now,
         &[
             "--metric",
             "dummy_requests_total",
@@ -437,11 +503,6 @@ fn go_series(generator: &Path, blocks: &Path, delay: &str) -> Vec<SeriesResponse
             "--stream-wire-format",
         ],
     );
-    assert!(
-        output.status.success(),
-        "Go oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let values: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
     values
         .into_iter()
@@ -449,17 +510,25 @@ fn go_series(generator: &Path, blocks: &Path, delay: &str) -> Vec<SeriesResponse
         .collect()
 }
 
-fn go_succeeds(generator: &Path, blocks: &Path, delay: &str) -> bool {
-    go(generator, blocks, delay, &["--endpoint", "info"])
+fn go_succeeds(generator: &Path, blocks: &Path, delay: &str, now: SystemTime) -> bool {
+    go(generator, blocks, delay, now, &["--endpoint", "info"])
         .status
         .success()
 }
 
-fn go(generator: &Path, blocks: &Path, delay: &str, args: &[&str]) -> std::process::Output {
+fn go(
+    generator: &Path,
+    blocks: &Path,
+    delay: &str,
+    now: SystemTime,
+    args: &[&str],
+) -> std::process::Output {
+    let reference = rfc3339(system_seconds(now) as i64);
     let output = std::process::Command::new("go")
         .args(["run", "-tags=slicelabels", "./cmd/store-oracle", "--bucket"])
         .arg(blocks)
-        .args(["--deletion-mark-delay", delay])
+        .args(["--consistency-delay", delay])
+        .args(["--consistency-reference-time", &reference])
         .args(args)
         .current_dir(generator)
         .output()
@@ -535,14 +604,62 @@ fn canonical_series(mut responses: Vec<SeriesResponse>) -> Vec<Vec<u8>> {
     encoded
 }
 
-fn write_mark(blocks: &Path, block: &str, mark_id: &str, version: i32, deletion_time: i64) {
+fn set_meta_fields(blocks: &Path, block: &str, upload_seconds: Option<i64>, source: Option<&str>) {
+    let path = blocks.join(block).join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    match upload_seconds {
+        Some(seconds) => meta["thanos"]["upload_time"] = rfc3339(seconds).into(),
+        None => {
+            meta["thanos"]
+                .as_object_mut()
+                .unwrap()
+                .remove("upload_time");
+        }
+    }
+    if let Some(source) = source {
+        meta["thanos"]["source"] = source.into();
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+}
+
+fn set_raw_upload_time(blocks: &Path, block: &str, value: serde_json::Value) {
+    let path = blocks.join(block).join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta["thanos"]["upload_time"] = value;
+    std::fs::write(path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+}
+
+fn rename_with_timestamp(blocks: &Path, original: &str, timestamp_ms: u64) -> String {
+    const ENCODING: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut timestamp = timestamp_ms;
+    let mut prefix = [b'0'; 10];
+    for value in prefix.iter_mut().rev() {
+        *value = ENCODING[(timestamp & 31) as usize];
+        timestamp >>= 5;
+    }
+    let renamed = format!(
+        "{}{}",
+        std::str::from_utf8(&prefix).unwrap(),
+        &original[10..]
+    );
+    std::fs::rename(blocks.join(original), blocks.join(&renamed)).unwrap();
+    let path = blocks.join(&renamed).join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta["ulid"] = renamed.clone().into();
+    std::fs::write(path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+    renamed
+}
+
+fn write_mark(blocks: &Path, block: &str) {
     std::fs::write(
         mark_path(blocks, block),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "id": mark_id,
-            "version": version,
-            "details": "parity fixture",
-            "deletion_time": deletion_time,
+            "id": block,
+            "version": 1,
+            "deletion_time": 0,
         }))
         .unwrap(),
     )
@@ -551,6 +668,16 @@ fn write_mark(blocks: &Path, block: &str, mark_id: &str, version: i32, deletion_
 
 fn mark_path(blocks: &Path, block: &str) -> std::path::PathBuf {
     blocks.join(block).join("deletion-mark.json")
+}
+
+fn make_compaction_replacement(blocks: &Path, source: &str, replacement: &str) {
+    let path = blocks.join(replacement).join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta["compaction"]["level"] = 2.into();
+    meta["compaction"]["sources"] = serde_json::json!([source, replacement]);
+    meta["thanos"]["source"] = "compactor".into();
+    std::fs::write(path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
 }
 
 fn generate(
@@ -581,6 +708,7 @@ fn generate(
         "1",
         "--native-series",
         "1",
+        "--downsample-5m=false",
         "--external-label",
         &format!("replica={replica}"),
     ]);
@@ -601,14 +729,14 @@ fn generate(
         .to_owned()
 }
 
-fn make_compaction_replacement(blocks: &Path, source: &str, replacement: &str) {
-    let path = blocks.join(replacement).join("meta.json");
-    let mut meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    meta["compaction"]["level"] = 2.into();
-    meta["compaction"]["sources"] = serde_json::json!([source, replacement]);
-    meta["thanos"]["source"] = "compactor".into();
-    std::fs::write(path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+fn rfc3339(seconds: i64) -> String {
+    DateTime::<Utc>::from_timestamp(seconds, 0)
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn system_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {

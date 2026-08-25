@@ -227,6 +227,7 @@ pub async fn build_block_index(
     storage: &RepositoryRegistry,
     index_build_concurrency: usize,
     metadata_read_concurrency: usize,
+    bootstrap_max_blocks: Option<usize>,
     block_max_age: Option<Duration>,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut meta_read_tasks = Vec::new();
@@ -273,19 +274,34 @@ pub async fn build_block_index(
         .buffer_unordered(metadata_read_concurrency)
         .try_collect::<Vec<_>>()
         .await?;
-    let mut active_block_ulids = BTreeSet::new();
     let mut tasks = Vec::new();
     let mut skipped_old_blocks = 0usize;
     for result in meta_read_results {
         match result {
             MetaReadResult::Build(task) => {
-                active_block_ulids.insert(task.meta.ulid.clone());
                 tasks.push(task);
             }
             MetaReadResult::SkippedOld => skipped_old_blocks += 1,
             MetaReadResult::SkippedDeleted => {}
         }
     }
+
+    tasks.sort_unstable_by(|left, right| right.meta.ulid.cmp(&left.meta.ulid));
+    if let Some(max_blocks) = bootstrap_max_blocks {
+        let skipped_blocks = tasks.len().saturating_sub(max_blocks);
+        tasks.truncate(max_blocks);
+        if skipped_blocks > 0 {
+            tracing::info!(
+                max_blocks,
+                skipped_blocks,
+                "limited Thanos blocks selected for bootstrap"
+            );
+        }
+    }
+    let active_block_ulids = tasks
+        .iter()
+        .map(|task| task.meta.ulid.clone())
+        .collect::<BTreeSet<_>>();
 
     if skipped_old_blocks > 0 {
         tracing::info!(
@@ -1219,6 +1235,7 @@ mod tests {
             &storage,
             StorageConfig::default().index_build_concurrency,
             StorageConfig::default().metadata_read_concurrency,
+            None,
             None,
         )
         .await

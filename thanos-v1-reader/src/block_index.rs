@@ -422,41 +422,50 @@ async fn build_chunk_index(
             index_bytes = index.len(),
             "downloaded Thanos TSDB index"
         );
-        let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
-        let mut metric_labels = BTreeMap::new();
-        let (series_count, chunk_count) = write_chunk_index_streaming(
-            &task.repository,
-            &task.meta,
-            &task.block_path,
-            &index,
-            &chunk_index_path,
-            &mut metric_labels,
-        )?;
-        let block_ulid = task.meta.ulid.clone();
-        let row = index_row(
-            &task.repository,
-            task.meta,
-            task.block_path.clone(),
-            task.meta_path,
-        )?;
-        tracing::info!(
-            repository = %task.repository.name,
-            block_ulid = %block_ulid,
-            elapsed_seconds = started.elapsed().as_secs_f64(),
-            series_count,
-            chunk_count,
-            "finished Thanos block index build"
-        );
-        Ok(BuiltBlockIndex {
-            row,
-            block_ulid,
-            block_path: task.block_path,
-            index_path: index_path.clone(),
-            chunk_index_path,
-            series_count,
-            chunk_count,
-            metric_labels,
+        let index_path_for_error = index_path.clone();
+        let index_path_for_worker = index_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
+            let mut metric_labels = BTreeMap::new();
+            let (series_count, chunk_count) = write_chunk_index_streaming(
+                &task.repository,
+                &task.meta,
+                &task.block_path,
+                &index,
+                &chunk_index_path,
+                &mut metric_labels,
+            )
+            .map_err(|error| error.to_string())?;
+            let block_ulid = task.meta.ulid.clone();
+            let row = index_row(
+                &task.repository,
+                task.meta,
+                task.block_path.clone(),
+                task.meta_path,
+            )
+            .map_err(|error| error.to_string())?;
+            tracing::info!(
+                repository = %task.repository.name,
+                block_ulid = %block_ulid,
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                series_count,
+                chunk_count,
+                "finished Thanos block index build"
+            );
+            Ok::<_, String>(BuiltBlockIndex {
+                row,
+                block_ulid,
+                block_path: task.block_path,
+                index_path: index_path_for_worker,
+                chunk_index_path,
+                series_count,
+                chunk_count,
+                metric_labels,
+            })
         })
+        .await
+        .map_err(|error| invalid_data(format!("block index worker failed: {error}")))?
+        .map_err(|error| invalid_data(format!("failed to process {index_path_for_error}: {error}")))
     }
     .await;
 

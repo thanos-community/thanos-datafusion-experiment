@@ -169,6 +169,19 @@ struct BlockBuildTask {
     meta_path: String,
 }
 
+struct MetaReadTask {
+    repository: ThanosRepositoryConfig,
+    storage_repository: std::sync::Arc<crate::storage::Repository>,
+    block_path: String,
+    meta_path: String,
+}
+
+enum MetaReadResult {
+    Build(BlockBuildTask),
+    SkippedOld,
+    SkippedDeleted,
+}
+
 struct BuiltBlockIndex {
     row: BlockIndexRow,
     block_ulid: String,
@@ -215,9 +228,7 @@ pub async fn build_block_index(
     index_build_concurrency: usize,
     block_max_age: Option<Duration>,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
-    let mut tasks = Vec::new();
-    let mut active_block_ulids = BTreeSet::new();
-    let mut skipped_old_blocks = 0usize;
+    let mut meta_read_tasks = Vec::new();
 
     for repository in repositories {
         let storage_repository = storage.require(&repository.uri)?;
@@ -237,48 +248,36 @@ pub async fn build_block_index(
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
-            if block_has_deletion_mark(storage_repository.operator(), &block_path).await? {
-                tracing::trace!(
-                    repository = %repository.name,
-                    block_path = %block_path,
-                    "skipping deleted Thanos block"
-                );
-                continue;
-            }
-
-            let contents = storage_repository.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
-                tracing::error!(
-                    repository = %repository.name,
-                    repository_uri = %repository.uri,
-                    block_path = %block_path,
-                    meta_path = %meta_path,
-                    error = %error,
-                    "failed to parse Thanos block metadata"
-                );
-                error
-            })?;
-            if block_is_older_than(&meta, block_max_age)? {
-                skipped_old_blocks += 1;
-                tracing::trace!(
-                    repository = %repository.name,
-                    block_ulid = %meta.ulid,
-                    block_path = %block_path,
-                    max_time = meta.max_time,
-                    max_age = ?block_max_age,
-                    "skipping Thanos block older than configured maximum age"
-                );
-                continue;
-            }
-            active_block_ulids.insert(meta.ulid.clone());
-
-            tasks.push(BlockBuildTask {
+            meta_read_tasks.push(MetaReadTask {
                 repository: repository.clone(),
                 storage_repository: storage_repository.clone(),
-                meta,
                 block_path,
                 meta_path,
             });
+        }
+    }
+
+    tracing::info!(
+        blocks = meta_read_tasks.len(),
+        concurrency = index_build_concurrency,
+        "reading Thanos block metadata concurrently"
+    );
+    let meta_read_results = stream::iter(meta_read_tasks)
+        .map(|task| read_block_meta(task, block_max_age))
+        .buffer_unordered(index_build_concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut active_block_ulids = BTreeSet::new();
+    let mut tasks = Vec::new();
+    let mut skipped_old_blocks = 0usize;
+    for result in meta_read_results {
+        match result {
+            MetaReadResult::Build(task) => {
+                active_block_ulids.insert(task.meta.ulid.clone());
+                tasks.push(task);
+            }
+            MetaReadResult::SkippedOld => skipped_old_blocks += 1,
+            MetaReadResult::SkippedDeleted => {}
         }
     }
 
@@ -352,6 +351,52 @@ fn block_is_older_than(meta: &BlockMeta, max_age: Option<Duration>) -> Result<bo
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let cutoff = now.saturating_sub(max_age).as_millis();
     Ok(i128::from(meta.max_time) < i128::try_from(cutoff)?)
+}
+
+async fn read_block_meta(
+    task: MetaReadTask,
+    block_max_age: Option<Duration>,
+) -> Result<MetaReadResult, BoxError> {
+    if block_has_deletion_mark(task.storage_repository.operator(), &task.block_path).await? {
+        tracing::trace!(
+            repository = %task.repository.name,
+            block_path = %task.block_path,
+            "skipping deleted Thanos block"
+        );
+        return Ok(MetaReadResult::SkippedDeleted);
+    }
+
+    let contents = task.storage_repository.read(&task.meta_path).await?;
+    let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
+        tracing::error!(
+            repository = %task.repository.name,
+            repository_uri = %task.repository.uri,
+            block_path = %task.block_path,
+            meta_path = %task.meta_path,
+            error = %error,
+            "failed to parse Thanos block metadata"
+        );
+        error
+    })?;
+    if block_is_older_than(&meta, block_max_age)? {
+        tracing::trace!(
+            repository = %task.repository.name,
+            block_ulid = %meta.ulid,
+            block_path = %task.block_path,
+            max_time = meta.max_time,
+            max_age = ?block_max_age,
+            "skipping Thanos block older than configured maximum age"
+        );
+        return Ok(MetaReadResult::SkippedOld);
+    }
+
+    Ok(MetaReadResult::Build(BlockBuildTask {
+        repository: task.repository,
+        storage_repository: task.storage_repository,
+        meta,
+        block_path: task.block_path,
+        meta_path: task.meta_path,
+    }))
 }
 
 async fn build_chunk_index(

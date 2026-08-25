@@ -1,6 +1,17 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.91-bookworm AS builder
+FROM rust:1.91-bookworm AS chef
+
+RUN cargo install --locked cargo-chef --version 0.1.78
+
+WORKDIR /app
+
+FROM chef AS planner
+
+COPY . .
+RUN cargo chef prepare --bin thanos-v1-reader --recipe-path recipe.json
+
+FROM chef AS builder
 
 ARG TARGETARCH
 
@@ -12,37 +23,24 @@ ENV PROTOC_INCLUDE=/usr/include
 
 WORKDIR /app
 
-# Build all dependency crates before adding the application sources. The build script
-# and vendored schemas are included because generating the protobuf bindings needs protoc.
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto ./proto
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,id=thanos-v1-reader-target-${TARGETARCH},target=/app/target \
-    mkdir -p src benches e2e \
-    && printf 'fn main() {}\n' > src/main.rs \
-    && printf 'fn main() {}\n' > benches/chunk_io.rs \
-    && printf 'fn main() {}\n' > e2e/e2e.rs \
-    && case "${TARGETARCH}" in \
+# Keep the cooked dependency artifacts in the image layer. Unlike a target cache
+# mount, this layer is exported by the GitHub Actions Buildx cache and can be reused
+# by fresh CI runners whenever the Cargo recipe is unchanged.
+COPY --from=planner /app/recipe.json recipe.json
+RUN case "${TARGETARCH}" in \
         amd64) export CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v4" ;; \
         arm64) export CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu ;; \
         *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
-    && cargo build --release --locked \
-    && rm -rf src benches e2e
+    && cargo chef cook --release --locked --bin thanos-v1-reader --target "${CARGO_BUILD_TARGET}" --recipe-path recipe.json
 
-COPY src ./src
-COPY benches ./benches
-COPY e2e ./e2e
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,id=thanos-v1-reader-target-${TARGETARCH},target=/app/target \
-    case "${TARGETARCH}" in \
+COPY . .
+RUN case "${TARGETARCH}" in \
         amd64) export CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v4" ;; \
         arm64) export CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu ;; \
         *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
-    && cargo build --release --locked \
+    && cargo build --release --locked --bin thanos-v1-reader --target "${CARGO_BUILD_TARGET}" \
     && cp "target/${CARGO_BUILD_TARGET}/release/thanos-v1-reader" /app/thanos-v1-reader
 
 FROM debian:bookworm-slim AS runtime

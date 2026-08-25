@@ -226,6 +226,7 @@ pub async fn build_block_index(
     index_cache_location: &str,
     storage: &RepositoryRegistry,
     index_build_concurrency: usize,
+    metadata_read_concurrency: usize,
     block_max_age: Option<Duration>,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut meta_read_tasks = Vec::new();
@@ -258,14 +259,18 @@ pub async fn build_block_index(
         }
     }
 
+    // Thanos block ULIDs sort by creation time. Process the newest blocks first so a recent
+    // query can become available before we have examined the historical tail of the bucket.
+    meta_read_tasks.sort_unstable_by(|left, right| right.block_path.cmp(&left.block_path));
+
     tracing::info!(
         blocks = meta_read_tasks.len(),
-        concurrency = index_build_concurrency,
+        concurrency = metadata_read_concurrency,
         "reading Thanos block metadata concurrently"
     );
     let meta_read_results = stream::iter(meta_read_tasks)
         .map(|task| read_block_meta(task, block_max_age))
-        .buffer_unordered(index_build_concurrency)
+        .buffer_unordered(metadata_read_concurrency)
         .try_collect::<Vec<_>>()
         .await?;
     let mut active_block_ulids = BTreeSet::new();
@@ -1208,6 +1213,7 @@ mod tests {
             root.path().join("cache").to_str().unwrap(),
             &storage,
             StorageConfig::default().index_build_concurrency,
+            StorageConfig::default().metadata_read_concurrency,
             None,
         )
         .await

@@ -94,8 +94,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/thanos-community/thanos-v1-reader
-          flavor: |
-            suffix=-${{ matrix.platform_pair }},enable=${{ github.event_name == 'push' }}
+          flavor: ${{ github.event_name == 'push' && format('suffix=-{0}', matrix.platform_pair) || '' }}
           tags: |
             type=raw,value=${{ steps.pr_image.outputs.tag }},enable=${{ github.event_name != 'push' }}
             type=raw,value=edge,enable={{is_default_branch}}

@@ -248,6 +248,7 @@ pub async fn build_block_index(
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
+            metrics::counter!("thanos_reader_block_index_metadata_blocks_discovered_total").increment(1);
             meta_read_tasks.push(MetaReadTask {
                 repository: repository.clone(),
                 storage_repository: storage_repository.clone(),
@@ -359,6 +360,7 @@ async fn read_block_meta(
 ) -> Result<MetaReadResult, BoxError> {
     if block_has_deletion_mark(task.storage_repository.operator(), &task.block_path).await? {
         metrics::counter!("thanos_reader_block_index_blocks_skipped_deleted_total").increment(1);
+        metrics::counter!("thanos_reader_block_index_metadata_blocks_examined_total").increment(1);
         tracing::trace!(
             repository = %task.repository.name,
             block_path = %task.block_path,
@@ -368,6 +370,7 @@ async fn read_block_meta(
     }
 
     let contents = task.storage_repository.read(&task.meta_path).await?;
+    metrics::counter!("thanos_reader_block_index_metadata_blocks_examined_total").increment(1);
     let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
         metrics::counter!("thanos_reader_block_index_block_meta_parse_failures_total").increment(1);
         tracing::error!(

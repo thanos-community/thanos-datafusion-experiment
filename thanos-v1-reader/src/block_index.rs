@@ -4,7 +4,7 @@ use std::{
     fs, io,
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arrow::{
@@ -35,9 +35,6 @@ type BoxError = Box<dyn Error>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
 /// Keep index construction well below the reader's 48 GiB production memory limit.
 const CHUNK_INDEX_BATCH_SIZE: usize = 50_000;
-/// Each worker holds one downloaded TSDB index and one bounded Parquet batch. Eight workers
-/// keep a 12-vCPU reader busy while leaving substantial headroom below its 48 GiB limit.
-const INDEX_BUILD_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Deserialize)]
 struct BlockMeta {
@@ -215,6 +212,8 @@ pub async fn build_block_index(
     repositories: &[ThanosRepositoryConfig],
     index_cache_location: &str,
     storage: &RepositoryRegistry,
+    index_build_concurrency: usize,
+    block_max_age: Option<Duration>,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut tasks = Vec::new();
     let mut active_block_ulids = BTreeSet::new();
@@ -258,6 +257,17 @@ pub async fn build_block_index(
                 );
                 error
             })?;
+            if block_is_older_than(&meta, block_max_age)? {
+                tracing::info!(
+                    repository = %repository.name,
+                    block_ulid = %meta.ulid,
+                    block_path = %block_path,
+                    max_time = meta.max_time,
+                    max_age = ?block_max_age,
+                    "skipping Thanos block older than configured maximum age"
+                );
+                continue;
+            }
             active_block_ulids.insert(meta.ulid.clone());
 
             tasks.push(BlockBuildTask {
@@ -272,12 +282,12 @@ pub async fn build_block_index(
 
     tracing::info!(
         blocks = tasks.len(),
-        concurrency = INDEX_BUILD_CONCURRENCY,
+        concurrency = index_build_concurrency,
         "building Thanos block indexes concurrently"
     );
     let built_indexes = stream::iter(tasks)
         .map(|task| build_chunk_index(task, index_cache_location.to_owned()))
-        .buffer_unordered(INDEX_BUILD_CONCURRENCY)
+        .buffer_unordered(index_build_concurrency)
         .try_collect::<Vec<_>>()
         .await?;
     let mut rows = Vec::with_capacity(built_indexes.len());
@@ -321,6 +331,15 @@ pub async fn build_block_index(
             label_columns,
         })
         .collect())
+}
+
+fn block_is_older_than(meta: &BlockMeta, max_age: Option<Duration>) -> Result<bool, BoxError> {
+    let Some(max_age) = max_age else {
+        return Ok(false);
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let cutoff = now.saturating_sub(max_age).as_millis();
+    Ok(i128::from(meta.max_time) < i128::try_from(cutoff)?)
 }
 
 async fn build_chunk_index(
@@ -547,7 +566,7 @@ fn write_chunk_index_streaming(
             Ok(count) => {
                 chunk_count += count;
                 if rows.len() >= CHUNK_INDEX_BATCH_SIZE {
-                    tracing::debug!(
+                    tracing::info!(
                         block_ulid = %meta.ulid,
                         batch_rows = rows.len(),
                         total_chunks = chunk_count,
@@ -567,7 +586,7 @@ fn write_chunk_index_streaming(
         Ok(()) => match write_error {
             Some(error) => Err(error),
             None => {
-                tracing::debug!(
+                tracing::info!(
                     block_ulid = %meta.ulid,
                     batch_rows = rows.len(),
                     total_chunks = chunk_count,
@@ -1111,6 +1130,8 @@ mod tests {
             &[repository],
             root.path().join("cache").to_str().unwrap(),
             &storage,
+            StorageConfig::default().index_build_concurrency,
+            None,
         )
         .await
         .unwrap();

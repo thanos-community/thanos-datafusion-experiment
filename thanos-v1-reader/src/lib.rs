@@ -19,8 +19,8 @@ pub mod chunk_reader;
 pub mod config;
 pub mod flight_service;
 pub mod metric_table;
-pub mod store_service;
 pub mod storage;
+pub mod store_service;
 pub mod thanos_proto;
 pub mod tsdb_index;
 
@@ -130,9 +130,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "configured Thanos repository"
         );
     }
-    let metric_table_schemas =
-        block_index::build_block_index(&config.repositories, &config.index_cache_location, &storage)
-            .await?;
+    let metric_table_schemas = block_index::build_block_index(
+        &config.repositories,
+        &config.index_cache_location,
+        &storage,
+        config.storage.index_build_concurrency,
+        config.storage.block_max_age_duration()?,
+    )
+    .await?;
     let block_index_path = block_index::block_index_file_path(&config.index_cache_location);
     let chunk_index_path = block_index::chunk_index_directory_path(&config.index_cache_location);
     tracing::info!(path = %block_index_path, "generated Thanos blocks index");
@@ -321,9 +326,15 @@ mod tests {
             storage: config::StorageConfig::default(),
         })
         .unwrap();
-        let schemas = block_index::build_block_index(&repositories, cache.to_str().unwrap(), &storage)
-            .await
-            .unwrap();
+        let schemas = block_index::build_block_index(
+            &repositories,
+            cache.to_str().unwrap(),
+            &storage,
+            config::StorageConfig::default().index_build_concurrency,
+            None,
+        )
+        .await
+        .unwrap();
         let context = index_context(
             &block_index::block_index_file_path(cache.to_str().unwrap()),
             &block_index::chunk_index_directory_path(cache.to_str().unwrap()),

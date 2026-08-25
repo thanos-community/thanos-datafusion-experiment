@@ -61,6 +61,12 @@ pub struct StorageConfig {
     pub bulk_read_concurrency: usize,
     #[serde(default = "default_max_concurrent_chunk_reads")]
     pub max_concurrent_chunk_reads: usize,
+    #[serde(default = "default_index_build_concurrency")]
+    pub index_build_concurrency: usize,
+    /// Ignore blocks whose maximum timestamp is older than this duration. This is useful for
+    /// bringing up an experimental reader against a large historical bucket.
+    #[serde(default)]
+    pub block_max_age: Option<String>,
     #[serde(default)]
     pub chunk_cache: Option<ChunkCacheConfig>,
 }
@@ -74,6 +80,8 @@ impl Default for StorageConfig {
             bulk_read_chunk_size: default_bulk_read_chunk_size(),
             bulk_read_concurrency: default_bulk_read_concurrency(),
             max_concurrent_chunk_reads: default_max_concurrent_chunk_reads(),
+            index_build_concurrency: default_index_build_concurrency(),
+            block_max_age: None,
             chunk_cache: None,
         }
     }
@@ -116,6 +124,14 @@ impl StorageConfig {
 
     pub fn bulk_read_chunk_size_bytes(&self) -> Result<u64, Box<dyn Error>> {
         parse_size(&self.bulk_read_chunk_size, "storage bulk_read_chunk_size")
+    }
+
+    pub fn block_max_age_duration(&self) -> Result<Option<Duration>, Box<dyn Error>> {
+        self.block_max_age
+            .as_deref()
+            .map(humantime::parse_duration)
+            .transpose()
+            .map_err(Into::into)
     }
 }
 
@@ -161,13 +177,17 @@ impl ReaderConfig {
                 .into());
             }
             if !names.insert(repository.name.as_str()) {
-                return Err(format!("duplicate Thanos repository name {:?}", repository.name).into());
+                return Err(
+                    format!("duplicate Thanos repository name {:?}", repository.name).into(),
+                );
             }
             let scheme = repository
                 .uri
                 .split_once("://")
                 .map(|(scheme, _)| scheme)
-                .ok_or_else(|| format!("repository URI {:?} must include a scheme", repository.uri))?;
+                .ok_or_else(|| {
+                    format!("repository URI {:?} must include a scheme", repository.uri)
+                })?;
             match scheme {
                 "file" if repository.s3.is_none() && repository.gcs.is_none() => {}
                 "s3" if repository.gcs.is_none() => {}
@@ -199,6 +219,7 @@ impl ReaderConfig {
         if storage.max_concurrent_requests == 0
             || storage.bulk_read_concurrency == 0
             || storage.max_concurrent_chunk_reads == 0
+            || storage.index_build_concurrency == 0
         {
             return Err("storage concurrency values must be greater than zero".into());
         }
@@ -209,7 +230,9 @@ impl ReaderConfig {
             let max_size = cache.max_size_bytes()?;
             let page_size = cache.page_size_bytes()?;
             if max_size == 0 || page_size == 0 || page_size > max_size {
-                return Err("chunk cache page_size must be non-zero and no larger than max_size".into());
+                return Err(
+                    "chunk cache page_size must be non-zero and no larger than max_size".into(),
+                );
             }
             if !page_size.is_power_of_two() {
                 return Err("chunk cache page_size must be a power of two".into());
@@ -226,16 +249,39 @@ fn default_metrics_listen_addr() -> String {
     DEFAULT_METRICS_LISTEN_ADDR.to_owned()
 }
 
-fn default_request_timeout() -> String { "30s".to_owned() }
-fn default_max_retries() -> usize { 3 }
-fn default_max_concurrent_requests() -> usize { 64 }
-fn default_bulk_read_chunk_size() -> String { "8MiB".to_owned() }
-fn default_bulk_read_concurrency() -> usize { 4 }
-fn default_max_concurrent_chunk_reads() -> usize { 16 }
-fn default_chunk_cache_max_size() -> String { "10GiB".to_owned() }
-fn default_chunk_cache_page_size() -> String { "512KiB".to_owned() }
-fn default_chunk_cache_policy() -> CachePolicy { CachePolicy::Slru }
-fn default_protected_fraction() -> f64 { 0.8 }
+fn default_request_timeout() -> String {
+    "30s".to_owned()
+}
+fn default_max_retries() -> usize {
+    3
+}
+fn default_max_concurrent_requests() -> usize {
+    64
+}
+fn default_bulk_read_chunk_size() -> String {
+    "8MiB".to_owned()
+}
+fn default_bulk_read_concurrency() -> usize {
+    4
+}
+fn default_max_concurrent_chunk_reads() -> usize {
+    16
+}
+fn default_index_build_concurrency() -> usize {
+    12
+}
+fn default_chunk_cache_max_size() -> String {
+    "10GiB".to_owned()
+}
+fn default_chunk_cache_page_size() -> String {
+    "512KiB".to_owned()
+}
+fn default_chunk_cache_policy() -> CachePolicy {
+    CachePolicy::Slru
+}
+fn default_protected_fraction() -> f64 {
+    0.8
+}
 
 fn parse_size(value: &str, name: &str) -> Result<u64, Box<dyn Error>> {
     let value = value.trim();
@@ -265,8 +311,14 @@ mod tests {
     #[test]
     fn storage_defaults_are_production_safe() {
         let storage = StorageConfig::default();
-        assert_eq!(storage.request_timeout_duration().unwrap(), Duration::from_secs(30));
-        assert_eq!(storage.bulk_read_chunk_size_bytes().unwrap(), 8 * 1024_u64.pow(2));
+        assert_eq!(
+            storage.request_timeout_duration().unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            storage.bulk_read_chunk_size_bytes().unwrap(),
+            8 * 1024_u64.pow(2)
+        );
         assert_eq!(storage.max_concurrent_chunk_reads, 16);
         assert_eq!(default_chunk_cache_page_size(), "512KiB");
     }

@@ -263,7 +263,7 @@ pub async fn build_block_index(
                     "processed Thanos block into expanded chunk parquet index"
                 );
 
-                index_row(repository, meta, block_path, meta_path)
+                index_row(repository, meta, block_path.clone(), meta_path)
             }
             .await;
             metrics::histogram!("thanos_reader_block_index_block_processing_duration_seconds")

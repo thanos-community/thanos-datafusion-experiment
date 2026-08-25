@@ -358,6 +358,7 @@ async fn read_block_meta(
     block_max_age: Option<Duration>,
 ) -> Result<MetaReadResult, BoxError> {
     if block_has_deletion_mark(task.storage_repository.operator(), &task.block_path).await? {
+        metrics::counter!("thanos_reader_block_index_blocks_skipped_deleted_total").increment(1);
         tracing::trace!(
             repository = %task.repository.name,
             block_path = %task.block_path,
@@ -368,6 +369,7 @@ async fn read_block_meta(
 
     let contents = task.storage_repository.read(&task.meta_path).await?;
     let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
+        metrics::counter!("thanos_reader_block_index_block_meta_parse_failures_total").increment(1);
         tracing::error!(
             repository = %task.repository.name,
             repository_uri = %task.repository.uri,

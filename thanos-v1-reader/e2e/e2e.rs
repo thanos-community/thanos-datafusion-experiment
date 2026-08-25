@@ -1,62 +1,13 @@
-use thanos_v1_reader::{
-    block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
-    config::ThanosRepositoryConfig,
-    index_context,
-};
+mod fixture;
+mod native_histogram_parity;
+mod raw_scalar_parity;
+mod scalar_downsample_parity;
+
+use fixture::{MAXT, MINT, POD_COUNT, SAMPLE_COUNT};
 
 #[tokio::test]
 async fn counter_samples_match_generated_block_values() {
-    let root = std::env::temp_dir().join(format!("thanos-v1-reader-e2e-{}", std::process::id()));
-    let blocks = root.join("blocks");
-    let cache = root.join("cache");
-    let generator_directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
-    let status = std::process::Command::new("go")
-        .args([
-            "run",
-            ".",
-            "--output",
-            blocks.to_str().unwrap(),
-            "--clean",
-            "--mint",
-            "1700000000000",
-            "--maxt",
-            "1700000600000",
-            "--samples",
-            "10",
-            "--instances",
-            "2",
-            "--pods",
-            "2",
-            "--routes",
-            "1",
-            "--native-series",
-            "1",
-            "--downsample-5m=false",
-        ])
-        .current_dir(generator_directory)
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    let repository = ThanosRepositoryConfig {
-        name: "e2e".to_owned(),
-        uri: format!("file://{}", blocks.display()),
-    };
-    let schemas = build_block_index(&[repository], cache.to_str().unwrap())
-        .await
-        .unwrap();
-    let context = index_context(
-        &block_index_file_path(cache.to_str().unwrap()),
-        &chunk_index_directory_path(cache.to_str().unwrap()),
-        &schemas,
-        &[ThanosRepositoryConfig {
-            name: "e2e".to_owned(),
-            uri: format!("file://{}", blocks.display()),
-        }],
-    )
-    .await
-    .unwrap();
+    let context = fixture::indexed_context("counter-cache").await;
 
     let batches = context
         .sql(
@@ -89,18 +40,18 @@ async fn counter_samples_match_generated_block_values() {
         })
         .collect::<Vec<_>>();
 
-    let mint = 1_700_000_000_000_i64;
-    let step = 60_000_i64;
-    let expected = (0..10)
+    let step = (MAXT - MINT) / SAMPLE_COUNT as i64;
+    let expected = (0..SAMPLE_COUNT)
         .flat_map(|sample| {
-            (0..2).map(move |pod| {
-                (
-                    mint + sample * step,
-                    (1_000 + pod * 100 + sample * 7) as f64,
-                )
+            (0..POD_COUNT).map(move |pod| {
+                let value = if sample == SAMPLE_COUNT / 2 {
+                    10 + pod
+                } else {
+                    1_000 + pod * 100 + sample * 7
+                };
+                (MINT + sample as i64 * step, value as f64)
             })
         })
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
-    std::fs::remove_dir_all(root).unwrap();
 }

@@ -3,9 +3,6 @@ use std::collections::BTreeMap;
 use futures::StreamExt;
 use serde::Deserialize;
 use thanos_v1_reader::{
-    block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
-    config::ThanosRepositoryConfig,
-    index_context,
     store_service::ThanosStoreService,
     thanos_proto::thanos::{
         self, Aggr, LabelMatcher, PartialResponseStrategy, store_server::Store,
@@ -29,104 +26,23 @@ struct OracleChunk {
 
 #[tokio::test]
 async fn native_histogram_chunks_match_go_bucket_store() {
-    let root = std::env::temp_dir().join(format!(
-        "thanos-v1-reader-native-e2e-{}",
-        std::process::id()
-    ));
-    let blocks = root.join("blocks");
-    let cache = root.join("cache");
-    let generator_directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
-    let status = std::process::Command::new("go")
-        .args([
-            "run",
-            ".",
-            "--output",
-            blocks.to_str().unwrap(),
-            "--clean",
-            "--mint",
-            "1700000000000",
-            "--maxt",
-            "1700000600000",
-            "--samples",
-            "10",
-            "--instances",
-            "1",
-            "--pods",
-            "1",
-            "--routes",
-            "1",
-            "--native-series",
-            "1",
-            "--downsample-5m=false",
-        ])
-        .current_dir(&generator_directory)
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    let repository = ThanosRepositoryConfig {
-        name: "e2e".to_owned(),
-        uri: format!("file://{}", blocks.display()),
-    };
-    let schemas = build_block_index(std::slice::from_ref(&repository), cache.to_str().unwrap())
-        .await
-        .unwrap();
-    let context = index_context(
-        &block_index_file_path(cache.to_str().unwrap()),
-        &chunk_index_directory_path(cache.to_str().unwrap()),
-        &schemas,
-        std::slice::from_ref(&repository),
-    )
-    .await
-    .unwrap();
-    let service = ThanosStoreService::new(context, std::slice::from_ref(&repository))
-        .await
-        .unwrap();
+    let (_, service) = crate::fixture::store_service("native-cache").await;
 
     for (metric, expected_encoding) in [
         ("dummy_native_histogram", 1),
         ("dummy_float_native_histogram", 2),
     ] {
-        let expected = go_bucket_store_series(&generator_directory, &blocks, metric);
+        let expected = crate::fixture::go_bucket_store_series(metric, None, None);
         let actual = reader_series(&service, metric).await;
         assert_eq!(actual, expected, "StoreAPI mismatch for {metric}");
-        assert_eq!(actual.len(), 1);
+        assert_eq!(actual.len(), crate::fixture::POD_COUNT);
         assert!(
-            actual[0]
-                .chunks
+            actual
                 .iter()
+                .flat_map(|series| &series.chunks)
                 .all(|chunk| chunk.encoding == expected_encoding)
         );
     }
-
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-fn go_bucket_store_series(
-    generator_directory: &std::path::Path,
-    blocks: &std::path::Path,
-    metric: &str,
-) -> Vec<OracleSeries> {
-    let output = std::process::Command::new("go")
-        .args([
-            "run",
-            "-tags=slicelabels",
-            "./cmd/store-oracle",
-            "--bucket",
-            blocks.to_str().unwrap(),
-            "--metric",
-            metric,
-        ])
-        .current_dir(generator_directory)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "Go BucketStore oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 async fn reader_series(service: &ThanosStoreService, metric: &str) -> Vec<OracleSeries> {

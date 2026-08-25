@@ -5,5 +5,9 @@
 !build.rs
 !src/
 !src/**
+!benches/
+!benches/**
+!e2e/
+!e2e/**
 !proto/
 !proto/**

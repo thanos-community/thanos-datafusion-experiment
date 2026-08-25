@@ -32,6 +32,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && rm -rf src benches e2e
 
 COPY src ./src
+COPY benches ./benches
+COPY e2e ./e2e
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,id=thanos-v1-reader-target-${TARGETARCH},target=/app/target \

@@ -85,7 +85,7 @@ async fn deletion_mark_grace_and_refresh_match_go() {
         &repository,
         &cache,
         Duration::from_secs(DELAY_SECONDS),
-        clock.now(),
+        SystemTime::now(),
     )
     .await;
     let state = service.shared_state();

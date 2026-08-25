@@ -366,11 +366,6 @@ async fn read_block_meta(
     if block_has_deletion_mark(task.storage_repository.operator(), &task.block_path).await? {
         metrics::counter!("thanos_reader_block_index_blocks_skipped_deleted_total").increment(1);
         metrics::counter!("thanos_reader_block_index_metadata_blocks_examined_total").increment(1);
-        tracing::trace!(
-            repository = %task.repository.name,
-            block_path = %task.block_path,
-            "skipping deleted Thanos block"
-        );
         return Ok(MetaReadResult::SkippedDeleted);
     }
 

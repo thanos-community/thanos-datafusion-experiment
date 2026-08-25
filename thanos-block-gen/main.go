@@ -41,6 +41,7 @@ type config struct {
 	maxt           int64
 	samples        int
 	externalLabels map[string]string
+	internalLabels map[string]string
 	instances      int
 	pods           int
 	routes         int
@@ -133,6 +134,7 @@ func parseConfig(args []string) (config, error) {
 	flags := flag.NewFlagSet("thanos-block-gen", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	var externalLabels labelFlags
+	var internalLabels labelFlags
 	flags.StringVar(&cfg.output, "output", cfg.output, "directory in which to write block ULID directories")
 	flags.Int64Var(&cfg.mint, "mint", cfg.mint, "minimum sample timestamp in Unix milliseconds")
 	flags.Int64Var(&cfg.maxt, "maxt", cfg.maxt, "exclusive maximum sample timestamp in Unix milliseconds")
@@ -143,6 +145,7 @@ func parseConfig(args []string) (config, error) {
 	flags.IntVar(&cfg.nativeSeries, "native-series", cfg.nativeSeries, "number of integer and float native histogram series")
 	flags.BoolVar(&cfg.scalarEdges, "scalar-edge-cases", false, "include counter resets, special gauge values, and zero histograms")
 	flags.Var(&externalLabels, "external-label", "external label in name=value form; repeatable")
+	flags.Var(&internalLabels, "internal-label", "internal series label in name=value form; repeatable")
 	flags.BoolVar(&cfg.clean, "clean", false, "remove the output directory before generating blocks")
 	flags.BoolVar(&cfg.downsample5m, "downsample-5m", true, "also generate a 5-minute downsampled block")
 	flags.BoolVar(&cfg.downsample1h, "downsample-1h", false, "also generate a 1-hour block from the 5-minute block")
@@ -170,6 +173,14 @@ func parseConfig(args []string) (config, error) {
 			return config{}, fmt.Errorf("invalid --external-label %q; expected name=value", raw)
 		}
 		cfg.externalLabels[name] = value
+	}
+	cfg.internalLabels = make(map[string]string, len(internalLabels))
+	for _, raw := range internalLabels {
+		name, value, ok := strings.Cut(raw, "=")
+		if !ok || name == "" || name == labels.MetricName {
+			return config{}, fmt.Errorf("invalid --internal-label %q; expected non-__name__ name=value", raw)
+		}
+		cfg.internalLabels[name] = value
 	}
 	return cfg, nil
 }
@@ -391,7 +402,7 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 			if cfg.scalarEdges && i == cfg.samples/2 {
 				counterValue = float64(10 + pod)
 			}
-			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_requests_total", "instance", instanceLabel, "job", fixtureLabels.job, "method", "GET", "pod", podLabel), timestamp, counterValue); err != nil {
+			if err := appendFloat(app, withInternalLabels(labels.FromStrings(labels.MetricName, "dummy_requests_total", "instance", instanceLabel, "job", fixtureLabels.job, "method", "GET", "pod", podLabel), cfg.internalLabels), timestamp, counterValue); err != nil {
 				return err
 			}
 			gaugeValue := 20 + float64(instance)/10 + math.Sin(float64(i+pod)/6)*4
@@ -407,7 +418,7 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 					gaugeValue = math.Float64frombits(value.StaleNaN)
 				}
 			}
-			if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_temperature_celsius", "instance", instanceLabel, "job", fixtureLabels.job, "pod", podLabel, "room", "lab"), timestamp, gaugeValue); err != nil {
+			if err := appendFloat(app, withInternalLabels(labels.FromStrings(labels.MetricName, "dummy_temperature_celsius", "instance", instanceLabel, "job", fixtureLabels.job, "pod", podLabel, "room", "lab"), cfg.internalLabels), timestamp, gaugeValue); err != nil {
 				return err
 			}
 		}
@@ -419,15 +430,15 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 				if cfg.scalarEdges && i == 0 {
 					observations = 0
 				}
-				if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_sum", "job", fixtureLabels.job, "pod", podLabel, "route", routeLabel), timestamp, observations*0.42); err != nil {
+				if err := appendFloat(app, withInternalLabels(labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_sum", "job", fixtureLabels.job, "pod", podLabel, "route", routeLabel), cfg.internalLabels), timestamp, observations*0.42); err != nil {
 					return err
 				}
-				if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_count", "job", fixtureLabels.job, "pod", podLabel, "route", routeLabel), timestamp, observations); err != nil {
+				if err := appendFloat(app, withInternalLabels(labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_count", "job", fixtureLabels.job, "pod", podLabel, "route", routeLabel), cfg.internalLabels), timestamp, observations); err != nil {
 					return err
 				}
 				for bucketIndex, bound := range classicBounds {
 					count := math.Min(observations, float64((bucketIndex+1)*(i+2)))
-					if err := appendFloat(app, labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_bucket", "job", fixtureLabels.job, "le", strconv.FormatFloat(bound, 'g', -1, 64), "pod", podLabel, "route", routeLabel), timestamp, count); err != nil {
+					if err := appendFloat(app, withInternalLabels(labels.FromStrings(labels.MetricName, "dummy_request_duration_seconds_bucket", "job", fixtureLabels.job, "le", strconv.FormatFloat(bound, 'g', -1, 64), "pod", podLabel, "route", routeLabel), cfg.internalLabels), timestamp, count); err != nil {
 						return err
 					}
 				}
@@ -438,11 +449,11 @@ func appendDummySamples(ctx context.Context, head *tsdb.Head, cfg config) error 
 			seriesLabel := fixtureLabels.series[series]
 			for pod := 0; pod < pods; pod++ {
 				podLabel := fixtureLabels.pods[pod]
-				if _, err := app.AppendHistogram(0, labels.FromStrings(labels.MetricName, "dummy_native_histogram", "job", fixtureLabels.job, "pod", podLabel, "series", seriesLabel), timestamp, nativeHistogram(i+series+pod), nil); err != nil {
+				if _, err := app.AppendHistogram(0, withInternalLabels(labels.FromStrings(labels.MetricName, "dummy_native_histogram", "job", fixtureLabels.job, "pod", podLabel, "series", seriesLabel), cfg.internalLabels), timestamp, nativeHistogram(i+series+pod), nil); err != nil {
 					_ = app.Rollback()
 					return fmt.Errorf("append native histogram: %w", err)
 				}
-				if _, err := app.AppendHistogram(0, labels.FromStrings(labels.MetricName, "dummy_float_native_histogram", "job", fixtureLabels.job, "pod", podLabel, "series", seriesLabel), timestamp, nil, floatNativeHistogram(i+series+pod)); err != nil {
+				if _, err := app.AppendHistogram(0, withInternalLabels(labels.FromStrings(labels.MetricName, "dummy_float_native_histogram", "job", fixtureLabels.job, "pod", podLabel, "series", seriesLabel), cfg.internalLabels), timestamp, nil, floatNativeHistogram(i+series+pod)); err != nil {
 					_ = app.Rollback()
 					return fmt.Errorf("append float native histogram: %w", err)
 				}
@@ -489,6 +500,14 @@ func appendFloat(app storage.Appender, labels labels.Labels, timestamp int64, va
 		return fmt.Errorf("append float sample: %w", err)
 	}
 	return nil
+}
+
+func withInternalLabels(series labels.Labels, internal map[string]string) labels.Labels {
+	builder := labels.NewBuilder(series)
+	for name, value := range internal {
+		builder.Set(name, value)
+	}
+	return builder.Labels()
 }
 
 func nativeHistogram(i int) *histogram.Histogram {

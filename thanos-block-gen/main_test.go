@@ -80,6 +80,22 @@ func TestParseConfigRejectsTooShortRange(t *testing.T) {
 	}
 }
 
+func TestParseConfigAcceptsInternalFixtureLabels(t *testing.T) {
+	cfg, err := parseConfig([]string{
+		"--internal-label", "replica=internal",
+		"--internal-label", "zone=test",
+	})
+	if err != nil {
+		t.Fatalf("parse internal labels: %v", err)
+	}
+	if got := cfg.internalLabels["replica"]; got != "internal" {
+		t.Fatalf("internal replica = %q, want internal", got)
+	}
+	if got := cfg.internalLabels["zone"]; got != "test" {
+		t.Fatalf("internal zone = %q, want test", got)
+	}
+}
+
 func TestDefaultConfigCreatesDenseOneHourFixture(t *testing.T) {
 	cfg, err := parseConfig(nil)
 	if err != nil {

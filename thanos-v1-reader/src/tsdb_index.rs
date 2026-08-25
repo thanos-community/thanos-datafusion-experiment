@@ -37,6 +37,17 @@ impl std::error::Error for IndexError {}
 
 /// Parse a Prometheus TSDB index v1 or v2 file into expanded series and chunk metadata.
 pub fn parse(bytes: &[u8]) -> Result<Vec<Series>, IndexError> {
+    let mut series = Vec::new();
+    parse_each(bytes, |entry| series.push(entry))?;
+    Ok(series)
+}
+
+/// Parse a Prometheus TSDB index v1 or v2 file and deliver each series as it is decoded.
+///
+/// This avoids retaining the complete expanded index when callers can process a series at a
+/// time. In particular, large production blocks can contain millions of series, so building a
+/// `Vec<Series>` before writing an on-disk index can exceed a reader's memory limit.
+pub fn parse_each(bytes: &[u8], mut visit: impl FnMut(Series)) -> Result<(), IndexError> {
     if bytes.len() < 5 + TOC_SIZE + CHECKSUM_SIZE {
         return Err(error("index is too short"));
     }
@@ -61,7 +72,6 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Series>, IndexError> {
         return Err(error("invalid series section bounds"));
     }
 
-    let mut series = Vec::new();
     let mut offset = series_start;
     while offset < series_end {
         if bytes[offset] == 0 {
@@ -85,7 +95,7 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Series>, IndexError> {
         }
 
         verify_crc(bytes, body_start, length as usize, "series entry")?;
-        series.push(parse_series(
+        visit(parse_series(
             &bytes[body_start..body_end],
             series_reference,
             &symbols,
@@ -93,7 +103,7 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Series>, IndexError> {
         offset = align_series(checksum_end)?;
     }
 
-    Ok(series)
+    Ok(())
 }
 
 #[derive(Debug)]

@@ -32,6 +32,8 @@ use crate::{
 
 type BoxError = Box<dyn Error>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
+/// Keep index construction well below the reader's 48 GiB production memory limit.
+const CHUNK_INDEX_BATCH_SIZE: usize = 50_000;
 
 #[derive(Debug, Deserialize)]
 struct BlockMeta {
@@ -197,7 +199,11 @@ pub async fn build_block_index(
 
     for repository in repositories {
         let storage_repository = storage.require(&repository.uri)?;
-        let mut lister = storage_repository.operator().lister_with("").recursive(true).await?;
+        let mut lister = storage_repository
+            .operator()
+            .lister_with("")
+            .recursive(true)
+            .await?;
 
         while let Some(entry) = lister.try_next().await? {
             if !entry.path().ends_with("meta.json") {
@@ -234,13 +240,15 @@ pub async fn build_block_index(
 
             let index_path = format!("{block_path}/index");
             let index = storage_repository.read(&index_path).await?;
-            let series = tsdb_index::parse(&index)?;
-            let series_count = series.len();
-            collect_metric_labels(&mut metric_labels, &meta.thanos.labels, &series);
-            let chunk_rows = chunk_rows(repository, &meta, &block_path, series)?;
-            let chunk_count = chunk_rows.len();
             let chunk_index_path = chunk_index_file_path(index_cache_location, &meta.ulid);
-            write_local_file(&chunk_index_path, chunk_parquet_bytes(chunk_rows)?).await?;
+            let (series_count, chunk_count) = write_chunk_index_streaming(
+                repository,
+                &meta,
+                &block_path,
+                &index,
+                &chunk_index_path,
+                &mut metric_labels,
+            )?;
             tracing::debug!(
                 repository = %repository.name,
                 block_ulid = %meta.ulid,
@@ -402,62 +410,146 @@ fn index_row(
     })
 }
 
-fn chunk_rows(
+/// Expand a single block's TSDB index into Parquet without holding the block's full series,
+/// expanded chunks, or encoded Parquet bytes in memory at once.
+fn write_chunk_index_streaming(
     repository: &ThanosRepositoryConfig,
     meta: &BlockMeta,
     block_path: &str,
-    series: Vec<Series>,
-) -> Result<Vec<ChunkIndexRow>, BoxError> {
-    let mut rows = Vec::new();
-    for series in series {
-        let series_mint = series
-            .chunks
-            .first()
-            .map(|chunk| chunk.mint)
-            .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
-        let series_maxt = series
-            .chunks
-            .last()
-            .map(|chunk| chunk.maxt)
-            .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
-        let metric_name = series
-            .labels
-            .get("__name__")
-            .ok_or_else(|| invalid_data("series is missing __name__ label".to_owned()))?
-            .clone();
-        let mut labels = series.labels.clone();
-        for (name, value) in &meta.thanos.labels {
-            labels.entry(name.clone()).or_insert_with(|| value.clone());
-        }
-        let labels_json = serde_json::to_string(&labels)?;
-
-        for chunk in series.chunks {
-            let chunk_file_seq = (chunk.reference >> 32) as u32;
-            let chunk_file_offset = chunk.reference & u64::from(u32::MAX);
-            rows.push(ChunkIndexRow {
-                repository_name: repository.name.clone(),
-                repository_uri: repository.uri.clone(),
-                block_ulid: meta.ulid.clone(),
-                block_path: block_path.to_owned(),
-                downsample_resolution: meta.thanos.downsample.resolution,
-                metric_name: metric_name.clone(),
-                // TSDB chunk references use a zero-based segment sequence while block
-                // segment filenames begin at 000001.
-                chunk_file_path: format!("{block_path}/chunks/{:06}", chunk_file_seq + 1),
-                chunk_ref: chunk.reference,
-                chunk_file_seq,
-                chunk_file_offset,
-                series_ref: series.reference,
-                series_mint,
-                series_maxt,
-                chunk_mint: chunk.mint,
-                chunk_maxt: chunk.maxt,
-                labels: labels.clone(),
-                labels_json: labels_json.clone(),
-            });
-        }
+    index: &[u8],
+    chunk_index_path: &str,
+    metric_labels: &mut BTreeMap<String, BTreeSet<String>>,
+) -> Result<(usize, usize), BoxError> {
+    let path = Path::new(
+        chunk_index_path
+            .strip_prefix("file://")
+            .unwrap_or(chunk_index_path),
+    );
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid_data(format!("invalid chunk index path {path:?}")))?;
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
     }
-    Ok(rows)
+    let temporary_path = path.with_file_name(format!("{}.partial", file_name.to_string_lossy()));
+    let file = fs::File::create(&temporary_path)?;
+    let schema = chunk_schema();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(parquet_properties()))?;
+    let mut rows = Vec::with_capacity(CHUNK_INDEX_BATCH_SIZE);
+    let mut series_count = 0;
+    let mut chunk_count = 0;
+    let mut write_error: Option<BoxError> = None;
+
+    let parsed = tsdb_index::parse_each(index, |series| {
+        if write_error.is_some() {
+            return;
+        }
+        series_count += 1;
+        collect_metric_labels(
+            metric_labels,
+            &meta.thanos.labels,
+            std::slice::from_ref(&series),
+        );
+        match append_chunk_rows(repository, meta, block_path, series, &mut rows) {
+            Ok(count) => {
+                chunk_count += count;
+                if rows.len() >= CHUNK_INDEX_BATCH_SIZE {
+                    if let Err(error) = flush_chunk_rows(&mut writer, &schema, &mut rows) {
+                        write_error = Some(error);
+                    }
+                }
+            }
+            Err(error) => write_error = Some(error),
+        }
+    });
+
+    let result = match parsed {
+        Err(error) => Err(Box::new(error) as BoxError),
+        Ok(()) => match write_error {
+            Some(error) => Err(error),
+            None => {
+                flush_chunk_rows(&mut writer, &schema, &mut rows)?;
+                writer.close()?;
+                fs::rename(&temporary_path, path)?;
+                Ok((series_count, chunk_count))
+            }
+        },
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn append_chunk_rows(
+    repository: &ThanosRepositoryConfig,
+    meta: &BlockMeta,
+    block_path: &str,
+    series: Series,
+    rows: &mut Vec<ChunkIndexRow>,
+) -> Result<usize, BoxError> {
+    let series_mint = series
+        .chunks
+        .first()
+        .map(|chunk| chunk.mint)
+        .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+    let series_maxt = series
+        .chunks
+        .last()
+        .map(|chunk| chunk.maxt)
+        .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+    let metric_name = series
+        .labels
+        .get("__name__")
+        .ok_or_else(|| invalid_data("series is missing __name__ label".to_owned()))?
+        .clone();
+    let mut labels = series.labels;
+    for (name, value) in &meta.thanos.labels {
+        labels.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    let labels_json = serde_json::to_string(&labels)?;
+    let count = series.chunks.len();
+    for chunk in series.chunks {
+        let chunk_file_seq = (chunk.reference >> 32) as u32;
+        let chunk_file_offset = chunk.reference & u64::from(u32::MAX);
+        rows.push(ChunkIndexRow {
+            repository_name: repository.name.clone(),
+            repository_uri: repository.uri.clone(),
+            block_ulid: meta.ulid.clone(),
+            block_path: block_path.to_owned(),
+            downsample_resolution: meta.thanos.downsample.resolution,
+            metric_name: metric_name.clone(),
+            chunk_file_path: format!("{block_path}/chunks/{:06}", chunk_file_seq + 1),
+            chunk_ref: chunk.reference,
+            chunk_file_seq,
+            chunk_file_offset,
+            series_ref: series.reference,
+            series_mint,
+            series_maxt,
+            chunk_mint: chunk.mint,
+            chunk_maxt: chunk.maxt,
+            labels: labels.clone(),
+            labels_json: labels_json.clone(),
+        });
+    }
+    Ok(count)
+}
+
+fn flush_chunk_rows(
+    writer: &mut ArrowWriter<fs::File>,
+    schema: &Arc<Schema>,
+    rows: &mut Vec<ChunkIndexRow>,
+) -> Result<(), BoxError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writer.write(&chunk_record_batch(schema, rows)?)?;
+    writer.flush()?;
+    rows.clear();
+    Ok(())
 }
 
 fn collect_metric_labels(
@@ -489,6 +581,7 @@ fn block_parquet_bytes(rows: Vec<BlockIndexRow>) -> Result<Vec<u8>, BoxError> {
     parquet_bytes(schema, batch)
 }
 
+#[cfg(test)]
 fn chunk_parquet_bytes(rows: Vec<ChunkIndexRow>) -> Result<Vec<u8>, BoxError> {
     let schema = chunk_schema();
     let batch = chunk_record_batch(&schema, &rows)?;
@@ -511,7 +604,7 @@ fn parquet_properties() -> WriterProperties {
         .set_write_page_header_statistics(true)
         .set_statistics_truncate_length(None)
         .set_column_index_truncate_length(None)
-        .set_max_row_group_row_count(Some(usize::MAX))
+        .set_max_row_group_row_count(Some(CHUNK_INDEX_BATCH_SIZE))
         .build()
 }
 
@@ -1048,7 +1141,15 @@ mod tests {
             }],
         }];
 
-        let rows = chunk_rows(&repository, &meta, &meta.ulid, series).unwrap();
+        let mut rows = Vec::new();
+        append_chunk_rows(
+            &repository,
+            &meta,
+            &meta.ulid,
+            series.into_iter().next().unwrap(),
+            &mut rows,
+        )
+        .unwrap();
 
         assert_eq!(rows[0].labels["cluster"], "production");
         assert_eq!(

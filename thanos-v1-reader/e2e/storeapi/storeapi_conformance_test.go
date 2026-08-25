@@ -1,4 +1,4 @@
-package main
+package storeapi
 
 import (
 	"bytes"
@@ -182,8 +182,12 @@ func startConformanceReader(t *testing.T, binary string) readerProcess {
 	root := t.TempDir()
 	blocks := filepath.Join(root, "blocks")
 	createConformanceBlock(t, blocks)
-	address := freeAddress(t)
-	metricsAddress := freeAddress(t)
+	listener := reserveListener(t)
+	metricsListener := reserveListener(t)
+	address := listener.Addr().String()
+	metricsAddress := metricsListener.Addr().String()
+	listenerFD := listenerFile(t, listener)
+	metricsListenerFD := listenerFile(t, metricsListener)
 	configPath := filepath.Join(root, "reader.toml")
 	config := fmt.Sprintf("listen_addr = %q\nmetrics_listen_addr = %q\nindex_cache_location = %q\n\n[[repositories]]\nname = \"acceptance\"\nuri = %q\n", address, metricsAddress, filepath.Join(root, "cache"), "file://"+blocks)
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
@@ -192,12 +196,28 @@ func startConformanceReader(t *testing.T, binary string) readerProcess {
 
 	var output bytes.Buffer
 	command := exec.Command(binary)
-	command.Env = append(os.Environ(), "THANOS_READER_CONFIG="+configPath, "OTEL_SDK_DISABLED=true", "RUST_LOG=info")
+	command.Env = append(
+		os.Environ(),
+		"THANOS_READER_CONFIG="+configPath,
+		"THANOS_READER_LISTEN_FD=3",
+		"THANOS_READER_METRICS_LISTEN_FD=4",
+		"OTEL_SDK_DISABLED=true",
+		"RUST_LOG=info",
+	)
+	command.ExtraFiles = []*os.File{listenerFD, metricsListenerFD}
 	command.Stdout = &output
 	command.Stderr = &output
 	if err := command.Start(); err != nil {
+		_ = listenerFD.Close()
+		_ = metricsListenerFD.Close()
+		_ = listener.Close()
+		_ = metricsListener.Close()
 		t.Fatalf("start reader: %v", err)
 	}
+	_ = listenerFD.Close()
+	_ = metricsListenerFD.Close()
+	_ = listener.Close()
+	_ = metricsListener.Close()
 	t.Cleanup(func() {
 		if command.Process != nil {
 			_ = command.Process.Kill()
@@ -301,12 +321,26 @@ func equalStrings(got, want []string) bool {
 	return strings.Join(got, "\n") == strings.Join(want, "\n")
 }
 
-func freeAddress(t *testing.T) string {
+func reserveListener(t *testing.T) *net.TCPListener {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve port: %v", err)
+		t.Fatalf("reserve listener: %v", err)
 	}
-	defer listener.Close()
-	return listener.Addr().String()
+	tcpListener, ok := listener.(*net.TCPListener)
+	if !ok {
+		_ = listener.Close()
+		t.Fatal("reserved listener is not TCP")
+	}
+	return tcpListener
+}
+
+func listenerFile(t *testing.T, listener *net.TCPListener) *os.File {
+	t.Helper()
+	file, err := listener.File()
+	if err != nil {
+		_ = listener.Close()
+		t.Fatalf("duplicate listener file descriptor: %v", err)
+	}
+	return file
 }

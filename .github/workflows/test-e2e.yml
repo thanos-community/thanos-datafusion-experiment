@@ -51,7 +51,7 @@ jobs:
         with:
           go-version-file: thanos-block-gen/go.mod
           cache: true
-          cache-dependency-path: thanos-block-gen/go.sum
+          cache-dependency-path: thanos-v1-reader/e2e/storeapi/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:

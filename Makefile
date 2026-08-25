@@ -19,7 +19,7 @@ reader-watch:
 	cd thanos-v1-reader && cargo watch -w src -w Cargo.toml -w dev.toml -x run
 
 e2e-test:
-	cd thanos-v1-reader && cargo test --test e2e
+	cd thanos-v1-reader && cargo test --tests
 	$(MAKE) store-api-conformance-test
 
 store-api-conformance-test:

@@ -1,56 +1,116 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
 };
 
 use arrow::{
-    array::{Array, ArrayRef, Int64Array, StringArray, StringViewArray, UInt64Array},
+    array::{Array, ArrayRef, Int64Array, ListArray, StringArray, StringViewArray, UInt64Array},
     record_batch::RecordBatch,
 };
 use datafusion::prelude::SessionContext;
 use futures::Stream;
+use opendal::Operator;
+use prost::Message;
 use regex::Regex;
+use tokio::sync::RwLock;
 use tokio_stream::iter;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    chunk_reader::{self, EncodedChunk},
+    block_index::repository_operator,
+    chunk_reader::{self, EncodedAggregateChunk, EncodedAggregateEncoding, EncodedChunk},
     config::ThanosRepositoryConfig,
-    storage::RepositoryRegistry,
+    thanos_proto::hintspb,
     thanos_proto::thanos::{
         self, Aggr, AggrChunk, Chunk, Label, LabelMatcher, Series, SeriesBatch, SeriesResponse,
         info, store_server::Store,
     },
 };
 
-type BoxError = Box<dyn Error>;
+type BoxError = Box<dyn Error + Send + Sync>;
 type SeriesStream = Pin<Box<dyn Stream<Item = Result<SeriesResponse, Status>> + Send>>;
+const SERIES_RESPONSE_HINTS_TYPE_URL: &str = "type.googleapis.com/hintspb.SeriesResponseHints";
+const LABEL_NAMES_RESPONSE_HINTS_TYPE_URL: &str =
+    "type.googleapis.com/hintspb.LabelNamesResponseHints";
+const LABEL_VALUES_RESPONSE_HINTS_TYPE_URL: &str =
+    "type.googleapis.com/hintspb.LabelValuesResponseHints";
+const BLOCK_ID_LABEL: &str = "__block_id";
 
 #[derive(Clone)]
 pub struct ThanosStoreService {
-    descriptors: Arc<Vec<ChunkDescriptor>>,
-    blocks: Arc<Vec<BlockMetadata>>,
-    storage: RepositoryRegistry,
+    state: SharedReaderState,
+}
+
+#[derive(Clone)]
+pub struct SharedReaderState {
+    snapshot: Arc<RwLock<Arc<ReaderSnapshot>>>,
+}
+
+pub struct ReaderQuerySnapshot {
+    snapshot: Arc<ReaderSnapshot>,
+}
+
+struct ReaderSnapshot {
+    context: SessionContext,
+    descriptors: Vec<ChunkDescriptor>,
+    blocks: Vec<BlockMetadata>,
+    operators: BTreeMap<String, Operator>,
+    _cache_generation: Option<SnapshotCacheGeneration>,
+}
+
+struct SnapshotCacheGeneration {
+    path: PathBuf,
+}
+
+impl Drop for SnapshotCacheGeneration {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to remove retired reader snapshot cache"
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
 struct ChunkDescriptor {
     repository_uri: String,
+    block_ulid: String,
     chunk_file_path: String,
     chunk_file_offset: u64,
     chunk_mint: i64,
     chunk_maxt: i64,
-    downsample_resolution: i64,
     labels: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
 struct BlockMetadata {
+    repository_uri: String,
+    block_ulid: String,
     min_time: i64,
     max_time: i64,
+    downsample_resolution: i64,
     external_labels: BTreeMap<String, String>,
+    compaction_sources: Vec<String>,
+}
+
+impl ChunkDescriptor {
+    fn block_key(&self) -> (String, String) {
+        (self.repository_uri.clone(), self.block_ulid.clone())
+    }
+}
+
+impl BlockMetadata {
+    fn key(&self) -> (String, String) {
+        (self.repository_uri.clone(), self.block_ulid.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -64,18 +124,93 @@ enum Matcher {
 impl ThanosStoreService {
     pub async fn new(
         context: SessionContext,
-        _repositories: &[ThanosRepositoryConfig],
-        storage: RepositoryRegistry,
+        repositories: &[ThanosRepositoryConfig],
     ) -> Result<Self, BoxError> {
-        let descriptors = load_descriptors(&context).await?;
-        let blocks = load_blocks(&context).await?;
+        let snapshot = ReaderSnapshot::new(context, repositories, None).await?;
         Ok(Self {
-            descriptors: Arc::new(descriptors),
-            blocks: Arc::new(blocks),
-            storage,
+            state: SharedReaderState {
+                snapshot: Arc::new(RwLock::new(Arc::new(snapshot))),
+            },
         })
     }
 
+    pub fn shared_state(&self) -> SharedReaderState {
+        self.state.clone()
+    }
+}
+
+impl SharedReaderState {
+    pub async fn query_snapshot(&self) -> ReaderQuerySnapshot {
+        ReaderQuerySnapshot {
+            snapshot: self.load().await,
+        }
+    }
+
+    pub async fn replace(
+        &self,
+        context: SessionContext,
+        repositories: &[ThanosRepositoryConfig],
+        cache_generation: PathBuf,
+    ) -> Result<(), BoxError> {
+        let snapshot = match ReaderSnapshot::new(
+            context,
+            repositories,
+            Some(cache_generation.clone()),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(cache_generation);
+                return Err(error);
+            }
+        };
+        let retired = {
+            let mut current = self.snapshot.write().await;
+            std::mem::replace(&mut *current, Arc::new(snapshot))
+        };
+        drop(retired);
+        Ok(())
+    }
+
+    async fn load(&self) -> Arc<ReaderSnapshot> {
+        self.snapshot.read().await.clone()
+    }
+}
+
+impl ReaderQuerySnapshot {
+    pub fn context(&self) -> &SessionContext {
+        &self.snapshot.context
+    }
+}
+
+impl ReaderSnapshot {
+    async fn new(
+        context: SessionContext,
+        repositories: &[ThanosRepositoryConfig],
+        cache_generation: Option<PathBuf>,
+    ) -> Result<Self, BoxError> {
+        let mut descriptors = load_descriptors(&context).await?;
+        let mut blocks = load_blocks(&context).await?;
+        let duplicate_blocks = duplicate_block_keys(&blocks);
+        blocks.retain(|block| !duplicate_blocks.contains(&block.key()));
+        descriptors.retain(|descriptor| !duplicate_blocks.contains(&descriptor.block_key()));
+        let operators = repositories
+            .iter()
+            .map(|repository| {
+                repository_operator(&repository.uri)
+                    .map(|operator| (repository.uri.clone(), operator))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+        Ok(Self {
+            context,
+            descriptors,
+            blocks,
+            operators,
+            _cache_generation: cache_generation.map(|path| SnapshotCacheGeneration { path }),
+        })
+    }
     fn matching_descriptors<'a>(
         &'a self,
         start: i64,
@@ -91,37 +226,85 @@ impl ThanosStoreService {
             .collect()
     }
 
+    fn selected_blocks(
+        &self,
+        start: i64,
+        end: i64,
+        max_resolution: i64,
+        series_matchers: &[Matcher],
+        block_matchers: &[Matcher],
+    ) -> Vec<&BlockMetadata> {
+        let mut block_sets = BTreeMap::<Vec<(String, String)>, Vec<&BlockMetadata>>::new();
+        for block in self.blocks.iter() {
+            block_sets
+                .entry(labels_key(&block.external_labels))
+                .or_default()
+                .push(block);
+        }
+        block_sets
+            .into_values()
+            .filter(|blocks| block_set_matches_series(blocks[0], series_matchers))
+            .flat_map(|blocks| select_blocks(&blocks, start, end, max_resolution, block_matchers))
+            .collect()
+    }
+
+    fn label_endpoint_blocks(
+        &self,
+        start: i64,
+        end: i64,
+        series_matchers: &[Matcher],
+        block_matchers: &[Matcher],
+    ) -> Vec<&BlockMetadata> {
+        self.blocks
+            .iter()
+            .filter(|block| {
+                block.min_time <= end
+                    && start < block.max_time
+                    && block_set_matches_series(block, series_matchers)
+                    && block_matches_hints(block, block_matchers)
+            })
+            .collect()
+    }
+
     fn info_response(&self) -> info::InfoResponse {
-        let mut ranges = BTreeMap::<Vec<(String, String)>, (i64, i64)>::new();
+        let mut ranges = BTreeMap::<Vec<(String, String)>, Vec<(i64, i64)>>::new();
         for block in self.blocks.iter() {
             let key = labels_key(&block.external_labels);
             ranges
                 .entry(key)
-                .and_modify(|range| {
-                    range.0 = range.0.min(block.min_time);
-                    range.1 = range.1.max(block.max_time);
-                })
-                .or_insert((block.min_time, block.max_time));
+                .or_default()
+                .push((block.min_time, block.max_time));
         }
 
-        let tsdb_infos = ranges
+        let mut tsdb_infos = Vec::new();
+        for (labels, block_ranges) in &mut ranges {
+            block_ranges.sort_by_key(|(min_time, _)| *min_time);
+            let mut ranges = block_ranges.iter().copied();
+            let Some(mut current) = ranges.next() else {
+                continue;
+            };
+            for next in ranges {
+                if next.0 > current.1 {
+                    tsdb_infos.push(tsdb_info(labels, current));
+                    current = next;
+                } else {
+                    current.1 = next.1;
+                }
+            }
+            tsdb_infos.push(tsdb_info(labels, current));
+        }
+        let min_time = self
+            .blocks
             .iter()
-            .map(|(labels, (min_time, max_time))| info::TsdbInfo {
-                labels: Some(thanos::ZLabelSet {
-                    labels: labels
-                        .iter()
-                        .map(|(name, value)| Label {
-                            name: name.clone(),
-                            value: value.clone(),
-                        })
-                        .collect(),
-                }),
-                min_time: *min_time,
-                max_time: *max_time,
-            })
-            .collect::<Vec<_>>();
-        let min_time = ranges.values().map(|(min, _)| *min).min().unwrap_or(0);
-        let max_time = ranges.values().map(|(_, max)| *max).max().unwrap_or(0);
+            .map(|block| block.min_time)
+            .min()
+            .unwrap_or(i64::MAX);
+        let max_time = self
+            .blocks
+            .iter()
+            .map(|block| block.max_time)
+            .max()
+            .unwrap_or(i64::MIN);
 
         info::InfoResponse {
             label_sets: ranges
@@ -140,8 +323,8 @@ impl ThanosStoreService {
             store: Some(info::StoreInfo {
                 min_time,
                 max_time,
-                supports_sharding: false,
-                supports_without_replica_labels: false,
+                supports_sharding: true,
+                supports_without_replica_labels: true,
                 tsdb_infos,
             }),
             rules: None,
@@ -162,59 +345,83 @@ impl Store for ThanosStoreService {
         &self,
         request: Request<thanos::SeriesRequest>,
     ) -> Result<Response<Self::SeriesStream>, Status> {
+        let snapshot = self.state.load().await;
         let request = request.into_inner();
-        reject_unsupported_series_options(&request)?;
         let matchers = compile_matchers(&request.matchers)?;
+        let request_hints = decode_series_request_hints(request.hints.as_ref())?;
+        let block_matchers = compile_matchers(&request_hints.block_matchers)?;
         let aggregates = aggregates(&request.aggregates)?;
         let limit = limit(request.limit)?;
         let abort_on_error = request.partial_response_disabled
             || request.partial_response_strategy == thanos::PartialResponseStrategy::Abort as i32;
 
-        let mut groups = BTreeMap::<Vec<(String, String)>, Vec<&ChunkDescriptor>>::new();
-        for descriptor in self.matching_descriptors(request.min_time, request.max_time, &matchers) {
+        let selected_blocks = snapshot.selected_blocks(
+            request.min_time,
+            request.max_time,
+            request.max_resolution_window,
+            &matchers,
+            &block_matchers,
+        );
+        let selected_block_keys = selected_blocks
+            .iter()
+            .map(|block| block.key())
+            .collect::<BTreeSet<_>>();
+        let selected_block_count = selected_blocks.len();
+        let mut groups =
+            BTreeMap::<(String, String, Vec<(String, String)>), Vec<&ChunkDescriptor>>::new();
+        for descriptor in
+            snapshot.matching_descriptors(request.min_time, request.max_time, &matchers)
+        {
+            if !selected_block_keys.contains(&descriptor.block_key()) {
+                continue;
+            }
             groups
-                .entry(labels_key(&descriptor.labels))
+                .entry((
+                    descriptor.repository_uri.clone(),
+                    descriptor.block_ulid.clone(),
+                    labels_key(&descriptor.labels),
+                ))
                 .or_default()
                 .push(descriptor);
         }
 
-        let mut series_responses = Vec::new();
-        let mut warning_responses = Vec::new();
-        for (_, mut descriptors) in groups {
-            if series_responses.len() >= limit {
-                break;
-            }
-            let selected_resolution = descriptors
-                .iter()
-                .filter(|descriptor| {
-                    if aggregates.contains(&(Aggr::Raw as i32)) {
-                        descriptor.downsample_resolution == 0
-                    } else {
-                        descriptor.downsample_resolution <= request.max_resolution_window
-                    }
-                })
-                .map(|descriptor| descriptor.downsample_resolution)
-                .max();
-            let Some(selected_resolution) = selected_resolution else {
+        let labels_to_remove = request
+            .without_replica_labels
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let mut block_counts = BTreeMap::<(String, String), usize>::new();
+        let mut visible_groups =
+            BTreeMap::<(Vec<(String, String)>, String, String), Vec<&ChunkDescriptor>>::new();
+        for ((repository_uri, block_ulid, original_labels), descriptors) in groups {
+            let visible_labels = original_labels
+                .into_iter()
+                .filter(|(name, _)| !labels_to_remove.contains(name))
+                .collect::<Vec<_>>();
+            if !matches_shard(&visible_labels, request.shard_info.as_ref()) {
                 continue;
-            };
-            descriptors
-                .retain(|descriptor| descriptor.downsample_resolution == selected_resolution);
-            descriptors.sort_by_key(|descriptor| (descriptor.chunk_mint, descriptor.chunk_maxt));
+            }
+            let count = block_counts
+                .entry((repository_uri.clone(), block_ulid.clone()))
+                .or_default();
+            if *count >= limit {
+                continue;
+            }
+            *count += 1;
+            visible_groups
+                .entry((visible_labels, repository_uri, block_ulid))
+                .or_default()
+                .extend(descriptors);
+        }
 
-            let labels = descriptors[0]
-                .labels
-                .iter()
-                .map(|(name, value)| Label {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect();
+        let mut merged_groups = BTreeMap::<Vec<(String, String)>, Vec<Vec<AggrChunk>>>::new();
+        let mut warning_responses = Vec::new();
+        for ((visible_labels, _, _), mut descriptors) in visible_groups {
+            descriptors.sort_by_key(|descriptor| (descriptor.chunk_mint, descriptor.chunk_maxt));
             let mut chunks = Vec::new();
             let mut warnings = Vec::new();
             if !request.skip_chunks {
                 for descriptor in descriptors {
-                    match self.encode_chunk(descriptor, &aggregates).await {
+                    match snapshot.encode_chunk(descriptor, &aggregates).await {
                         Ok(Some(chunk)) => chunks.push(chunk),
                         Ok(None) => {}
                         Err(error) if abort_on_error => return Err(error),
@@ -225,17 +432,45 @@ impl Store for ThanosStoreService {
                         }),
                     }
                 }
+                chunks.sort_by(|left, right| match compare_aggr_chunks(left, right) {
+                    value if value > 0 => std::cmp::Ordering::Less,
+                    value if value < 0 => std::cmp::Ordering::Greater,
+                    _ => std::cmp::Ordering::Equal,
+                });
+                chunks.dedup_by(|left, right| compare_aggr_chunks(left, right) == 0);
             }
             if request.skip_chunks || !chunks.is_empty() {
-                series_responses.push(SeriesResponse {
-                    result: Some(thanos::series_response::Result::Series(Series {
-                        labels,
-                        chunks,
-                    })),
-                });
+                merged_groups
+                    .entry(visible_labels)
+                    .or_default()
+                    .push(chunks);
             }
             warning_responses.extend(warnings);
         }
+
+        let series_responses = merged_groups
+            .into_iter()
+            .map(|(labels, chunk_sets)| {
+                let chunks = chunk_sets.into_iter().fold(Vec::new(), merge_chunks);
+                SeriesResponse {
+                    result: Some(thanos::series_response::Result::Series(Series {
+                        labels: labels
+                            .into_iter()
+                            .map(|(name, value)| Label { name, value })
+                            .collect(),
+                        chunks,
+                    })),
+                }
+            })
+            .collect::<Vec<_>>();
+        let merged_series_count = series_responses.len();
+        let merged_chunks_count = series_responses
+            .iter()
+            .filter_map(|response| match &response.result {
+                Some(thanos::series_response::Result::Series(series)) => Some(series.chunks.len()),
+                _ => None,
+            })
+            .sum::<usize>();
 
         let batch_size = usize::try_from(request.response_batch_size)
             .ok()
@@ -265,6 +500,28 @@ impl Store for ThanosStoreService {
                 .collect()
         };
         responses.extend(warning_responses);
+        let response_hints = hintspb::SeriesResponseHints {
+            queried_blocks: selected_blocks
+                .into_iter()
+                .map(|block| hintspb::Block {
+                    id: block.block_ulid.clone(),
+                })
+                .collect(),
+            query_stats: request_hints
+                .enable_query_stats
+                .then(|| hintspb::QueryStats {
+                    blocks_queried: i64::try_from(selected_block_count).unwrap_or(i64::MAX),
+                    merged_series_count: i64::try_from(merged_series_count).unwrap_or(i64::MAX),
+                    merged_chunks_count: i64::try_from(merged_chunks_count).unwrap_or(i64::MAX),
+                    ..Default::default()
+                }),
+        };
+        responses.push(SeriesResponse {
+            result: Some(thanos::series_response::Result::Hints(prost_types::Any {
+                type_url: SERIES_RESPONSE_HINTS_TYPE_URL.to_owned(),
+                value: response_hints.encode_to_vec(),
+            })),
+        });
         Ok(Response::new(Box::pin(iter(responses.into_iter().map(Ok)))))
     }
 
@@ -272,18 +529,69 @@ impl Store for ThanosStoreService {
         &self,
         request: Request<thanos::LabelNamesRequest>,
     ) -> Result<Response<thanos::LabelNamesResponse>, Status> {
+        let snapshot = self.state.load().await;
         let request = request.into_inner();
-        reject_unsupported_label_options(&request.without_replica_labels, request.hints.is_some())?;
-        let matchers = compile_matchers(&request.matchers)?;
-        let names = self
-            .matching_descriptors(request.start, request.end, &matchers)
-            .into_iter()
-            .flat_map(|descriptor| descriptor.labels.keys().cloned())
+        let matchers = compile_label_endpoint_matchers(&request.matchers)?;
+        let request_hints = decode_label_names_request_hints(request.hints.as_ref())?;
+        let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
+        let blocks =
+            snapshot.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
+        let block_keys = blocks
+            .iter()
+            .map(|block| block.key())
+            .collect::<BTreeSet<_>>();
+        let external_names = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.key(),
+                    block
+                        .external_labels
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let labels_to_remove = request
+            .without_replica_labels
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let has_matchers = !matchers.is_empty();
+        let names = snapshot
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                block_keys.contains(&descriptor.block_key())
+                    && (!has_matchers
+                        || (overlaps(
+                            descriptor.chunk_mint,
+                            descriptor.chunk_maxt,
+                            request.start,
+                            request.end,
+                        ) && matches_label_endpoint_all(&descriptor.labels, &matchers)))
+            })
+            .flat_map(|descriptor| {
+                descriptor.labels.keys().filter(|name| {
+                    !labels_to_remove.contains(name)
+                        || (!has_matchers
+                            && !external_names
+                                .get(&descriptor.block_key())
+                                .is_some_and(|names| names.contains(*name)))
+                })
+            })
+            .cloned()
             .collect::<BTreeSet<_>>();
         Ok(Response::new(thanos::LabelNamesResponse {
-            names: take_limit(names, request.limit)?,
+            names: take_label_limit(names, request.limit),
             warnings: vec![],
-            hints: None,
+            hints: Some(prost_types::Any {
+                type_url: LABEL_NAMES_RESPONSE_HINTS_TYPE_URL.to_owned(),
+                value: hintspb::LabelNamesResponseHints {
+                    queried_blocks: queried_blocks(blocks),
+                }
+                .encode_to_vec(),
+            }),
         }))
     }
 
@@ -291,21 +599,55 @@ impl Store for ThanosStoreService {
         &self,
         request: Request<thanos::LabelValuesRequest>,
     ) -> Result<Response<thanos::LabelValuesResponse>, Status> {
+        let snapshot = self.state.load().await;
         let request = request.into_inner();
-        if request.label.is_empty() {
-            return Err(Status::invalid_argument("label must not be empty"));
+        let matchers = compile_label_endpoint_matchers(&request.matchers)?;
+        if request.without_replica_labels.contains(&request.label) {
+            return Ok(Response::new(thanos::LabelValuesResponse::default()));
         }
-        reject_unsupported_label_options(&request.without_replica_labels, request.hints.is_some())?;
-        let matchers = compile_matchers(&request.matchers)?;
-        let values = self
-            .matching_descriptors(request.start, request.end, &matchers)
-            .into_iter()
-            .filter_map(|descriptor| descriptor.labels.get(&request.label).cloned())
+        let request_hints = decode_label_values_request_hints(request.hints.as_ref())?;
+        let block_matchers = compile_label_endpoint_matchers(&request_hints.block_matchers)?;
+        let blocks =
+            snapshot.label_endpoint_blocks(request.start, request.end, &matchers, &block_matchers);
+        let block_keys = blocks
+            .iter()
+            .map(|block| block.key())
             .collect::<BTreeSet<_>>();
+        let has_matchers = !matchers.is_empty();
+        let mut values = snapshot
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                block_keys.contains(&descriptor.block_key())
+                    && (!has_matchers
+                        || (overlaps(
+                            descriptor.chunk_mint,
+                            descriptor.chunk_maxt,
+                            request.start,
+                            request.end,
+                        ) && matches_label_endpoint_all(&descriptor.labels, &matchers)))
+            })
+            .filter_map(|descriptor| {
+                descriptor
+                    .labels
+                    .get(&request.label)
+                    .filter(|value| !has_matchers || !value.is_empty())
+                    .cloned()
+            })
+            .collect::<BTreeSet<_>>();
+        if !has_matchers && request.label.is_empty() && !blocks.is_empty() {
+            values.insert(String::new());
+        }
         Ok(Response::new(thanos::LabelValuesResponse {
-            values: take_limit(values, request.limit)?,
+            values: take_label_limit(values, request.limit),
             warnings: vec![],
-            hints: None,
+            hints: Some(prost_types::Any {
+                type_url: LABEL_VALUES_RESPONSE_HINTS_TYPE_URL.to_owned(),
+                value: hintspb::LabelValuesResponseHints {
+                    queried_blocks: queried_blocks(blocks),
+                }
+                .encode_to_vec(),
+            }),
         }))
     }
 }
@@ -316,27 +658,28 @@ impl info::info_server::Info for ThanosStoreService {
         &self,
         _request: Request<info::InfoRequest>,
     ) -> Result<Response<info::InfoResponse>, Status> {
-        Ok(Response::new(self.info_response()))
+        let snapshot = self.state.load().await;
+        Ok(Response::new(snapshot.info_response()))
     }
 }
 
-impl ThanosStoreService {
+impl ReaderSnapshot {
     async fn encode_chunk(
         &self,
         descriptor: &ChunkDescriptor,
         aggregates: &BTreeSet<i32>,
     ) -> Result<Option<AggrChunk>, Status> {
-        let repository = self
-            .storage
+        let operator = self
+            .operators
             .get(&descriptor.repository_uri)
             .ok_or_else(|| {
                 Status::internal(format!(
-                    "no storage repository for repository {:?}",
+                    "no object-store operator for repository {:?}",
                     descriptor.repository_uri
                 ))
             })?;
         let chunk = chunk_reader::read_encoded_chunk(
-            repository.as_ref(),
+            operator,
             &descriptor.chunk_file_path,
             descriptor.chunk_file_offset,
         )
@@ -369,11 +712,11 @@ impl ThanosStoreService {
                 max,
                 counter,
             } => {
-                result.count = aggregate_chunk(count, aggregates, Aggr::Count);
-                result.sum = aggregate_chunk(sum, aggregates, Aggr::Sum);
-                result.min = aggregate_chunk(min, aggregates, Aggr::Min);
-                result.max = aggregate_chunk(max, aggregates, Aggr::Max);
-                result.counter = aggregate_chunk(counter, aggregates, Aggr::Counter);
+                result.count = aggregate_chunk(count, aggregates, Aggr::Count)?;
+                result.sum = aggregate_chunk(sum, aggregates, Aggr::Sum)?;
+                result.min = aggregate_chunk(min, aggregates, Aggr::Min)?;
+                result.max = aggregate_chunk(max, aggregates, Aggr::Max)?;
+                result.counter = aggregate_chunk(counter, aggregates, Aggr::Counter)?;
             }
         }
         if result.raw.is_none()
@@ -400,46 +743,214 @@ fn raw_chunk(data: Vec<u8>, encoding: thanos::chunk::Encoding) -> Chunk {
 }
 
 fn aggregate_chunk(
-    data: Option<Vec<u8>>,
+    chunk: Option<EncodedAggregateChunk>,
     aggregates: &BTreeSet<i32>,
     aggregate: Aggr,
-) -> Option<Chunk> {
-    aggregates
-        .contains(&(aggregate as i32))
-        .then_some(data)
-        .flatten()
-        .map(|data| raw_chunk(data, thanos::chunk::Encoding::Xor))
+) -> Result<Option<Chunk>, Status> {
+    if !aggregates.contains(&(aggregate as i32)) {
+        return Ok(None);
+    }
+    let chunk = chunk.ok_or_else(|| {
+        Status::internal(format!(
+            "aggregate {} does not exist",
+            aggregate.as_str_name().to_ascii_lowercase()
+        ))
+    })?;
+    let encoding = match chunk.encoding {
+        EncodedAggregateEncoding::Xor => thanos::chunk::Encoding::Xor,
+        EncodedAggregateEncoding::Histogram => thanos::chunk::Encoding::Histogram,
+        EncodedAggregateEncoding::FloatHistogram => thanos::chunk::Encoding::FloatHistogram,
+    };
+    Ok(Some(raw_chunk(chunk.data, encoding)))
 }
 
-fn reject_unsupported_series_options(request: &thanos::SeriesRequest) -> Result<(), Status> {
-    if request.hints.is_some()
-        || request.shard_info.is_some()
-        || !request.without_replica_labels.is_empty()
-    {
-        return Err(Status::unimplemented(
-            "opaque hints, sharding, and replica-label removal are not supported",
-        ));
+fn decode_series_request_hints(
+    hints: Option<&prost_types::Any>,
+) -> Result<hintspb::SeriesRequestHints, Status> {
+    let Some(hints) = hints else {
+        return Ok(hintspb::SeriesRequestHints::default());
+    };
+    let Some((_, message_name)) = hints.type_url.rsplit_once('/') else {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal series request hints: message type url {:?} is invalid",
+            hints.type_url
+        )));
+    };
+    if message_name != "hintspb.SeriesRequestHints" {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal series request hints: mismatched message type: got {message_name:?} want \"hintspb.SeriesRequestHints\""
+        )));
     }
-    Ok(())
+    hintspb::SeriesRequestHints::decode(hints.value.as_slice()).map_err(|error| {
+        Status::invalid_argument(format!("unmarshal series request hints: {error}"))
+    })
 }
 
-fn reject_unsupported_label_options(
-    without_replica_labels: &[String],
-    has_hints: bool,
-) -> Result<(), Status> {
-    if has_hints || !without_replica_labels.is_empty() {
-        return Err(Status::unimplemented(
-            "opaque hints and replica-label removal are not supported",
-        ));
+fn decode_label_names_request_hints(
+    hints: Option<&prost_types::Any>,
+) -> Result<hintspb::LabelNamesRequestHints, Status> {
+    decode_label_request_hints(
+        hints,
+        "hintspb.LabelNamesRequestHints",
+        "label names",
+        |bytes| hintspb::LabelNamesRequestHints::decode(bytes),
+    )
+}
+
+fn decode_label_values_request_hints(
+    hints: Option<&prost_types::Any>,
+) -> Result<hintspb::LabelValuesRequestHints, Status> {
+    decode_label_request_hints(
+        hints,
+        "hintspb.LabelValuesRequestHints",
+        "label values",
+        |bytes| hintspb::LabelValuesRequestHints::decode(bytes),
+    )
+}
+
+fn decode_label_request_hints<T: Default>(
+    hints: Option<&prost_types::Any>,
+    expected_name: &str,
+    endpoint: &str,
+    decode: impl FnOnce(&[u8]) -> Result<T, prost::DecodeError>,
+) -> Result<T, Status> {
+    let Some(hints) = hints else {
+        return Ok(T::default());
+    };
+    let Some((_, message_name)) = hints.type_url.rsplit_once('/') else {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal {endpoint} request hints: message type url {:?} is invalid",
+            hints.type_url
+        )));
+    };
+    if message_name != expected_name {
+        return Err(Status::invalid_argument(format!(
+            "unmarshal {endpoint} request hints: mismatched message type: got {message_name:?} want {expected_name:?}"
+        )));
     }
-    Ok(())
+    decode(hints.value.as_slice()).map_err(|error| {
+        Status::invalid_argument(format!("unmarshal {endpoint} request hints: {error}"))
+    })
+}
+
+fn queried_blocks(blocks: Vec<&BlockMetadata>) -> Vec<hintspb::Block> {
+    blocks
+        .into_iter()
+        .map(|block| hintspb::Block {
+            id: block.block_ulid.clone(),
+        })
+        .collect()
+}
+
+fn matches_shard(labels: &[(String, String)], shard_info: Option<&thanos::ShardInfo>) -> bool {
+    let Some(shard_info) = shard_info.filter(|shard| shard.total_shards >= 1) else {
+        return true;
+    };
+    let sharding_labels = shard_info.labels.iter().collect::<BTreeSet<_>>();
+    let mut bytes = Vec::new();
+    for (name, value) in labels {
+        let listed = sharding_labels.contains(name);
+        if (shard_info.by && listed) || (!shard_info.by && !listed) {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0xff);
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0xff);
+        }
+    }
+    xxhash_rust::xxh64::xxh64(&bytes, 0) % shard_info.total_shards as u64
+        == shard_info.shard_index as u64
+}
+
+fn merge_chunks(left: Vec<AggrChunk>, right: Vec<AggrChunk>) -> Vec<AggrChunk> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match compare_aggr_chunks(&left[left_index], &right[right_index]) {
+            value if value > 0 => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+            }
+            value if value < 0 => {
+                merged.push(right[right_index].clone());
+                right_index += 1;
+            }
+            _ => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&left[left_index..]);
+    merged.extend_from_slice(&right[right_index..]);
+    merged
+}
+
+fn compare_aggr_chunks(left: &AggrChunk, right: &AggrChunk) -> i32 {
+    if left.min_time != right.min_time {
+        return if left.min_time < right.min_time {
+            1
+        } else {
+            -1
+        };
+    }
+    if left.max_time != right.max_time {
+        return if left.max_time < right.max_time {
+            1
+        } else {
+            -1
+        };
+    }
+    for (left, right) in [
+        (&left.raw, &right.raw),
+        (&left.count, &right.count),
+        (&left.sum, &right.sum),
+        (&left.min, &right.min),
+        (&left.max, &right.max),
+        (&left.counter, &right.counter),
+    ] {
+        let comparison = compare_chunks(left.as_ref(), right.as_ref());
+        if comparison != 0 {
+            return comparison;
+        }
+    }
+    0
+}
+
+fn compare_chunks(left: Option<&Chunk>, right: Option<&Chunk>) -> i32 {
+    match (left, right) {
+        (None, None) => 0,
+        (Some(_), None) => 1,
+        (None, Some(_)) => -1,
+        (Some(left), Some(right)) => {
+            if left.r#type != right.r#type {
+                return if left.r#type < right.r#type { 1 } else { -1 };
+            }
+            match left.data.cmp(&right.data) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
+    }
 }
 
 fn compile_matchers(matchers: &[LabelMatcher]) -> Result<Vec<Matcher>, Status> {
+    compile_matchers_with_validation(matchers, true)
+}
+
+fn compile_label_endpoint_matchers(matchers: &[LabelMatcher]) -> Result<Vec<Matcher>, Status> {
+    compile_matchers_with_validation(matchers, false)
+}
+
+fn compile_matchers_with_validation(
+    matchers: &[LabelMatcher],
+    validate_name: bool,
+) -> Result<Vec<Matcher>, Status> {
     matchers
         .iter()
         .map(|matcher| {
-            if matcher.name.is_empty() {
+            if validate_name && matcher.name.is_empty() {
                 return Err(Status::invalid_argument(
                     "label matcher name must not be empty",
                 ));
@@ -482,6 +993,13 @@ fn matches_all(labels: &BTreeMap<String, String>, matchers: &[Matcher]) -> bool 
     })
 }
 
+fn matches_label_endpoint_all(labels: &BTreeMap<String, String>, matchers: &[Matcher]) -> bool {
+    matchers
+        .iter()
+        .all(|matcher| !matcher_name(matcher).is_empty())
+        && matches_all(labels, matchers)
+}
+
 fn overlaps(min: i64, max: i64, start: i64, end: i64) -> bool {
     min <= end && max >= start
 }
@@ -491,6 +1009,22 @@ fn labels_key(labels: &BTreeMap<String, String>) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+fn tsdb_info(labels: &[(String, String)], range: (i64, i64)) -> info::TsdbInfo {
+    info::TsdbInfo {
+        labels: Some(thanos::ZLabelSet {
+            labels: labels
+                .iter()
+                .map(|(name, value)| Label {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }),
+        min_time: range.0,
+        max_time: range.1,
+    }
 }
 
 fn aggregates(values: &[i32]) -> Result<BTreeSet<i32>, Status> {
@@ -520,16 +1054,176 @@ fn limit(limit: i64) -> Result<usize, Status> {
     })
 }
 
-fn take_limit(values: BTreeSet<String>, requested_limit: i64) -> Result<Vec<String>, Status> {
-    let limit = limit(requested_limit)?;
-    Ok(values.into_iter().take(limit).collect())
+fn take_label_limit(values: BTreeSet<String>, requested_limit: i64) -> Vec<String> {
+    let limit = usize::try_from(requested_limit)
+        .ok()
+        .filter(|limit| *limit > 0)
+        .unwrap_or(usize::MAX);
+    values.into_iter().take(limit).collect()
+}
+
+const BLOCK_RESOLUTIONS: [i64; 3] = [60 * 60 * 1000, 5 * 60 * 1000, 0];
+
+fn select_blocks<'a>(
+    blocks: &[&'a BlockMetadata],
+    mint: i64,
+    maxt: i64,
+    max_resolution: i64,
+    block_matchers: &[Matcher],
+) -> Vec<&'a BlockMetadata> {
+    let Some(resolution_index) = BLOCK_RESOLUTIONS
+        .iter()
+        .position(|resolution| *resolution <= max_resolution)
+    else {
+        return Vec::new();
+    };
+    let by_resolution = BLOCK_RESOLUTIONS
+        .iter()
+        .map(|resolution| {
+            let mut matching = blocks
+                .iter()
+                .copied()
+                .filter(|block| block.downsample_resolution == *resolution)
+                .collect::<Vec<_>>();
+            matching.sort_by_key(|block| (block.min_time, block.max_time));
+            matching
+        })
+        .collect::<Vec<_>>();
+    select_resolution(&by_resolution, resolution_index, mint, maxt, block_matchers)
+}
+
+fn select_resolution<'a>(
+    blocks: &[Vec<&'a BlockMetadata>],
+    resolution_index: usize,
+    mint: i64,
+    maxt: i64,
+    block_matchers: &[Matcher],
+) -> Vec<&'a BlockMetadata> {
+    if mint > maxt {
+        return Vec::new();
+    }
+    let mut selected = Vec::new();
+    let mut start = mint;
+    for &block in &blocks[resolution_index] {
+        if block.max_time <= mint {
+            continue;
+        }
+        if block.min_time > maxt {
+            break;
+        }
+        if resolution_index + 1 < blocks.len() {
+            selected.extend(select_resolution(
+                blocks,
+                resolution_index + 1,
+                start,
+                block.min_time.wrapping_sub(1),
+                block_matchers,
+            ));
+        }
+        if block_matches_hints(block, block_matchers) {
+            selected.push(block);
+        }
+        start = block.max_time;
+    }
+    if resolution_index + 1 < blocks.len() {
+        selected.extend(select_resolution(
+            blocks,
+            resolution_index + 1,
+            start,
+            maxt,
+            block_matchers,
+        ));
+    }
+    selected
+}
+
+fn block_set_matches_series(block: &BlockMetadata, matchers: &[Matcher]) -> bool {
+    matchers.iter().all(|matcher| {
+        let name = matcher_name(matcher);
+        match block.external_labels.get(name) {
+            Some(value) if !value.is_empty() => matcher_matches(matcher, Some(value)),
+            _ => true,
+        }
+    })
+}
+
+fn block_matches_hints(block: &BlockMetadata, matchers: &[Matcher]) -> bool {
+    matchers.iter().all(|matcher| {
+        let value = if matcher_name(matcher) == BLOCK_ID_LABEL {
+            Some(block.block_ulid.as_str())
+        } else {
+            block
+                .external_labels
+                .get(matcher_name(matcher))
+                .map(String::as_str)
+        };
+        matcher_matches(matcher, value)
+    })
+}
+
+fn matcher_name(matcher: &Matcher) -> &str {
+    match matcher {
+        Matcher::Eq(name, _)
+        | Matcher::Neq(name, _)
+        | Matcher::Re(name, _)
+        | Matcher::Nre(name, _) => name,
+    }
+}
+
+fn matcher_matches(matcher: &Matcher, value: Option<&str>) -> bool {
+    let value = value.unwrap_or("");
+    match matcher {
+        Matcher::Eq(_, expected) => value == expected,
+        Matcher::Neq(_, expected) => value != expected,
+        Matcher::Re(_, regex) => regex.is_match(value),
+        Matcher::Nre(_, regex) => !regex.is_match(value),
+    }
+}
+
+fn duplicate_block_keys(blocks: &[BlockMetadata]) -> BTreeSet<(String, String)> {
+    let mut groups = BTreeMap::<(String, i64, Vec<(String, String)>), Vec<&BlockMetadata>>::new();
+    for block in blocks {
+        groups
+            .entry((
+                block.repository_uri.clone(),
+                block.downsample_resolution,
+                labels_key(&block.external_labels),
+            ))
+            .or_default()
+            .push(block);
+    }
+    let mut duplicates = BTreeSet::new();
+    for mut group in groups.into_values() {
+        group.sort_by(|left, right| {
+            right
+                .compaction_sources
+                .len()
+                .cmp(&left.compaction_sources.len())
+                .then_with(|| left.block_ulid.cmp(&right.block_ulid))
+        });
+        let mut covering = Vec::<&BlockMetadata>::new();
+        'blocks: for block in group {
+            for parent in &covering {
+                if block
+                    .compaction_sources
+                    .iter()
+                    .all(|source| parent.compaction_sources.contains(source))
+                {
+                    duplicates.insert(block.key());
+                    continue 'blocks;
+                }
+            }
+            covering.push(block);
+        }
+    }
+    duplicates
 }
 
 async fn load_descriptors(context: &SessionContext) -> Result<Vec<ChunkDescriptor>, BoxError> {
     let batches = context
         .sql(
-            "SELECT repository_uri, chunk_file_path, chunk_file_offset, chunk_mint, chunk_maxt, \
-             downsample_resolution, labels_json FROM chunks",
+            "SELECT repository_uri, block_ulid, chunk_file_path, chunk_file_offset, chunk_mint, \
+             chunk_maxt, labels_json FROM chunks",
         )
         .await?
         .collect()
@@ -544,7 +1238,10 @@ async fn load_descriptors(context: &SessionContext) -> Result<Vec<ChunkDescripto
 
 async fn load_blocks(context: &SessionContext) -> Result<Vec<BlockMetadata>, BoxError> {
     let batches = context
-        .sql("SELECT min_time, max_time, external_labels FROM blocks")
+        .sql(
+            "SELECT repository_uri, block_ulid, min_time, max_time, downsample_resolution, \
+             external_labels, compaction_sources FROM blocks",
+        )
         .await?
         .collect()
         .await?;
@@ -556,21 +1253,21 @@ async fn load_blocks(context: &SessionContext) -> Result<Vec<BlockMetadata>, Box
 
 fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, BoxError> {
     let repository_uri = string_column(batch, "repository_uri")?;
+    let block_ulid = string_column(batch, "block_ulid")?;
     let chunk_file_path = string_column(batch, "chunk_file_path")?;
     let chunk_file_offset = uint64_column(batch, "chunk_file_offset")?;
     let chunk_mint = int64_column(batch, "chunk_mint")?;
     let chunk_maxt = int64_column(batch, "chunk_maxt")?;
-    let downsample_resolution = int64_column(batch, "downsample_resolution")?;
     let labels_json = string_column(batch, "labels_json")?;
     (0..batch.num_rows())
         .map(|index| {
             Ok(ChunkDescriptor {
                 repository_uri: string_value(repository_uri.as_ref(), index)?,
+                block_ulid: string_value(block_ulid.as_ref(), index)?,
                 chunk_file_path: string_value(chunk_file_path.as_ref(), index)?,
                 chunk_file_offset: chunk_file_offset.value(index),
                 chunk_mint: chunk_mint.value(index),
                 chunk_maxt: chunk_maxt.value(index),
-                downsample_resolution: downsample_resolution.value(index),
                 labels: serde_json::from_str(&string_value(labels_json.as_ref(), index)?)?,
             })
         })
@@ -578,18 +1275,31 @@ fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, B
 }
 
 fn blocks_from_batch(batch: &RecordBatch) -> Result<Vec<BlockMetadata>, BoxError> {
+    let repository_uri = string_column(batch, "repository_uri")?;
+    let block_ulid = string_column(batch, "block_ulid")?;
     let min_time = int64_column(batch, "min_time")?;
     let max_time = int64_column(batch, "max_time")?;
+    let downsample_resolution = int64_column(batch, "downsample_resolution")?;
     let external_labels = string_column(batch, "external_labels")?;
+    let compaction_sources = batch
+        .column_by_name("compaction_sources")
+        .ok_or_else(|| std::io::Error::other("missing block index column compaction_sources"))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| std::io::Error::other("invalid block index column compaction_sources"))?;
     (0..batch.num_rows())
         .map(|index| {
             Ok(BlockMetadata {
+                repository_uri: string_value(repository_uri.as_ref(), index)?,
+                block_ulid: string_value(block_ulid.as_ref(), index)?,
                 min_time: min_time.value(index),
                 max_time: max_time.value(index),
+                downsample_resolution: downsample_resolution.value(index),
                 external_labels: serde_json::from_str(&string_value(
                     external_labels.as_ref(),
                     index,
                 )?)?,
+                compaction_sources: string_list_value(compaction_sources, index)?,
             })
         })
         .collect()
@@ -610,6 +1320,17 @@ fn string_value(array: &dyn Array, index: usize) -> Result<String, BoxError> {
         return Ok(array.value(index).to_owned());
     }
     Err("expected a UTF-8 column".into())
+}
+
+fn string_list_value(array: &ListArray, index: usize) -> Result<Vec<String>, BoxError> {
+    let values = array.value(index);
+    let values = values
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| std::io::Error::other("invalid UTF-8 list column"))?;
+    Ok((0..values.len())
+        .map(|index| values.value(index).to_owned())
+        .collect())
 }
 
 fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array, BoxError> {
@@ -635,6 +1356,18 @@ mod tests {
     use super::*;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
+
+    fn block(id: &str, min_time: i64, max_time: i64, resolution: i64) -> BlockMetadata {
+        BlockMetadata {
+            repository_uri: "file:///blocks".to_owned(),
+            block_ulid: id.to_owned(),
+            min_time,
+            max_time,
+            downsample_resolution: resolution,
+            external_labels: BTreeMap::new(),
+            compaction_sources: vec![id.to_owned()],
+        }
+    }
 
     use crate::thanos_proto::thanos::{
         info::{info_client::InfoClient, info_server::InfoServer},
@@ -677,59 +1410,137 @@ mod tests {
     }
 
     #[test]
-    fn raw_queries_choose_raw_resolution() {
-        let descriptors = vec![
-            ChunkDescriptor {
-                repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "raw".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 0,
-                chunk_maxt: 10,
-                downsample_resolution: 0,
-                labels: BTreeMap::new(),
-            },
-            ChunkDescriptor {
-                repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "downsampled".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 0,
-                chunk_maxt: 10,
-                downsample_resolution: 300_000,
-                labels: BTreeMap::new(),
-            },
+    fn shard_matching_uses_go_label_hashing_semantics() {
+        let labels = labels_key(&BTreeMap::from([
+            ("pod".to_owned(), "nginx".to_owned()),
+            ("node".to_owned(), "node-1".to_owned()),
+            ("container".to_owned(), "nginx".to_owned()),
+        ]));
+        assert!(matches_shard(&labels, None));
+        assert!(matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 0,
+                total_shards: 0,
+                by: true,
+                labels: vec![],
+            })
+        ));
+        assert!(!matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 0,
+                total_shards: 2,
+                by: true,
+                labels: vec!["pod".to_owned(), "node".to_owned()],
+            })
+        ));
+        assert!(matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 1,
+                total_shards: 2,
+                by: true,
+                labels: vec!["node".to_owned(), "pod".to_owned()],
+            })
+        ));
+        assert!(matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 0,
+                total_shards: 2,
+                by: false,
+                labels: vec!["node".to_owned()],
+            })
+        ));
+        assert!(!matches_shard(
+            &labels,
+            Some(&thanos::ShardInfo {
+                shard_index: 2,
+                total_shards: 2,
+                by: false,
+                labels: vec![],
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selection_matches_bucket_store_resolution_and_overlap_order() {
+        let blocks = [
+            block("raw-0", 0, 100, 0),
+            block("raw-1a", 100, 200, 0),
+            block("raw-1b", 100, 200, 0),
+            block("raw-2-short", 200, 299, 0),
+            block("raw-2", 200, 300, 0),
+            block("raw-3", 300, 400, 0),
+            block("raw-long", 300, 600, 0),
+            block("raw-4", 400, 500, 0),
+            block("5m-0", 0, 100, 300_000),
+            block("5m-1", 100, 200, 300_000),
+            block("5m-2", 200, 300, 300_000),
+            block("5m-3", 300, 400, 300_000),
+            block("1h-1", 100, 200, 3_600_000),
+            block("1h-2", 200, 300, 3_600_000),
         ];
-        let raw = aggregates(&[Aggr::Raw as i32]).unwrap();
-        assert!(
-            descriptors
-                .iter()
-                .filter(|descriptor| {
-                    raw.contains(&(Aggr::Raw as i32)) && descriptor.downsample_resolution == 0
-                })
-                .all(|descriptor| descriptor.chunk_file_path == "raw")
+        let references = blocks.iter().collect::<Vec<_>>();
+        let selected = select_blocks(&references, 0, 500, 3_600_000, &[])
+            .into_iter()
+            .map(|block| block.block_ulid.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            vec!["5m-0", "1h-1", "1h-2", "5m-3", "raw-long", "raw-4"]
+        );
+    }
+
+    #[test]
+    fn compaction_source_supersets_filter_only_same_group_duplicates() {
+        let mut source = block("source", 0, 100, 0);
+        source.compaction_sources = vec!["a".to_owned()];
+        let mut compacted = block("compacted", 0, 100, 0);
+        compacted.compaction_sources = vec!["a".to_owned(), "b".to_owned()];
+        let mut downsampled = block("downsampled", 0, 100, 300_000);
+        downsampled.compaction_sources = vec!["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            duplicate_block_keys(&[source, compacted, downsampled]),
+            BTreeSet::from([("file:///blocks".to_owned(), "source".to_owned())])
         );
     }
 
     #[tokio::test]
     async fn generated_clients_discover_and_query_the_store_service() {
         let service = ThanosStoreService {
-            descriptors: Arc::new(vec![ChunkDescriptor {
-                repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "unused-when-skipping-chunks".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 100,
-                chunk_maxt: 200,
-                downsample_resolution: 0,
-                labels: BTreeMap::from([
-                    ("__name__".to_owned(), "up".to_owned()),
-                    ("cluster".to_owned(), "test".to_owned()),
-                ]),
-            }]),
-            blocks: Arc::new(vec![BlockMetadata {
-                min_time: 100,
-                max_time: 200,
-                external_labels: BTreeMap::from([("cluster".to_owned(), "test".to_owned())]),
-            }]),
-            storage: RepositoryRegistry::empty(),
+            state: SharedReaderState {
+                snapshot: Arc::new(RwLock::new(Arc::new(ReaderSnapshot {
+                    context: SessionContext::new(),
+                    descriptors: vec![ChunkDescriptor {
+                        repository_uri: "file:///blocks".to_owned(),
+                        block_ulid: "block".to_owned(),
+                        chunk_file_path: "unused-when-skipping-chunks".to_owned(),
+                        chunk_file_offset: 0,
+                        chunk_mint: 100,
+                        chunk_maxt: 200,
+                        labels: BTreeMap::from([
+                            ("__name__".to_owned(), "up".to_owned()),
+                            ("cluster".to_owned(), "test".to_owned()),
+                        ]),
+                    }],
+                    blocks: vec![BlockMetadata {
+                        repository_uri: "file:///blocks".to_owned(),
+                        block_ulid: "block".to_owned(),
+                        min_time: 100,
+                        max_time: 200,
+                        downsample_resolution: 0,
+                        external_labels: BTreeMap::from([(
+                            "cluster".to_owned(),
+                            "test".to_owned(),
+                        )]),
+                        compaction_sources: vec!["block".to_owned()],
+                    }],
+                    operators: BTreeMap::new(),
+                    _cache_generation: None,
+                }))),
+            },
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -750,7 +1561,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(info.component_type, "store");
-        assert_eq!(info.store.unwrap().min_time, 100);
+        let store_info = info.store.unwrap();
+        assert_eq!(store_info.min_time, 100);
+        assert!(store_info.supports_sharding);
+        assert!(store_info.supports_without_replica_labels);
 
         let mut store_client = StoreClient::connect(endpoint).await.unwrap();
         let mut stream = store_client

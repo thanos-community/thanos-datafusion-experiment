@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrayRef, Float64Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
-        StringViewArray, TimestampMillisecondBuilder, UInt64Array,
+        Array, ArrayBuilder, ArrayRef, Float64Builder, Int32Builder, Int64Array, Int64Builder,
+        ListBuilder, StringArray, StringBuilder, StringViewArray, StructBuilder,
+        TimestampMillisecondBuilder, UInt8Builder, UInt32Builder, UInt64Array, UInt64Builder,
     },
     datatypes::{DataType, SchemaRef},
     record_batch::RecordBatch,
@@ -22,12 +23,14 @@ use datafusion::{
     },
 };
 use futures::{TryStreamExt, stream};
+use opendal::Operator as OpendalOperator;
 use regex::Regex;
 
 use crate::{
-    block_index::MetricTableSchema,
-    chunk_reader,
-    storage::RepositoryRegistry,
+    block_index::{MetricTableSchema, repository_operator},
+    chunk_reader::{self, AggregateSelection},
+    config::ThanosRepositoryConfig,
+    histogram::{HistogramBuckets, HistogramCount, HistogramSample, Span},
 };
 
 #[derive(Debug)]
@@ -35,20 +38,28 @@ pub struct MetricTableProvider {
     metric_name: String,
     schema: MetricTableSchema,
     chunk_provider: Arc<dyn TableProvider>,
-    storage: RepositoryRegistry,
+    operators: BTreeMap<String, OpendalOperator>,
 }
 
 impl MetricTableProvider {
     pub fn new(
         schema: MetricTableSchema,
         chunk_provider: Arc<dyn TableProvider>,
-        storage: RepositoryRegistry,
+        repositories: &[ThanosRepositoryConfig],
     ) -> Result<Self> {
+        let operators = repositories
+            .iter()
+            .map(|repository| {
+                repository_operator(&repository.uri)
+                    .map(|operator| (repository.uri.clone(), operator))
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self {
             metric_name: schema.name.clone(),
             schema,
             chunk_provider,
-            storage,
+            operators,
         })
     }
 }
@@ -92,7 +103,7 @@ impl TableProvider for MetricTableProvider {
             self.metric_name.clone(),
             filters,
             self.metric_name.ends_with("_total"),
-            self.storage.clone(),
+            self.operators.clone(),
         )))
     }
 
@@ -121,7 +132,7 @@ struct MetricScanExec {
     metric_name: String,
     filters: Vec<MetricFilter>,
     counter_metric: bool,
-    storage: RepositoryRegistry,
+    operators: BTreeMap<String, OpendalOperator>,
     properties: Arc<PlanProperties>,
 }
 
@@ -133,7 +144,7 @@ impl MetricScanExec {
         metric_name: String,
         filters: Vec<MetricFilter>,
         counter_metric: bool,
-        storage: RepositoryRegistry,
+        operators: BTreeMap<String, OpendalOperator>,
     ) -> Self {
         let output_schema = projected_schema(&schema, projection.as_deref());
         let properties = Arc::new(PlanProperties::new(
@@ -149,7 +160,7 @@ impl MetricScanExec {
             metric_name,
             filters,
             counter_metric,
-            storage,
+            operators,
             properties,
         }
     }
@@ -190,7 +201,7 @@ impl ExecutionPlan for MetricScanExec {
             self.metric_name.clone(),
             self.filters.clone(),
             self.counter_metric,
-            self.storage.clone(),
+            self.operators.clone(),
         )))
     }
 
@@ -205,14 +216,14 @@ impl ExecutionPlan for MetricScanExec {
         let projection = self.projection.clone();
         let metric_name = self.metric_name.clone();
         let filters = self.filters.clone();
-        let storage = self.storage.clone();
+        let operators = self.operators.clone();
         let counter_metric = self.counter_metric;
         let batch = async move {
             let descriptors = child.try_collect::<Vec<_>>().await?;
             build_metric_batch(
                 &metric_schema,
                 projection.as_deref(),
-                &storage,
+                &operators,
                 &metric_name,
                 &filters,
                 counter_metric,
@@ -230,13 +241,22 @@ impl ExecutionPlan for MetricScanExec {
 async fn build_metric_batch(
     schema: &SchemaRef,
     projection: Option<&[usize]>,
-    storage: &RepositoryRegistry,
+    operators: &BTreeMap<String, OpendalOperator>,
     metric_name: &str,
     filters: &[MetricFilter],
     counter_metric: bool,
     descriptors: Vec<RecordBatch>,
 ) -> Result<RecordBatch> {
     let mut rows = Vec::new();
+    let selected_aggregate = filters.iter().find_map(|filter| match filter {
+        MetricFilter::Aggregate { value } => match value.as_str() {
+            "count" => Some(AggregateSelection::Count),
+            "sum" => Some(AggregateSelection::Sum),
+            "counter" => Some(AggregateSelection::Counter),
+            _ => None,
+        },
+        _ => None,
+    });
     for batch in descriptors {
         let repository_uri = string_column(&batch, "repository_uri")?;
         let chunk_file_path = string_column(&batch, "chunk_file_path")?;
@@ -254,9 +274,9 @@ async fn build_metric_batch(
             let repository_uri = string_value(repository_uri.as_ref(), index)?;
             let chunk_file_path = string_value(chunk_file_path.as_ref(), index)?;
             let labels_json = string_value(labels_json.as_ref(), index)?;
-            let repository = storage.get(&repository_uri).ok_or_else(|| {
+            let operator = operators.get(&repository_uri).ok_or_else(|| {
                 DataFusionError::Execution(format!(
-                    "no storage repository for URI {:?}",
+                    "no OpenDAL operator for repository URI {:?}",
                     repository_uri
                 ))
             })?;
@@ -275,10 +295,11 @@ async fn build_metric_batch(
                 continue;
             }
             let samples = chunk_reader::read_samples(
-                repository.as_ref(),
+                operator,
                 &chunk_file_path,
                 chunk_file_offset.value(index),
                 counter_metric,
+                selected_aggregate,
             )
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -291,8 +312,10 @@ async fn build_metric_batch(
                 }
                 rows.push(MetricRow {
                     timestamp: sample.timestamp,
-                    value: sample.value,
+                    value: sample.histogram.is_none().then_some(sample.value),
+                    histogram: sample.histogram,
                     downsample_resolution: resolution.value(index),
+                    aggregate: sample.aggregate.as_str(),
                     labels: labels.clone(),
                 });
             }
@@ -321,6 +344,9 @@ enum MetricFilter {
         regex: Regex,
         negated: bool,
     },
+    Aggregate {
+        value: String,
+    },
 }
 
 impl MetricFilter {
@@ -337,6 +363,7 @@ impl MetricFilter {
             Self::Resolution { operator, value } => {
                 compare_i64(descriptor.downsample_resolution, *operator, *value)
             }
+            Self::Aggregate { .. } => true,
             Self::Label {
                 name,
                 operator,
@@ -377,6 +404,7 @@ impl MetricFilter {
             Self::Resolution { operator, value } => {
                 compare_i64(downsample_resolution, *operator, *value)
             }
+            Self::Aggregate { value } => sample.aggregate.as_str() == value,
             Self::Label {
                 name,
                 operator,
@@ -426,6 +454,13 @@ fn parse_filter(expr: &Expr) -> Option<MetricFilter> {
             scalar_i64(&value).map(|value| MetricFilter::Resolution { operator, value })
         }
         "value" => None,
+        "histogram" => None,
+        "aggregate_kind" => {
+            let value = scalar_string(&value)?;
+            (operator == Operator::Eq
+                && matches!(value.as_str(), "raw" | "count" | "sum" | "counter"))
+            .then_some(MetricFilter::Aggregate { value })
+        }
         _ => {
             let value = scalar_string(&value)?;
             match operator {
@@ -543,8 +578,10 @@ fn compare_str(left: &str, operator: Operator, right: &str) -> bool {
 #[derive(Debug)]
 struct MetricRow {
     timestamp: i64,
-    value: f64,
+    value: Option<f64>,
+    histogram: Option<HistogramSample>,
     downsample_resolution: i64,
+    aggregate: &'static str,
     labels: BTreeMap<String, String>,
 }
 
@@ -567,14 +604,24 @@ fn record_batch(
             ("value", DataType::Float64) => {
                 let mut values = Float64Builder::new();
                 for row in rows {
-                    values.append_value(row.value);
+                    values.append_option(row.value);
                 }
                 columns.push(Arc::new(values.finish()));
+            }
+            ("histogram", DataType::Struct(fields)) => {
+                columns.push(Arc::new(histogram_array(rows, fields.clone())?));
             }
             ("downsample_resolution", DataType::Int64) => {
                 let mut values = Int64Builder::new();
                 for row in rows {
                     values.append_value(row.downsample_resolution);
+                }
+                columns.push(Arc::new(values.finish()));
+            }
+            ("aggregate_kind", DataType::Utf8) => {
+                let mut values = StringBuilder::new();
+                for row in rows {
+                    values.append_value(row.aggregate);
                 }
                 columns.push(Arc::new(values.finish()));
             }
@@ -594,6 +641,266 @@ fn record_batch(
     }
     RecordBatch::try_new(output_schema, columns)
         .map_err(|error| DataFusionError::External(Box::new(error)))
+}
+
+fn histogram_array(
+    rows: &[MetricRow],
+    fields: arrow::datatypes::Fields,
+) -> Result<arrow::array::StructArray> {
+    let span_fields = match fields[9].data_type() {
+        DataType::List(field) => match field.data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "invalid histogram span type".to_owned(),
+                ));
+            }
+        },
+        _ => {
+            return Err(DataFusionError::Internal(
+                "invalid histogram span list".to_owned(),
+            ));
+        }
+    };
+    let span_builder = || {
+        ListBuilder::new(StructBuilder::new(
+            span_fields.clone(),
+            vec![
+                Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(UInt32Builder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        ))
+    };
+    let mut builder = StructBuilder::new(
+        fields,
+        vec![
+            Box::new(StringBuilder::new()),
+            Box::new(Int32Builder::new()),
+            Box::new(UInt64Builder::new()),
+            Box::new(Float64Builder::new()),
+            Box::new(Float64Builder::new()),
+            Box::new(Float64Builder::new()),
+            Box::new(UInt64Builder::new()),
+            Box::new(Float64Builder::new()),
+            Box::new(UInt8Builder::new()),
+            Box::new(span_builder()),
+            Box::new(span_builder()),
+            Box::new(ListBuilder::new(Int64Builder::new())),
+            Box::new(ListBuilder::new(Int64Builder::new())),
+            Box::new(ListBuilder::new(Float64Builder::new())),
+            Box::new(ListBuilder::new(Float64Builder::new())),
+            Box::new(ListBuilder::new(Float64Builder::new())),
+        ],
+    );
+    for row in rows {
+        let Some(histogram) = &row.histogram else {
+            append_null_histogram(&mut builder);
+            continue;
+        };
+        builder
+            .field_builder::<StringBuilder>(0)
+            .expect("kind builder")
+            .append_value(match histogram.count {
+                HistogramCount::Integer(_) => "histogram",
+                HistogramCount::Float(_) => "float_histogram",
+            });
+        builder
+            .field_builder::<Int32Builder>(1)
+            .expect("schema builder")
+            .append_value(histogram.schema);
+        append_histogram_counts(&mut builder, histogram);
+        builder
+            .field_builder::<Float64Builder>(4)
+            .expect("sum builder")
+            .append_value(histogram.sum);
+        builder
+            .field_builder::<Float64Builder>(5)
+            .expect("threshold builder")
+            .append_value(histogram.zero_threshold);
+        builder
+            .field_builder::<UInt8Builder>(8)
+            .expect("reset hint builder")
+            .append_value(histogram.reset_hint);
+        append_spans(&mut builder, 9, &histogram.positive_spans);
+        append_spans(&mut builder, 10, &histogram.negative_spans);
+        append_histogram_buckets(&mut builder, histogram);
+        let custom_values = builder
+            .field_builder::<ListBuilder<Float64Builder>>(15)
+            .expect("custom values builder");
+        custom_values
+            .values()
+            .append_slice(&histogram.custom_values);
+        custom_values.append(true);
+        builder.append(true);
+    }
+    Ok(builder.finish())
+}
+
+fn append_null_histogram(builder: &mut StructBuilder) {
+    builder
+        .field_builder::<StringBuilder>(0)
+        .expect("kind builder")
+        .append_null();
+    builder
+        .field_builder::<Int32Builder>(1)
+        .expect("schema builder")
+        .append_null();
+    builder
+        .field_builder::<UInt64Builder>(2)
+        .expect("integer count builder")
+        .append_null();
+    builder
+        .field_builder::<Float64Builder>(3)
+        .expect("float count builder")
+        .append_null();
+    builder
+        .field_builder::<Float64Builder>(4)
+        .expect("sum builder")
+        .append_null();
+    builder
+        .field_builder::<Float64Builder>(5)
+        .expect("threshold builder")
+        .append_null();
+    builder
+        .field_builder::<UInt64Builder>(6)
+        .expect("integer zero count builder")
+        .append_null();
+    builder
+        .field_builder::<Float64Builder>(7)
+        .expect("float zero count builder")
+        .append_null();
+    builder
+        .field_builder::<UInt8Builder>(8)
+        .expect("reset hint builder")
+        .append_null();
+    builder
+        .field_builder::<ListBuilder<StructBuilder>>(9)
+        .expect("positive spans builder")
+        .append_null();
+    builder
+        .field_builder::<ListBuilder<StructBuilder>>(10)
+        .expect("negative spans builder")
+        .append_null();
+    append_i64_list(builder, 11, None);
+    append_i64_list(builder, 12, None);
+    append_f64_list(builder, 13, None);
+    append_f64_list(builder, 14, None);
+    append_f64_list(builder, 15, None);
+    builder.append(false);
+}
+
+fn append_histogram_counts(builder: &mut StructBuilder, histogram: &HistogramSample) {
+    match histogram.count {
+        HistogramCount::Integer(value) => {
+            builder
+                .field_builder::<UInt64Builder>(2)
+                .expect("integer count builder")
+                .append_value(value);
+            builder
+                .field_builder::<Float64Builder>(3)
+                .expect("float count builder")
+                .append_null();
+        }
+        HistogramCount::Float(value) => {
+            builder
+                .field_builder::<UInt64Builder>(2)
+                .expect("integer count builder")
+                .append_null();
+            builder
+                .field_builder::<Float64Builder>(3)
+                .expect("float count builder")
+                .append_value(value);
+        }
+    }
+    match histogram.zero_count {
+        HistogramCount::Integer(value) => {
+            builder
+                .field_builder::<UInt64Builder>(6)
+                .expect("integer zero count builder")
+                .append_value(value);
+            builder
+                .field_builder::<Float64Builder>(7)
+                .expect("float zero count builder")
+                .append_null();
+        }
+        HistogramCount::Float(value) => {
+            builder
+                .field_builder::<UInt64Builder>(6)
+                .expect("integer zero count builder")
+                .append_null();
+            builder
+                .field_builder::<Float64Builder>(7)
+                .expect("float zero count builder")
+                .append_value(value);
+        }
+    }
+}
+
+fn append_spans(builder: &mut StructBuilder, field: usize, spans: &[Span]) {
+    let spans_builder = builder
+        .field_builder::<ListBuilder<StructBuilder>>(field)
+        .expect("span list builder");
+    for span in spans {
+        spans_builder
+            .values()
+            .field_builder::<Int32Builder>(0)
+            .expect("span offset builder")
+            .append_value(span.offset);
+        spans_builder
+            .values()
+            .field_builder::<UInt32Builder>(1)
+            .expect("span length builder")
+            .append_value(span.length);
+        spans_builder.values().append(true);
+    }
+    spans_builder.append(true);
+}
+
+fn append_histogram_buckets(builder: &mut StructBuilder, histogram: &HistogramSample) {
+    match &histogram.positive_buckets {
+        HistogramBuckets::Integer(values) => {
+            append_i64_list(builder, 11, Some(values));
+            append_f64_list(builder, 13, None);
+        }
+        HistogramBuckets::Float(values) => {
+            append_i64_list(builder, 11, None);
+            append_f64_list(builder, 13, Some(values));
+        }
+    }
+    match &histogram.negative_buckets {
+        HistogramBuckets::Integer(values) => {
+            append_i64_list(builder, 12, Some(values));
+            append_f64_list(builder, 14, None);
+        }
+        HistogramBuckets::Float(values) => {
+            append_i64_list(builder, 12, None);
+            append_f64_list(builder, 14, Some(values));
+        }
+    }
+}
+
+fn append_i64_list(builder: &mut StructBuilder, field: usize, values: Option<&[i64]>) {
+    let list = builder
+        .field_builder::<ListBuilder<Int64Builder>>(field)
+        .expect("integer bucket builder");
+    if let Some(values) = values {
+        list.values().append_slice(values);
+        list.append(true);
+    } else {
+        list.append_null();
+    }
+}
+
+fn append_f64_list(builder: &mut StructBuilder, field: usize, values: Option<&[f64]>) {
+    let list = builder
+        .field_builder::<ListBuilder<Float64Builder>>(field)
+        .expect("float bucket builder");
+    if let Some(values) = values {
+        list.values().append_slice(values);
+        list.append(true);
+    } else {
+        list.append_null();
+    }
 }
 
 fn projected_schema(schema: &SchemaRef, projection: Option<&[usize]>) -> SchemaRef {

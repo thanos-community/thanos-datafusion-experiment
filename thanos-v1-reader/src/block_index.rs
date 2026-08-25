@@ -424,7 +424,7 @@ async fn build_chunk_index(
         );
         let index_path_for_error = index_path.clone();
         let index_path_for_worker = index_path.clone();
-        tokio::task::spawn_blocking(move || {
+        let built_index = tokio::task::spawn_blocking(move || {
             let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
             let mut metric_labels = BTreeMap::new();
             let (series_count, chunk_count) = write_chunk_index_streaming(
@@ -465,7 +465,8 @@ async fn build_chunk_index(
         })
         .await
         .map_err(|error| invalid_data(format!("block index worker failed: {error}")))?
-        .map_err(|error| invalid_data(format!("failed to process {index_path_for_error}: {error}")))
+        .map_err(|error| invalid_data(format!("failed to process {index_path_for_error}: {error}")))?;
+        Ok(built_index)
     }
     .await;
 

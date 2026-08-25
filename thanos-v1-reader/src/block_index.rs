@@ -52,15 +52,15 @@ struct BlockMeta {
 
 #[derive(Debug, Default, Deserialize)]
 struct BlockStats {
-    #[serde(rename = "numSamples")]
+    #[serde(rename = "numSamples", default)]
     num_samples: u64,
-    #[serde(rename = "numFloatSamples")]
+    #[serde(rename = "numFloatSamples", default)]
     num_float_samples: u64,
     #[serde(rename = "numHistogramSamples", default)]
     num_histogram_samples: u64,
-    #[serde(rename = "numSeries")]
+    #[serde(rename = "numSeries", default)]
     num_series: u64,
-    #[serde(rename = "numChunks")]
+    #[serde(rename = "numChunks", default)]
     num_chunks: u64,
 }
 
@@ -94,9 +94,11 @@ struct Downsample {
     resolution: i64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct BlockFile {
+    #[serde(default)]
     rel_path: String,
+    #[serde(default)]
     size_bytes: u64,
 }
 
@@ -217,7 +219,17 @@ pub async fn build_block_index(
             }
 
             let contents = storage_repository.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(&contents)?;
+            let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
+                tracing::error!(
+                    repository = %repository.name,
+                    repository_uri = %repository.uri,
+                    block_path = %block_path,
+                    meta_path = %meta_path,
+                    error = %error,
+                    "failed to parse Thanos block metadata"
+                );
+                error
+            })?;
             active_block_ulids.insert(meta.ulid.clone());
 
             let index_path = format!("{block_path}/index");
@@ -842,7 +854,65 @@ fn invalid_data(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ReaderConfig, StorageConfig};
     use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+
+    #[test]
+    fn legacy_block_metadata_defaults_missing_statistics() {
+        let meta: BlockMeta = serde_json::from_str(
+            r#"{
+                "ulid": "01M0SQFT00EQ1D78Q8Y8EFD0BZ",
+                "minTime": 100,
+                "maxTime": 200,
+                "stats": { "numSamples": 7 },
+                "thanos": { "files": [{}] }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(meta.stats.num_samples, 7);
+        assert_eq!(meta.stats.num_float_samples, 0);
+        assert_eq!(meta.stats.num_histogram_samples, 0);
+        assert_eq!(meta.stats.num_series, 0);
+        assert_eq!(meta.stats.num_chunks, 0);
+        assert_eq!(meta.thanos.files[0].rel_path, "");
+        assert_eq!(meta.thanos.files[0].size_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn skips_deletion_marked_blocks_before_parsing_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let repository_root = root.path().join("repository");
+        let block_path = repository_root.join("01M0SQFT00EQ1D78Q8Y8EFD0BZ");
+        fs::create_dir_all(&block_path).unwrap();
+        fs::write(block_path.join("meta.json"), b"not valid JSON").unwrap();
+        fs::write(block_path.join(DELETION_MARK_FILE_NAME), b"{}").unwrap();
+
+        let repository = ThanosRepositoryConfig {
+            name: "repository".to_owned(),
+            uri: format!("file://{}", repository_root.display()),
+            s3: None,
+            gcs: None,
+        };
+        let storage = RepositoryRegistry::new(&ReaderConfig {
+            listen_addr: "127.0.0.1:1".to_owned(),
+            metrics_listen_addr: "127.0.0.1:2".to_owned(),
+            index_cache_location: root.path().join("cache").display().to_string(),
+            repositories: vec![repository.clone()],
+            storage: StorageConfig::default(),
+        })
+        .unwrap();
+
+        let schemas = build_block_index(
+            &[repository],
+            root.path().join("cache").to_str().unwrap(),
+            &storage,
+        )
+        .await
+        .unwrap();
+
+        assert!(schemas.is_empty());
+    }
 
     #[test]
     fn chunk_parquet_contains_row_group_statistics_and_page_indexes() {

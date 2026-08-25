@@ -361,17 +361,14 @@ impl ThanosStoreService {
             counter: None,
         };
         match chunk {
-            EncodedChunk::Xor(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
+            EncodedChunk::Xor(data) => {
                 result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::Xor));
             }
-            EncodedChunk::Histogram(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
+            EncodedChunk::Histogram(data) => {
                 result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::Histogram));
             }
-            EncodedChunk::FloatHistogram(data) if aggregates.contains(&(Aggr::Raw as i32)) => {
+            EncodedChunk::FloatHistogram(data) => {
                 result.raw = Some(raw_chunk(data, thanos::chunk::Encoding::FloatHistogram));
-            }
-            EncodedChunk::Xor(_) | EncodedChunk::Histogram(_) | EncodedChunk::FloatHistogram(_) => {
-                return Ok(None);
             }
             EncodedChunk::Aggregate {
                 count,

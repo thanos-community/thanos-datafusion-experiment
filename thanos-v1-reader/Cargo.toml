@@ -54,4 +54,5 @@ tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+libc = "0.2"
 tempfile = "3.27.0"

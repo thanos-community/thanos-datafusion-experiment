@@ -1,4 +1,4 @@
-package main
+package storeapi
 
 import (
 	"bytes"

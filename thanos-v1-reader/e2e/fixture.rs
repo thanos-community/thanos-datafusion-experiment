@@ -1,14 +1,20 @@
-use std::path::{Path, PathBuf};
-
-use serde::de::DeserializeOwned;
-use tempfile::TempDir;
-use thanos_v1_reader::{
-    block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
-    config::{ReaderConfig, StorageConfig, ThanosRepositoryConfig},
-    index_context,
-    storage::RepositoryRegistry,
-    store_service::ThanosStoreService,
+use std::{
+    fs::File,
+    io,
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+use arrow::record_batch::RecordBatch;
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use futures::TryStreamExt;
+use tempfile::TempDir;
+use tonic::transport::{Channel, Endpoint};
 
 pub const MINT: i64 = 1_700_000_000_000;
 pub const MAXT: i64 = 1_700_003_600_000;
@@ -19,7 +25,6 @@ pub const RESOLUTION_5M: i64 = 5 * 60 * 1000;
 pub struct GeneratedFixture {
     root: Option<TempDir>,
     blocks: PathBuf,
-    generator_directory: PathBuf,
 }
 
 pub fn generated_fixture() -> GeneratedFixture {
@@ -29,7 +34,7 @@ pub fn generated_fixture() -> GeneratedFixture {
         .expect("create e2e fixture directory");
     let blocks = root.path().join("blocks");
     let generator_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
-    let output = std::process::Command::new("go")
+    let output = Command::new("go")
         .args([
             "run",
             ".",
@@ -53,7 +58,7 @@ pub fn generated_fixture() -> GeneratedFixture {
             "--scalar-edge-cases",
             "--downsample-5m=true",
         ])
-        .current_dir(&generator_directory)
+        .current_dir(generator_directory)
         .output()
         .expect("run deterministic Thanos fixture generator");
     assert!(
@@ -62,11 +67,9 @@ pub fn generated_fixture() -> GeneratedFixture {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-
     GeneratedFixture {
         root: Some(root),
         blocks,
-        generator_directory,
     }
 }
 
@@ -78,26 +81,68 @@ impl GeneratedFixture {
             .path()
     }
 
-    pub fn blocks(&self) -> &Path {
-        &self.blocks
-    }
+    #[cfg(unix)]
+    pub async fn start_reader(&self) -> ReaderProcess {
+        let grpc_listener = TcpListener::bind("127.0.0.1:0").expect("reserve gRPC listener");
+        let metrics_listener = TcpListener::bind("127.0.0.1:0").expect("reserve metrics listener");
+        let address = grpc_listener.local_addr().expect("gRPC listener address");
+        let metrics_address = metrics_listener
+            .local_addr()
+            .expect("metrics listener address");
+        let address_text = address.to_string();
+        let metrics_address_text = metrics_address.to_string();
+        let config_path = self.root().join("reader.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "listen_addr = {address_text:?}\nmetrics_listen_addr = {metrics_address_text:?}\nindex_cache_location = {:?}\n\n[[repositories]]\nname = \"e2e\"\nuri = {:?}\n",
+                self.root().join("cache").display().to_string(),
+                format!("file://{}", self.blocks.display()),
+            ),
+        )
+        .expect("write reader config");
+        let stderr_path = self.root().join("reader.stderr");
+        let stderr = File::create(&stderr_path).expect("create reader stderr log");
 
-    pub fn generator_directory(&self) -> &Path {
-        &self.generator_directory
-    }
-
-    fn repository(&self) -> ThanosRepositoryConfig {
-        ThanosRepositoryConfig {
-            name: "e2e".to_owned(),
-            uri: format!("file://{}", self.blocks.display()),
-            s3: None,
-            gcs: None,
+        let grpc_fd = grpc_listener.as_raw_fd();
+        let metrics_fd = metrics_listener.as_raw_fd();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_thanos-v1-reader"));
+        command
+            .env("THANOS_READER_CONFIG", &config_path)
+            .env("THANOS_READER_LISTEN_FD", "3")
+            .env("THANOS_READER_METRICS_LISTEN_FD", "4")
+            .env("OTEL_SDK_DISABLED", "true")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr));
+        unsafe {
+            command.pre_exec(move || {
+                duplicate_listener(grpc_fd, 3).and_then(|_| duplicate_listener(metrics_fd, 4))
+            });
         }
-    }
+        let child = command.spawn().expect("start reader process");
+        drop(grpc_listener);
+        drop(metrics_listener);
 
-    fn cache(&self, name: &str) -> PathBuf {
-        self.root().join(name)
+        let reader = ReaderProcess {
+            child,
+            address: address.to_string(),
+            stderr_path,
+        };
+        reader.wait_until_ready().await;
+        reader
     }
+}
+
+#[cfg(unix)]
+fn duplicate_listener(
+    source: std::os::fd::RawFd,
+    destination: std::os::fd::RawFd,
+) -> io::Result<()> {
+    if unsafe { libc::dup2(source, destination) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl Drop for GeneratedFixture {
@@ -111,89 +156,104 @@ impl Drop for GeneratedFixture {
     }
 }
 
-pub async fn indexed_context(
-    fixture: &GeneratedFixture,
-    cache_name: &str,
-) -> datafusion::prelude::SessionContext {
-    let cache = fixture.cache(cache_name);
-    let repository = fixture.repository();
-    let storage = RepositoryRegistry::new(&ReaderConfig {
-        listen_addr: "127.0.0.1:1".to_owned(),
-        metrics_listen_addr: "127.0.0.1:2".to_owned(),
-        index_cache_location: cache.display().to_string(),
-        repositories: vec![repository.clone()],
-        storage: StorageConfig::default(),
-    })
-    .unwrap();
-    let schemas = build_block_index(
-        std::slice::from_ref(&repository),
-        cache.to_str().unwrap(),
-        &storage,
-    )
-    .await
-    .unwrap();
-    index_context(
-        &block_index_file_path(cache.to_str().unwrap()),
-        &chunk_index_directory_path(cache.to_str().unwrap()),
-        &schemas,
-        std::slice::from_ref(&repository),
-        storage,
-    )
-    .await
-    .unwrap()
+pub struct ReaderProcess {
+    child: Child,
+    address: String,
+    stderr_path: PathBuf,
 }
 
-pub async fn store_service(
-    fixture: &GeneratedFixture,
-    cache_name: &str,
-) -> (datafusion::prelude::SessionContext, ThanosStoreService) {
-    let repository = fixture.repository();
-    let context = indexed_context(fixture, cache_name).await;
-    let storage = RepositoryRegistry::new(&ReaderConfig {
-        listen_addr: "127.0.0.1:1".to_owned(),
-        metrics_listen_addr: "127.0.0.1:2".to_owned(),
-        index_cache_location: fixture.cache(cache_name).display().to_string(),
-        repositories: vec![repository.clone()],
-        storage: StorageConfig::default(),
-    })
-    .unwrap();
-    let service =
-        ThanosStoreService::new(context.clone(), std::slice::from_ref(&repository), storage)
+impl ReaderProcess {
+    async fn client(&self) -> FlightSqlServiceClient<Channel> {
+        Endpoint::from_shared(format!("http://{}", self.address))
+            .expect("valid reader endpoint")
+            .connect()
             .await
-            .unwrap();
-    (context, service)
+            .map(FlightSqlServiceClient::new)
+            .expect("connect Flight SQL client")
+    }
+
+    async fn wait_until_ready(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(mut client) = Endpoint::from_shared(format!("http://{}", self.address))
+                .expect("valid reader endpoint")
+                .connect()
+                .await
+                .map(FlightSqlServiceClient::new)
+            {
+                if client.execute("SELECT 1".to_owned(), None).await.is_ok() {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reader did not become ready; stderr:\n{}",
+                self.stderr(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    pub async fn query(&self, sql: &str) -> Vec<RecordBatch> {
+        let mut client = self.client().await;
+        let info = client
+            .execute(sql.to_owned(), None)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Flight SQL query failed for {sql:?}: {error}; stderr:\n{}",
+                    self.stderr()
+                )
+            });
+        assert_eq!(
+            info.endpoint.len(),
+            1,
+            "query should produce one Flight endpoint"
+        );
+        let ticket = info.endpoint[0]
+            .ticket
+            .clone()
+            .expect("Flight endpoint ticket");
+        client
+            .do_get(ticket)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Flight SQL DoGet failed for {sql:?}: {error}; stderr:\n{}",
+                    self.stderr()
+                )
+            })
+            .try_collect()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Flight SQL stream failed for {sql:?}: {error}; stderr:\n{}",
+                    self.stderr()
+                )
+            })
+    }
+
+    pub async fn query_error(&self, sql: &str) -> String {
+        self.client()
+            .await
+            .execute(sql.to_owned(), None)
+            .await
+            .expect_err("query should fail")
+            .to_string()
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path)
+            .unwrap_or_else(|error| format!("read stderr: {error}"))
+    }
 }
 
-pub fn go_bucket_store_series<T: DeserializeOwned>(
-    fixture: &GeneratedFixture,
-    metric: &str,
-    aggregates: Option<&str>,
-    max_resolution: Option<i64>,
-) -> Vec<T> {
-    let mut command = std::process::Command::new("go");
-    command.args([
-        "run",
-        "-tags=slicelabels",
-        "./cmd/store-oracle",
-        "--bucket",
-        fixture.blocks().to_str().unwrap(),
-        "--metric",
-        metric,
-    ]);
-    if let Some(aggregates) = aggregates {
-        command.args(["--aggregates", aggregates]);
+impl Drop for ReaderProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if std::thread::panicking() {
+            eprintln!("reader stderr:\n{}", self.stderr());
+        }
     }
-    if let Some(max_resolution) = max_resolution {
-        command.args(["--max-resolution", &max_resolution.to_string()]);
-    }
-    let output = command
-        .current_dir(fixture.generator_directory())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "Go BucketStore oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
 }

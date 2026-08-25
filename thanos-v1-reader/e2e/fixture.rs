@@ -1,15 +1,13 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
+use tempfile::TempDir;
 use thanos_v1_reader::{
     block_index::{block_index_file_path, build_block_index, chunk_index_directory_path},
     config::{ReaderConfig, StorageConfig, ThanosRepositoryConfig},
     index_context,
-    store_service::ThanosStoreService,
     storage::RepositoryRegistry,
+    store_service::ThanosStoreService,
 };
 
 pub const MINT: i64 = 1_700_000_000_000;
@@ -18,58 +16,68 @@ pub const SAMPLE_COUNT: usize = 240;
 pub const POD_COUNT: usize = 2;
 pub const RESOLUTION_5M: i64 = 5 * 60 * 1000;
 
-static FIXTURE: OnceLock<GeneratedFixture> = OnceLock::new();
-
 pub struct GeneratedFixture {
-    root: PathBuf,
+    root: Option<TempDir>,
     blocks: PathBuf,
     generator_directory: PathBuf,
 }
 
-pub fn generated_fixture() -> &'static GeneratedFixture {
-    FIXTURE.get_or_init(|| {
-        let root =
-            std::env::temp_dir().join(format!("thanos-v1-reader-e2e-{}", std::process::id()));
-        let blocks = root.join("blocks");
-        let generator_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
-        let status = std::process::Command::new("go")
-            .args([
-                "run",
-                ".",
-                "--output",
-                blocks.to_str().unwrap(),
-                "--clean",
-                "--mint",
-                &MINT.to_string(),
-                "--maxt",
-                &MAXT.to_string(),
-                "--samples",
-                &SAMPLE_COUNT.to_string(),
-                "--instances",
-                "2",
-                "--pods",
-                &POD_COUNT.to_string(),
-                "--routes",
-                "2",
-                "--native-series",
-                "1",
-                "--scalar-edge-cases",
-                "--downsample-5m=true",
-            ])
-            .current_dir(&generator_directory)
-            .status()
-            .unwrap();
-        assert!(status.success());
+pub fn generated_fixture() -> GeneratedFixture {
+    let root = tempfile::Builder::new()
+        .prefix("thanos-v1-reader-e2e-")
+        .tempdir()
+        .expect("create e2e fixture directory");
+    let blocks = root.path().join("blocks");
+    let generator_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../thanos-block-gen");
+    let output = std::process::Command::new("go")
+        .args([
+            "run",
+            ".",
+            "--output",
+            blocks.to_str().unwrap(),
+            "--clean",
+            "--mint",
+            &MINT.to_string(),
+            "--maxt",
+            &MAXT.to_string(),
+            "--samples",
+            &SAMPLE_COUNT.to_string(),
+            "--instances",
+            "2",
+            "--pods",
+            &POD_COUNT.to_string(),
+            "--routes",
+            "2",
+            "--native-series",
+            "1",
+            "--scalar-edge-cases",
+            "--downsample-5m=true",
+        ])
+        .current_dir(&generator_directory)
+        .output()
+        .expect("run deterministic Thanos fixture generator");
+    assert!(
+        output.status.success(),
+        "Thanos fixture generator failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 
-        GeneratedFixture {
-            root,
-            blocks,
-            generator_directory,
-        }
-    })
+    GeneratedFixture {
+        root: Some(root),
+        blocks,
+        generator_directory,
+    }
 }
 
 impl GeneratedFixture {
+    fn root(&self) -> &Path {
+        self.root
+            .as_ref()
+            .expect("e2e fixture root is available")
+            .path()
+    }
+
     pub fn blocks(&self) -> &Path {
         &self.blocks
     }
@@ -88,12 +96,25 @@ impl GeneratedFixture {
     }
 
     fn cache(&self, name: &str) -> PathBuf {
-        self.root.join(name)
+        self.root().join(name)
     }
 }
 
-pub async fn indexed_context(cache_name: &str) -> datafusion::prelude::SessionContext {
-    let fixture = generated_fixture();
+impl Drop for GeneratedFixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Some(root) = self.root.take() {
+                let path = root.keep();
+                eprintln!("retained failed e2e fixture at {}", path.display());
+            }
+        }
+    }
+}
+
+pub async fn indexed_context(
+    fixture: &GeneratedFixture,
+    cache_name: &str,
+) -> datafusion::prelude::SessionContext {
     let cache = fixture.cache(cache_name);
     let repository = fixture.repository();
     let storage = RepositoryRegistry::new(&ReaderConfig {
@@ -109,8 +130,8 @@ pub async fn indexed_context(cache_name: &str) -> datafusion::prelude::SessionCo
         cache.to_str().unwrap(),
         &storage,
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     index_context(
         &block_index_file_path(cache.to_str().unwrap()),
         &chunk_index_directory_path(cache.to_str().unwrap()),
@@ -123,11 +144,11 @@ pub async fn indexed_context(cache_name: &str) -> datafusion::prelude::SessionCo
 }
 
 pub async fn store_service(
+    fixture: &GeneratedFixture,
     cache_name: &str,
 ) -> (datafusion::prelude::SessionContext, ThanosStoreService) {
-    let fixture = generated_fixture();
     let repository = fixture.repository();
-    let context = indexed_context(cache_name).await;
+    let context = indexed_context(fixture, cache_name).await;
     let storage = RepositoryRegistry::new(&ReaderConfig {
         listen_addr: "127.0.0.1:1".to_owned(),
         metrics_listen_addr: "127.0.0.1:2".to_owned(),
@@ -136,22 +157,19 @@ pub async fn store_service(
         storage: StorageConfig::default(),
     })
     .unwrap();
-    let service = ThanosStoreService::new(
-        context.clone(),
-        std::slice::from_ref(&repository),
-        storage,
-    )
-        .await
-        .unwrap();
+    let service =
+        ThanosStoreService::new(context.clone(), std::slice::from_ref(&repository), storage)
+            .await
+            .unwrap();
     (context, service)
 }
 
 pub fn go_bucket_store_series<T: DeserializeOwned>(
+    fixture: &GeneratedFixture,
     metric: &str,
     aggregates: Option<&str>,
     max_resolution: Option<i64>,
 ) -> Vec<T> {
-    let fixture = generated_fixture();
     let mut command = std::process::Command::new("go");
     command.args([
         "run",

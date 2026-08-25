@@ -26,13 +26,14 @@ struct OracleChunk {
 
 #[tokio::test]
 async fn native_histogram_chunks_match_go_bucket_store() {
-    let (_, service) = crate::fixture::store_service("native-cache").await;
+    let fixture = crate::fixture::generated_fixture();
+    let (_, service) = crate::fixture::store_service(&fixture, "native-cache").await;
 
     for (metric, expected_encoding) in [
         ("dummy_native_histogram", 1),
         ("dummy_float_native_histogram", 2),
     ] {
-        let expected = crate::fixture::go_bucket_store_series(metric, None, None);
+        let expected = crate::fixture::go_bucket_store_series(&fixture, metric, None, None);
         let actual = reader_series(&service, metric).await;
         assert_eq!(actual, expected, "StoreAPI mismatch for {metric}");
         assert_eq!(actual.len(), crate::fixture::POD_COUNT);

@@ -23,7 +23,7 @@ e2e-test:
 
 store-api-conformance-test:
 	cd thanos-v1-reader && cargo build --bin thanos-v1-reader
-	cd thanos-block-gen && THANOS_V1_READER_BIN="../thanos-v1-reader/target/debug/thanos-v1-reader" go test -run '^TestThanosV1ReaderStoreAPIConformance$$' -count=1
+	cd thanos-block-gen && THANOS_V1_READER_BIN="../thanos-v1-reader/target/debug/thanos-v1-reader" go test -v -run '^TestThanosV1ReaderStoreAPIConformance$$' -count=1
 
 test:
 	cd thanos-v1-reader && cargo test

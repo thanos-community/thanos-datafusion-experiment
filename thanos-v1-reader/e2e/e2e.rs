@@ -7,7 +7,8 @@ use fixture::{MAXT, MINT, POD_COUNT, SAMPLE_COUNT};
 
 #[tokio::test]
 async fn counter_samples_match_generated_block_values() {
-    let context = fixture::indexed_context("counter-cache").await;
+    let fixture = fixture::generated_fixture();
+    let context = fixture::indexed_context(&fixture, "counter-cache").await;
 
     let batches = context
         .sql(

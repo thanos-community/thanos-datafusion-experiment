@@ -47,7 +47,8 @@ struct OracleSample {
 
 #[tokio::test]
 async fn scalar_downsample_aggregates_match_go_bucket_store() {
-    let (context, service) = crate::fixture::store_service("downsample-cache").await;
+    let fixture = crate::fixture::generated_fixture();
+    let (context, service) = crate::fixture::store_service(&fixture, "downsample-cache").await;
     let aggregates = [Aggr::Count, Aggr::Sum, Aggr::Min, Aggr::Max, Aggr::Counter];
 
     for (metric, expected_series) in [
@@ -58,6 +59,7 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
         ("dummy_request_duration_seconds_sum", 4),
     ] {
         let expected = crate::fixture::go_bucket_store_series(
+            &fixture,
             metric,
             Some("count,sum,min,max,counter"),
             Some(crate::fixture::RESOLUTION_5M),
@@ -89,6 +91,7 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
     }
 
     let counter = crate::fixture::go_bucket_store_series(
+        &fixture,
         "dummy_requests_total",
         Some("count,sum,min,max,counter"),
         Some(crate::fixture::RESOLUTION_5M),
@@ -115,6 +118,7 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
     );
 
     let gauge = crate::fixture::go_bucket_store_series(
+        &fixture,
         "dummy_temperature_celsius",
         Some("count,sum,min,max,counter"),
         Some(crate::fixture::RESOLUTION_5M),
@@ -145,6 +149,7 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
     );
 
     let histogram_count = crate::fixture::go_bucket_store_series(
+        &fixture,
         "dummy_request_duration_seconds_count",
         Some("count,sum,min,max,counter"),
         Some(crate::fixture::RESOLUTION_5M),
@@ -156,8 +161,12 @@ async fn scalar_downsample_aggregates_match_go_bucket_store() {
         "classic histogram zero-count window must survive downsampling"
     );
 
-    let expected_raw_fallback =
-        crate::fixture::go_bucket_store_series("dummy_requests_total", Some("count"), Some(0));
+    let expected_raw_fallback = crate::fixture::go_bucket_store_series(
+        &fixture,
+        "dummy_requests_total",
+        Some("count"),
+        Some(0),
+    );
     let actual_raw_fallback =
         reader_series(&service, "dummy_requests_total", &[Aggr::Count], 0).await;
     assert_eq!(actual_raw_fallback, expected_raw_fallback);

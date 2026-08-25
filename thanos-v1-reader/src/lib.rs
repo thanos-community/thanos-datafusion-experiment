@@ -1,5 +1,8 @@
 use std::{env, net::SocketAddr};
 
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
+
 use arrow_flight::flight_service_server::FlightServiceServer;
 use axum::{Router, extract::State, routing::get};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -7,6 +10,7 @@ use opentelemetry::{global, trace::TracerProvider as _};
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -97,6 +101,12 @@ pub async fn register_metric_tables(
 
 const LISTEN_ADDR_ENV_VAR: &str = "FLIGHT_LISTEN_ADDR";
 const METRICS_LISTEN_ADDR_ENV_VAR: &str = "METRICS_LISTEN_ADDR";
+/// When set, the reader adopts already-bound TCP listeners from its parent process.
+///
+/// This is primarily useful for hermetic integration tests: the harness can reserve an
+/// ephemeral port and pass its file descriptor to the reader without a close-and-rebind race.
+const LISTEN_FD_ENV_VAR: &str = "THANOS_READER_LISTEN_FD";
+const METRICS_LISTEN_FD_ENV_VAR: &str = "THANOS_READER_METRICS_LISTEN_FD";
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing()?;
@@ -108,8 +118,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let address = env::var(LISTEN_ADDR_ENV_VAR).unwrap_or(config.listen_addr);
     let metrics_address =
         env::var(METRICS_LISTEN_ADDR_ENV_VAR).unwrap_or(config.metrics_listen_addr);
+    let listener = listener_from_env(LISTEN_FD_ENV_VAR)?;
+    let metrics_listener = listener_from_env(METRICS_LISTEN_FD_ENV_VAR)?;
     let socket_address: SocketAddr = address.parse()?;
-    start_metrics_server(&metrics_address, prometheus_handle).await?;
+    start_metrics_server(&metrics_address, metrics_listener, prometheus_handle).await?;
 
     for repository in &config.repositories {
         tracing::info!(
@@ -146,16 +158,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(%address, "starting DataFusion Arrow Flight server");
 
-    Server::builder()
+    let server = Server::builder()
         .add_service(FlightServiceServer::new(service))
         .add_service(thanos_proto::thanos::store_server::StoreServer::new(
             store_service.clone(),
         ))
         .add_service(thanos_proto::thanos::info::info_server::InfoServer::new(
             store_service,
-        ))
-        .serve(socket_address)
-        .await?;
+        ));
+    if let Some(listener) = listener {
+        server
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await?;
+    } else {
+        server.serve(socket_address).await?;
+    }
 
     Ok(())
 }
@@ -179,9 +196,13 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn start_metrics_server(
     address: &str,
+    listener: Option<TcpListener>,
     prometheus_handle: PrometheusHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(address).await?;
+    let listener = match listener {
+        Some(listener) => listener,
+        None => TcpListener::bind(address).await?,
+    };
     let app = Router::new()
         .route("/metrics", get(prometheus_metrics))
         .with_state(prometheus_handle);
@@ -192,6 +213,32 @@ async fn start_metrics_server(
         }
     });
     Ok(())
+}
+
+fn listener_from_env(name: &str) -> Result<Option<TcpListener>, Box<dyn std::error::Error>> {
+    let Some(raw_fd) = env::var_os(name) else {
+        return Ok(None);
+    };
+    let raw_fd = raw_fd
+        .to_string_lossy()
+        .parse::<i32>()
+        .map_err(|error| format!("{name} must be a file descriptor: {error}"))?;
+    if raw_fd < 0 {
+        return Err(format!("{name} must be non-negative").into());
+    }
+
+    #[cfg(unix)]
+    {
+        // The parent deliberately transfers ownership of this inherited descriptor.
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(raw_fd as RawFd) };
+        listener.set_nonblocking(true)?;
+        return Ok(Some(TcpListener::from_std(listener)?));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = raw_fd;
+        Err(format!("{name} is only supported on Unix").into())
+    }
 }
 
 async fn prometheus_metrics(State(handle): State<PrometheusHandle>) -> String {

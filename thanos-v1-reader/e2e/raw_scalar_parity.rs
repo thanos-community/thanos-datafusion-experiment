@@ -33,7 +33,8 @@ struct OracleSample {
 
 #[tokio::test]
 async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
-    let (context, service) = crate::fixture::store_service("raw-scalar-cache").await;
+    let fixture = crate::fixture::generated_fixture();
+    let (context, service) = crate::fixture::store_service(&fixture, "raw-scalar-cache").await;
 
     for (metric, expected_series) in [
         ("dummy_requests_total", 2),
@@ -42,7 +43,7 @@ async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
         ("dummy_request_duration_seconds_count", 4),
         ("dummy_request_duration_seconds_sum", 4),
     ] {
-        let expected = crate::fixture::go_bucket_store_series(metric, None, None);
+        let expected = crate::fixture::go_bucket_store_series(&fixture, metric, None, None);
         let actual = reader_series(&service, metric).await;
         assert_eq!(actual, expected, "StoreAPI mismatch for {metric}");
         assert_eq!(actual.len(), expected_series, "series count for {metric}");
@@ -93,7 +94,8 @@ async fn raw_scalar_and_classic_histogram_series_match_go_bucket_store() {
         }
     }
 
-    let gauge = crate::fixture::go_bucket_store_series("dummy_temperature_celsius", None, None);
+    let gauge =
+        crate::fixture::go_bucket_store_series(&fixture, "dummy_temperature_celsius", None, None);
     let gauge_bits = oracle_values(&gauge)
         .into_iter()
         .map(|(_, bits)| bits)

@@ -105,12 +105,21 @@ impl ThanosStoreService {
                 .collect());
         }
 
+        // The on-disk StoreAPI projection keeps labels as canonical JSON. Apply exact PromQL
+        // matchers in DataFusion before projecting `chunks_json`: decoding chunk locations for
+        // every series in a large time block made otherwise narrow rate queries time out.
+        let label_filters = exact_label_filters(matchers)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let label_predicate = label_filters
+            .iter()
+            .map(|filter| format!(" AND labels_json LIKE {}", sql_literal(filter)))
+            .collect::<String>();
         let frame = self
             .context
             .sql(&format!(
                 "SELECT repository_uri, downsample_resolution, series_mint, series_maxt, \
                  labels_json, chunks_json \
-                 FROM series WHERE series_mint <= {end} AND series_maxt >= {start}"
+                 FROM series WHERE series_mint <= {end} AND series_maxt >= {start}{label_predicate}"
             ))
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -195,6 +204,33 @@ impl ThanosStoreService {
             status: None,
         }
     }
+}
+
+fn exact_label_filters(matchers: &[Matcher]) -> Result<Vec<String>, serde_json::Error> {
+    matchers
+        .iter()
+        .filter_map(|matcher| match matcher {
+            // Prometheus defines `label=""` to also match a missing label. A JSON substring
+            // predicate cannot express that without excluding valid series, so retain it for
+            // the final matcher evaluation.
+            Matcher::Eq(name, value) if !value.is_empty() => Some((name, value)),
+            Matcher::Eq(_, _) => None,
+            Matcher::Neq(_, _) | Matcher::Re(_, _) | Matcher::Nre(_, _) => None,
+        })
+        .map(|(name, value)| {
+            // `labels` is a BTreeMap, serialized without whitespace, so this fragment is both
+            // exact and independent of the position of the label in the JSON object.
+            Ok(format!(
+                "%{}:{}%",
+                serde_json::to_string(name)?,
+                serde_json::to_string(value)?
+            ))
+        })
+        .collect()
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[tonic::async_trait]
@@ -657,6 +693,25 @@ fn uint64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_matchers_produce_canonical_json_filters() {
+        let filters = exact_label_filters(&[
+            Matcher::Eq("__name__".to_owned(), "process_cpu_seconds_total".to_owned()),
+            Matcher::Eq("prometheus".to_owned(), "monitoring/reader".to_owned()),
+            Matcher::Eq("missing".to_owned(), String::new()),
+            Matcher::Re("job".to_owned(), Regex::new("reader").unwrap()),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            filters,
+            vec![
+                r#"%"__name__":"process_cpu_seconds_total"%"#.to_owned(),
+                r#"%"prometheus":"monitoring/reader"%"#.to_owned(),
+            ]
+        );
+    }
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 

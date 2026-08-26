@@ -161,6 +161,25 @@ struct ChunkIndexRow {
     labels_json: String,
 }
 
+/// Disk-backed StoreAPI projection: one row per TSDB series in a block.
+#[derive(Debug)]
+struct SeriesIndexRow {
+    repository_uri: String,
+    downsample_resolution: i64,
+    series_mint: i64,
+    series_maxt: i64,
+    labels_json: String,
+    chunks_json: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SeriesChunkLocation {
+    chunk_file_path: String,
+    chunk_file_offset: u64,
+    chunk_mint: i64,
+    chunk_maxt: i64,
+}
+
 struct BlockBuildTask {
     repository: ThanosRepositoryConfig,
     storage_repository: std::sync::Arc<crate::storage::Repository>,
@@ -188,6 +207,7 @@ struct BuiltBlockIndex {
     block_path: String,
     index_path: String,
     chunk_index_path: String,
+    series_index_path: String,
     series_count: usize,
     chunk_count: usize,
     metric_labels: BTreeMap<String, BTreeSet<String>>,
@@ -328,6 +348,7 @@ pub async fn build_block_index(
     }
 
     cleanup_chunk_index_files(index_cache_location, &active_block_ulids)?;
+    cleanup_series_index_files(index_cache_location, &active_block_ulids)?;
 
     rows.sort_by(|left, right| {
         (
@@ -424,6 +445,7 @@ async fn build_chunk_index(
         let index_path_for_worker = index_path.clone();
         let built_index = tokio::task::spawn_blocking(move || {
             let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
+            let series_index_path = series_index_file_path(&index_cache_location, &task.meta.ulid);
             let mut metric_labels = BTreeMap::new();
             let (series_count, chunk_count) = write_chunk_index_streaming(
                 &task.repository,
@@ -431,6 +453,7 @@ async fn build_chunk_index(
                 &task.block_path,
                 &index,
                 &chunk_index_path,
+                &series_index_path,
                 &mut metric_labels,
             )
             .map_err(|error| error.to_string())?;
@@ -456,6 +479,7 @@ async fn build_chunk_index(
                 block_path: task.block_path,
                 index_path: index_path_for_worker,
                 chunk_index_path,
+                series_index_path,
                 series_count,
                 chunk_count,
                 metric_labels,
@@ -512,6 +536,18 @@ pub fn chunk_index_file_path(index_cache_location: &str, block_ulid: &str) -> St
         .into_owned()
 }
 
+/// Return the generated per-block StoreAPI series projection location.
+pub fn series_index_file_path(index_cache_location: &str, block_ulid: &str) -> String {
+    let location = index_cache_location
+        .strip_prefix("file://")
+        .unwrap_or(index_cache_location);
+    Path::new(location)
+        .join("series")
+        .join(format!("{block_ulid}.parquet"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Return the generated expanded chunk-index directory for a configured cache directory.
 pub fn chunk_index_directory_path(index_cache_location: &str) -> String {
     let location = index_cache_location
@@ -523,12 +559,44 @@ pub fn chunk_index_directory_path(index_cache_location: &str) -> String {
         .into_owned()
 }
 
+/// Return the generated StoreAPI series projection directory.
+pub fn series_index_directory_path(index_cache_location: &str) -> String {
+    let location = index_cache_location
+        .strip_prefix("file://")
+        .unwrap_or(index_cache_location);
+    Path::new(location)
+        .join("series")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn cleanup_chunk_index_files(
     index_cache_location: &str,
     active_block_ulids: &BTreeSet<String>,
 ) -> Result<(), BoxError> {
-    let directory = chunk_index_directory_path(index_cache_location);
-    let directory = Path::new(&directory);
+    cleanup_index_files(
+        Path::new(&chunk_index_directory_path(index_cache_location)),
+        active_block_ulids,
+        "chunk",
+    )
+}
+
+fn cleanup_series_index_files(
+    index_cache_location: &str,
+    active_block_ulids: &BTreeSet<String>,
+) -> Result<(), BoxError> {
+    cleanup_index_files(
+        Path::new(&series_index_directory_path(index_cache_location)),
+        active_block_ulids,
+        "series",
+    )
+}
+
+fn cleanup_index_files(
+    directory: &Path,
+    active_block_ulids: &BTreeSet<String>,
+    index_kind: &str,
+) -> Result<(), BoxError> {
     if !directory.exists() {
         return Ok(());
     }
@@ -553,7 +621,7 @@ fn cleanup_chunk_index_files(
         }
 
         fs::remove_file(&path)?;
-        tracing::debug!(path = %path.display(), block_ulid, "removed stale chunk index cache file");
+        tracing::debug!(path = %path.display(), block_ulid, index_kind, "removed stale index cache file");
     }
     Ok(())
 }
@@ -617,6 +685,7 @@ fn write_chunk_index_streaming(
     block_path: &str,
     index: &[u8],
     chunk_index_path: &str,
+    series_index_path: &str,
     metric_labels: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<(usize, usize), BoxError> {
     let path = Path::new(
@@ -637,7 +706,28 @@ fn write_chunk_index_streaming(
     let file = fs::File::create(&temporary_path)?;
     let schema = chunk_schema();
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(parquet_properties()))?;
+    let series_path = Path::new(
+        series_index_path
+            .strip_prefix("file://")
+            .unwrap_or(series_index_path),
+    );
+    let series_file_name = series_path
+        .file_name()
+        .ok_or_else(|| invalid_data(format!("invalid series index path {series_path:?}")))?;
+    if let Some(parent) = series_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary_series_path =
+        series_path.with_file_name(format!("{}.partial", series_file_name.to_string_lossy()));
+    let series_file = fs::File::create(&temporary_series_path)?;
+    let series_schema = series_schema();
+    let mut series_writer =
+        ArrowWriter::try_new(series_file, series_schema.clone(), Some(parquet_properties()))?;
     let mut rows = Vec::with_capacity(CHUNK_INDEX_BATCH_SIZE);
+    let mut series_rows = Vec::with_capacity(CHUNK_INDEX_BATCH_SIZE);
     let mut series_count = 0;
     let mut chunk_count = 0;
     let mut write_error: Option<BoxError> = None;
@@ -652,7 +742,14 @@ fn write_chunk_index_streaming(
             &meta.thanos.labels,
             std::slice::from_ref(&series),
         );
-        match append_chunk_rows(repository, meta, block_path, series, &mut rows) {
+        match append_chunk_rows(
+            repository,
+            meta,
+            block_path,
+            series,
+            &mut rows,
+            &mut series_rows,
+        ) {
             Ok(count) => {
                 chunk_count += count;
                 if rows.len() >= CHUNK_INDEX_BATCH_SIZE {
@@ -663,6 +760,13 @@ fn write_chunk_index_streaming(
                         "flushing bounded chunk-index Parquet batch"
                     );
                     if let Err(error) = flush_chunk_rows(&mut writer, &schema, &mut rows) {
+                        write_error = Some(error);
+                    }
+                }
+                if series_rows.len() >= CHUNK_INDEX_BATCH_SIZE {
+                    if let Err(error) =
+                        flush_series_rows(&mut series_writer, &series_schema, &mut series_rows)
+                    {
                         write_error = Some(error);
                     }
                 }
@@ -683,14 +787,18 @@ fn write_chunk_index_streaming(
                     "flushing final chunk-index Parquet batch"
                 );
                 flush_chunk_rows(&mut writer, &schema, &mut rows)?;
+                flush_series_rows(&mut series_writer, &series_schema, &mut series_rows)?;
                 writer.close()?;
+                series_writer.close()?;
                 fs::rename(&temporary_path, path)?;
+                fs::rename(&temporary_series_path, series_path)?;
                 Ok((series_count, chunk_count))
             }
         },
     };
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
+        let _ = fs::remove_file(&temporary_series_path);
     }
     result
 }
@@ -701,6 +809,7 @@ fn append_chunk_rows(
     block_path: &str,
     series: Series,
     rows: &mut Vec<ChunkIndexRow>,
+    series_rows: &mut Vec<SeriesIndexRow>,
 ) -> Result<usize, BoxError> {
     let series_mint = series
         .chunks
@@ -723,9 +832,17 @@ fn append_chunk_rows(
     }
     let labels_json = serde_json::to_string(&labels)?;
     let count = series.chunks.len();
+    let mut chunk_locations = Vec::with_capacity(count);
     for chunk in series.chunks {
         let chunk_file_seq = (chunk.reference >> 32) as u32;
         let chunk_file_offset = chunk.reference & u64::from(u32::MAX);
+        let chunk_file_path = format!("{block_path}/chunks/{:06}", chunk_file_seq + 1);
+        chunk_locations.push(SeriesChunkLocation {
+            chunk_file_path: chunk_file_path.clone(),
+            chunk_file_offset,
+            chunk_mint: chunk.mint,
+            chunk_maxt: chunk.maxt,
+        });
         rows.push(ChunkIndexRow {
             repository_name: repository.name.clone(),
             repository_uri: repository.uri.clone(),
@@ -733,7 +850,7 @@ fn append_chunk_rows(
             block_path: block_path.to_owned(),
             downsample_resolution: meta.thanos.downsample.resolution,
             metric_name: metric_name.clone(),
-            chunk_file_path: format!("{block_path}/chunks/{:06}", chunk_file_seq + 1),
+            chunk_file_path,
             chunk_ref: chunk.reference,
             chunk_file_seq,
             chunk_file_offset,
@@ -746,6 +863,14 @@ fn append_chunk_rows(
             labels_json: labels_json.clone(),
         });
     }
+    series_rows.push(SeriesIndexRow {
+        repository_uri: repository.uri.clone(),
+        downsample_resolution: meta.thanos.downsample.resolution,
+        series_mint,
+        series_maxt,
+        labels_json,
+        chunks_json: serde_json::to_string(&chunk_locations)?,
+    });
     Ok(count)
 }
 
@@ -758,6 +883,20 @@ fn flush_chunk_rows(
         return Ok(());
     }
     writer.write(&chunk_record_batch(schema, rows)?)?;
+    writer.flush()?;
+    rows.clear();
+    Ok(())
+}
+
+fn flush_series_rows(
+    writer: &mut ArrowWriter<fs::File>,
+    schema: &Arc<Schema>,
+    rows: &mut Vec<SeriesIndexRow>,
+) -> Result<(), BoxError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writer.write(&series_record_batch(schema, rows)?)?;
     writer.flush()?;
     rows.clear();
     Ok(())
@@ -1040,6 +1179,17 @@ fn chunk_schema() -> Arc<Schema> {
     ]))
 }
 
+fn series_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("repository_uri", DataType::Utf8, false),
+        Field::new("downsample_resolution", DataType::Int64, false),
+        Field::new("series_mint", DataType::Int64, false),
+        Field::new("series_maxt", DataType::Int64, false),
+        Field::new("labels_json", DataType::Utf8, false),
+        Field::new("chunks_json", DataType::Utf8, false),
+    ]))
+}
+
 fn chunk_record_batch(
     schema: &Arc<Schema>,
     rows: &[ChunkIndexRow],
@@ -1125,6 +1275,39 @@ fn chunk_record_batch(
         )),
     ];
 
+    Ok(RecordBatch::try_new(schema.clone(), columns)?)
+}
+
+fn series_record_batch(
+    schema: &Arc<Schema>,
+    rows: &[SeriesIndexRow],
+) -> Result<RecordBatch, BoxError> {
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.repository_uri.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.downsample_resolution).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.series_mint).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.series_maxt).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.labels_json.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.chunks_json.as_str())
+                .collect::<Vec<_>>(),
+        )),
+    ];
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 

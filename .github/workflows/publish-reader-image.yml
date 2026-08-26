@@ -2,6 +2,12 @@
 name: Reader image
 
 "on":
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to publish
+        required: true
+        type: string
   push:
     branches:
       - main
@@ -44,7 +50,7 @@ jobs:
   build:
     name: Build image (${{ matrix.platform }})
     if: >-
-      github.event_name == 'push' ||
+      github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'pull_request_target' &&
@@ -78,11 +84,17 @@ jobs:
 
       - name: Prepare pull request image tag
         id: pr_image
-        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'
         run: |
-          short_sha="${PR_HEAD_SHA::7}"
-          echo "tag=pr-${PR_NUMBER}-${short_sha}" >> "${GITHUB_OUTPUT}"
+          if [ "${EVENT_NAME}" = workflow_dispatch ]; then
+            echo "tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          else
+            short_sha="${PR_HEAD_SHA::7}"
+            echo "tag=pr-${PR_NUMBER}-${short_sha}" >> "${GITHUB_OUTPUT}"
+          fi
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
 

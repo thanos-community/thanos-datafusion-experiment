@@ -22,7 +22,10 @@ use opendal::{
     services::Fs,
 };
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::{
+    basic::{Compression, ZstdLevel},
+    file::properties::{EnabledStatistics, WriterProperties},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -33,8 +36,10 @@ use crate::{
 
 type BoxError = Box<dyn Error>;
 const DELETION_MARK_FILE_NAME: &str = "deletion-mark.json";
-/// Keep index construction well below the reader's 48 GiB production memory limit.
-const CHUNK_INDEX_BATCH_SIZE: usize = 50_000;
+/// Keep a StoreAPI projection worker comfortably below the reader's 48 GiB production limit.
+/// A series can contain a long JSON array of chunk locations, so 5k rows bounds an Arrow batch
+/// much more reliably than the former 50k-row chunk-oriented batch.
+const INDEX_BATCH_SIZE: usize = 5_000;
 
 #[derive(Debug, Deserialize)]
 struct BlockMeta {
@@ -111,7 +116,7 @@ struct IndexStats {
     series_max_size: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct BlockIndexRow {
     repository_name: String,
     repository_uri: String,
@@ -206,8 +211,18 @@ struct BuiltBlockIndex {
     block_ulid: String,
     block_path: String,
     index_path: String,
-    chunk_index_path: String,
     series_index_path: String,
+    series_count: usize,
+    chunk_count: usize,
+    metric_labels: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Metadata retained beside each completed block projection so a bootstrap can resume after a
+/// restart without re-downloading and expanding immutable TSDB indexes.
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedBlockIndex {
+    row: BlockIndexRow,
+    materialize_chunk_index: bool,
     series_count: usize,
     chunk_count: usize,
     metric_labels: BTreeMap<String, BTreeSet<String>>,
@@ -247,6 +262,7 @@ pub async fn build_block_index(
     storage: &RepositoryRegistry,
     index_build_concurrency: usize,
     metadata_read_concurrency: usize,
+    materialize_chunk_index: bool,
     block_max_age: Option<Duration>,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
     let mut meta_read_tasks = Vec::new();
@@ -269,7 +285,8 @@ pub async fn build_block_index(
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
-            metrics::counter!("thanos_reader_block_index_metadata_blocks_discovered_total").increment(1);
+            metrics::counter!("thanos_reader_block_index_metadata_blocks_discovered_total")
+                .increment(1);
             meta_read_tasks.push(MetaReadTask {
                 repository: repository.clone(),
                 storage_repository: storage_repository.clone(),
@@ -325,8 +342,38 @@ pub async fn build_block_index(
     );
     metrics::gauge!("thanos_reader_block_index_total_blocks").set(tasks.len() as f64);
     metrics::gauge!("thanos_reader_block_index_processed_blocks").set(0.0);
+    if !materialize_chunk_index {
+        remove_chunk_index_files(index_cache_location)?;
+    }
     let built_indexes = stream::iter(tasks)
-        .map(|task| build_chunk_index(task, index_cache_location.to_owned()))
+        .map(|task| {
+            let index_cache_location = index_cache_location.to_owned();
+            async move {
+                match load_cached_block_index(
+                    &task,
+                    &index_cache_location,
+                    materialize_chunk_index,
+                )? {
+                    Some(cached) => {
+                        metrics::counter!("thanos_reader_block_index_blocks_reused_total")
+                            .increment(1);
+                        metrics::gauge!("thanos_reader_block_index_processed_blocks")
+                            .increment(1.0);
+                        tracing::info!(
+                            repository = %cached.row.repository_name,
+                            block_ulid = %cached.block_ulid,
+                            series_count = cached.series_count,
+                            chunk_count = cached.chunk_count,
+                            "reused completed Thanos block index from local cache"
+                        );
+                        Ok(cached)
+                    }
+                    None => {
+                        build_chunk_index(task, index_cache_location, materialize_chunk_index).await
+                    }
+                }
+            }
+        })
         .buffer_unordered(index_build_concurrency)
         .try_collect::<Vec<_>>()
         .await?;
@@ -338,7 +385,6 @@ pub async fn build_block_index(
             block_ulid = %built.block_ulid,
             block_path = %built.block_path,
             index_path = %built.index_path,
-            chunk_index_path = %built.chunk_index_path,
             series_count = built.series_count,
             chunk_count = built.chunk_count,
             "processed Thanos block into expanded chunk parquet index"
@@ -347,8 +393,8 @@ pub async fn build_block_index(
         rows.push(built.row);
     }
 
-    cleanup_chunk_index_files(index_cache_location, &active_block_ulids)?;
     cleanup_series_index_files(index_cache_location, &active_block_ulids)?;
+    cleanup_block_manifest_files(index_cache_location, &active_block_ulids)?;
 
     rows.sort_by(|left, right| {
         (
@@ -393,7 +439,26 @@ async fn read_block_meta(
         return Ok(MetaReadResult::SkippedDeleted);
     }
 
-    let contents = task.storage_repository.read(&task.meta_path).await?;
+    let contents = match task.storage_repository.read(&task.meta_path).await {
+        Ok(contents) => contents,
+        // S3 listings are eventually consistent with block deletion. A deletion mark can be
+        // written after the check above, or the object can disappear between listing and read.
+        // This is an expected race, not a bootstrap-fatal repository error.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            metrics::counter!("thanos_reader_block_index_blocks_skipped_deleted_total")
+                .increment(1);
+            metrics::counter!("thanos_reader_block_index_metadata_blocks_examined_total")
+                .increment(1);
+            tracing::info!(
+                repository = %task.repository.name,
+                block_path = %task.block_path,
+                meta_path = %task.meta_path,
+                "skipped Thanos block whose metadata disappeared during discovery"
+            );
+            return Ok(MetaReadResult::SkippedDeleted);
+        }
+        Err(error) => return Err(Box::new(error)),
+    };
     metrics::counter!("thanos_reader_block_index_metadata_blocks_examined_total").increment(1);
     let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
         metrics::counter!("thanos_reader_block_index_block_meta_parse_failures_total").increment(1);
@@ -423,6 +488,7 @@ async fn read_block_meta(
 async fn build_chunk_index(
     task: BlockBuildTask,
     index_cache_location: String,
+    materialize_chunk_index: bool,
 ) -> Result<BuiltBlockIndex, BoxError> {
     let index_path = format!("{}/index", task.block_path);
     let started = Instant::now();
@@ -444,19 +510,32 @@ async fn build_chunk_index(
         let index_path_for_error = index_path.clone();
         let index_path_for_worker = index_path.clone();
         let built_index = tokio::task::spawn_blocking(move || {
-            let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
             let series_index_path = series_index_file_path(&index_cache_location, &task.meta.ulid);
-            let mut metric_labels = BTreeMap::new();
-            let (series_count, chunk_count) = write_chunk_index_streaming(
-                &task.repository,
-                &task.meta,
-                &task.block_path,
-                &index,
-                &chunk_index_path,
-                &series_index_path,
-                &mut metric_labels,
-            )
-            .map_err(|error| error.to_string())?;
+            let (series_count, chunk_count, metric_labels) = if materialize_chunk_index {
+                let chunk_index_path =
+                    chunk_index_file_path(&index_cache_location, &task.meta.ulid);
+                let (series_count, chunk_count, metric_labels) =
+                    write_chunk_and_series_index_streaming(
+                        &task.repository,
+                        &task.meta,
+                        &task.block_path,
+                        &index,
+                        &chunk_index_path,
+                        &series_index_path,
+                    )
+                    .map_err(|error| error.to_string())?;
+                (series_count, chunk_count, metric_labels)
+            } else {
+                let (series_count, chunk_count) = write_series_index_streaming(
+                    &task.repository.uri,
+                    &task.meta,
+                    &task.block_path,
+                    &index,
+                    &series_index_path,
+                )
+                .map_err(|error| error.to_string())?;
+                (series_count, chunk_count, BTreeMap::new())
+            };
             let block_ulid = task.meta.ulid.clone();
             let row = index_row(
                 &task.repository,
@@ -473,21 +552,31 @@ async fn build_chunk_index(
                 chunk_count,
                 "finished Thanos block index build"
             );
-            Ok::<_, String>(BuiltBlockIndex {
+            let cached = CachedBlockIndex {
                 row,
-                block_ulid,
-                block_path: task.block_path,
-                index_path: index_path_for_worker,
-                chunk_index_path,
-                series_index_path,
+                materialize_chunk_index,
                 series_count,
                 chunk_count,
                 metric_labels,
+            };
+            write_block_manifest(&index_cache_location, &block_ulid, &cached)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(BuiltBlockIndex {
+                row: cached.row,
+                block_ulid,
+                block_path: task.block_path,
+                index_path: index_path_for_worker,
+                series_index_path,
+                series_count: cached.series_count,
+                chunk_count: cached.chunk_count,
+                metric_labels: cached.metric_labels,
             })
         })
         .await
         .map_err(|error| invalid_data(format!("block index worker failed: {error}")))?
-        .map_err(|error| invalid_data(format!("failed to process {index_path_for_error}: {error}")))?;
+        .map_err(|error| {
+            invalid_data(format!("failed to process {index_path_for_error}: {error}"))
+        })?;
         Ok(built_index)
     }
     .await;
@@ -570,6 +659,92 @@ pub fn series_index_directory_path(index_cache_location: &str) -> String {
         .into_owned()
 }
 
+fn block_manifest_file_path(index_cache_location: &str, block_ulid: &str) -> String {
+    let location = index_cache_location
+        .strip_prefix("file://")
+        .unwrap_or(index_cache_location);
+    Path::new(location)
+        .join("manifests")
+        .join(format!("{block_ulid}.json"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn load_cached_block_index(
+    task: &BlockBuildTask,
+    index_cache_location: &str,
+    materialize_chunk_index: bool,
+) -> Result<Option<BuiltBlockIndex>, BoxError> {
+    let chunk_index_path = chunk_index_file_path(index_cache_location, &task.meta.ulid);
+    let series_index_path = series_index_file_path(index_cache_location, &task.meta.ulid);
+    if !Path::new(&series_index_path).is_file()
+        || (materialize_chunk_index && !Path::new(&chunk_index_path).is_file())
+    {
+        return Ok(None);
+    }
+
+    let manifest_path = block_manifest_file_path(index_cache_location, &task.meta.ulid);
+    let bytes = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Box::new(error)),
+    };
+    let cached: CachedBlockIndex = match serde_json::from_slice(&bytes) {
+        Ok(cached) => cached,
+        Err(error) => {
+            tracing::warn!(
+                path = %manifest_path,
+                error = %error,
+                "ignoring unreadable completed block index manifest"
+            );
+            return Ok(None);
+        }
+    };
+    if cached.row.block_ulid != task.meta.ulid
+        || cached.materialize_chunk_index != materialize_chunk_index
+        || cached.row.repository_name != task.repository.name
+        || cached.row.repository_uri != task.repository.uri
+        || cached.row.block_path != task.block_path
+        || cached.row.meta_path != task.meta_path
+    {
+        tracing::warn!(
+            path = %manifest_path,
+            block_ulid = %task.meta.ulid,
+            "ignoring completed block index manifest that does not match block metadata"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(BuiltBlockIndex {
+        block_ulid: cached.row.block_ulid.clone(),
+        block_path: task.block_path.clone(),
+        index_path: format!("{}/index", task.block_path),
+        series_index_path,
+        series_count: cached.series_count,
+        chunk_count: cached.chunk_count,
+        metric_labels: cached.metric_labels,
+        row: cached.row,
+    }))
+}
+
+fn write_block_manifest(
+    index_cache_location: &str,
+    block_ulid: &str,
+    cached: &CachedBlockIndex,
+) -> Result<(), BoxError> {
+    let path = block_manifest_file_path(index_cache_location, block_ulid);
+    let path = Path::new(&path);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| invalid_data(format!("invalid block manifest path {path:?}")))?;
+    fs::create_dir_all(parent)?;
+    let temporary_path = path.with_extension("json.partial");
+    fs::write(&temporary_path, serde_json::to_vec(cached)?)?;
+    fs::rename(temporary_path, path)?;
+    Ok(())
+}
+
 fn cleanup_chunk_index_files(
     index_cache_location: &str,
     active_block_ulids: &BTreeSet<String>,
@@ -581,6 +756,34 @@ fn cleanup_chunk_index_files(
     )
 }
 
+/// The StoreAPI serves chunk locations from the series projection. Remove legacy per-chunk
+/// projections before a bootstrap so a previous reader version cannot consume the entire PVC.
+fn remove_chunk_index_files(index_cache_location: &str) -> Result<(), BoxError> {
+    let directory_path = chunk_index_directory_path(index_cache_location);
+    let directory = Path::new(&directory_path);
+    if !directory.exists() {
+        return Ok(());
+    }
+    let mut removed = 0usize;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_legacy_chunk_projection = path.extension().and_then(|value| value.to_str())
+            == Some("parquet")
+            || path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".parquet.partial"));
+        if entry.file_type()?.is_file() && is_legacy_chunk_projection {
+            fs::remove_file(path)?;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "removed legacy per-chunk index projections");
+    }
+    Ok(())
+}
+
 fn cleanup_series_index_files(
     index_cache_location: &str,
     active_block_ulids: &BTreeSet<String>,
@@ -589,6 +792,20 @@ fn cleanup_series_index_files(
         Path::new(&series_index_directory_path(index_cache_location)),
         active_block_ulids,
         "series",
+    )
+}
+
+fn cleanup_block_manifest_files(
+    index_cache_location: &str,
+    active_block_ulids: &BTreeSet<String>,
+) -> Result<(), BoxError> {
+    let location = index_cache_location
+        .strip_prefix("file://")
+        .unwrap_or(index_cache_location);
+    cleanup_index_files(
+        Path::new(location).join("manifests").as_path(),
+        active_block_ulids,
+        "manifest",
     )
 }
 
@@ -605,7 +822,10 @@ fn cleanup_index_files(
         let entry = entry?;
         let path = entry.path();
         if !entry.file_type()?.is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("parquet")
+            || !matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("parquet" | "json")
+            )
         {
             continue;
         }
@@ -677,17 +897,14 @@ fn index_row(
     })
 }
 
-/// Expand a single block's TSDB index into Parquet without holding the block's full series,
-/// expanded chunks, or encoded Parquet bytes in memory at once.
-fn write_chunk_index_streaming(
+fn write_chunk_and_series_index_streaming(
     repository: &ThanosRepositoryConfig,
     meta: &BlockMeta,
     block_path: &str,
     index: &[u8],
     chunk_index_path: &str,
     series_index_path: &str,
-    metric_labels: &mut BTreeMap<String, BTreeSet<String>>,
-) -> Result<(usize, usize), BoxError> {
+) -> Result<(usize, usize, BTreeMap<String, BTreeSet<String>>), BoxError> {
     let path = Path::new(
         chunk_index_path
             .strip_prefix("file://")
@@ -724,10 +941,14 @@ fn write_chunk_index_streaming(
         series_path.with_file_name(format!("{}.partial", series_file_name.to_string_lossy()));
     let series_file = fs::File::create(&temporary_series_path)?;
     let series_schema = series_schema();
-    let mut series_writer =
-        ArrowWriter::try_new(series_file, series_schema.clone(), Some(parquet_properties()))?;
-    let mut rows = Vec::with_capacity(CHUNK_INDEX_BATCH_SIZE);
-    let mut series_rows = Vec::with_capacity(CHUNK_INDEX_BATCH_SIZE);
+    let mut series_writer = ArrowWriter::try_new(
+        series_file,
+        series_schema.clone(),
+        Some(parquet_properties()),
+    )?;
+    let mut rows = Vec::with_capacity(INDEX_BATCH_SIZE);
+    let mut series_rows = Vec::with_capacity(INDEX_BATCH_SIZE);
+    let mut metric_labels = BTreeMap::new();
     let mut series_count = 0;
     let mut chunk_count = 0;
     let mut write_error: Option<BoxError> = None;
@@ -738,7 +959,7 @@ fn write_chunk_index_streaming(
         }
         series_count += 1;
         collect_metric_labels(
-            metric_labels,
+            &mut metric_labels,
             &meta.thanos.labels,
             std::slice::from_ref(&series),
         );
@@ -752,18 +973,12 @@ fn write_chunk_index_streaming(
         ) {
             Ok(count) => {
                 chunk_count += count;
-                if rows.len() >= CHUNK_INDEX_BATCH_SIZE {
-                    tracing::info!(
-                        block_ulid = %meta.ulid,
-                        batch_rows = rows.len(),
-                        total_chunks = chunk_count,
-                        "flushing bounded chunk-index Parquet batch"
-                    );
+                if rows.len() >= INDEX_BATCH_SIZE {
                     if let Err(error) = flush_chunk_rows(&mut writer, &schema, &mut rows) {
                         write_error = Some(error);
                     }
                 }
-                if series_rows.len() >= CHUNK_INDEX_BATCH_SIZE {
+                if series_rows.len() >= INDEX_BATCH_SIZE {
                     if let Err(error) =
                         flush_series_rows(&mut series_writer, &series_schema, &mut series_rows)
                     {
@@ -780,19 +995,13 @@ fn write_chunk_index_streaming(
         Ok(()) => match write_error {
             Some(error) => Err(error),
             None => {
-                tracing::info!(
-                    block_ulid = %meta.ulid,
-                    batch_rows = rows.len(),
-                    total_chunks = chunk_count,
-                    "flushing final chunk-index Parquet batch"
-                );
                 flush_chunk_rows(&mut writer, &schema, &mut rows)?;
                 flush_series_rows(&mut series_writer, &series_schema, &mut series_rows)?;
                 writer.close()?;
                 series_writer.close()?;
                 fs::rename(&temporary_path, path)?;
                 fs::rename(&temporary_series_path, series_path)?;
-                Ok((series_count, chunk_count))
+                Ok((series_count, chunk_count, metric_labels))
             }
         },
     };
@@ -801,6 +1010,130 @@ fn write_chunk_index_streaming(
         let _ = fs::remove_file(&temporary_series_path);
     }
     result
+}
+
+/// Materialize the StoreAPI projection without retaining a block's complete expanded index.
+///
+/// The old per-chunk projection duplicated each series' labels and chunk locations. StoreAPI
+/// reads the series projection directly, so omitting that duplicate keeps both the working set
+/// and durable index within the cache volume.
+fn write_series_index_streaming(
+    repository_uri: &str,
+    meta: &BlockMeta,
+    block_path: &str,
+    index: &[u8],
+    series_index_path: &str,
+) -> Result<(usize, usize), BoxError> {
+    let series_path = Path::new(
+        series_index_path
+            .strip_prefix("file://")
+            .unwrap_or(series_index_path),
+    );
+    let series_file_name = series_path
+        .file_name()
+        .ok_or_else(|| invalid_data(format!("invalid series index path {series_path:?}")))?;
+    if let Some(parent) = series_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary_series_path =
+        series_path.with_file_name(format!("{}.partial", series_file_name.to_string_lossy()));
+    let series_file = fs::File::create(&temporary_series_path)?;
+    let series_schema = series_schema();
+    let mut series_writer = ArrowWriter::try_new(
+        series_file,
+        series_schema.clone(),
+        Some(parquet_properties()),
+    )?;
+    let mut series_rows = Vec::with_capacity(INDEX_BATCH_SIZE);
+    let mut series_count = 0;
+    let mut chunk_count = 0;
+    let mut write_error: Option<BoxError> = None;
+
+    let parsed = tsdb_index::parse_each(index, |series| {
+        if write_error.is_some() {
+            return;
+        }
+        series_count += 1;
+        match append_series_row(repository_uri, meta, block_path, series, &mut series_rows) {
+            Ok(count) => {
+                chunk_count += count;
+                if series_rows.len() >= INDEX_BATCH_SIZE {
+                    if let Err(error) =
+                        flush_series_rows(&mut series_writer, &series_schema, &mut series_rows)
+                    {
+                        write_error = Some(error);
+                    }
+                }
+            }
+            Err(error) => write_error = Some(error),
+        }
+    });
+
+    let result = match parsed {
+        Err(error) => Err(Box::new(error) as BoxError),
+        Ok(()) => match write_error {
+            Some(error) => Err(error),
+            None => {
+                flush_series_rows(&mut series_writer, &series_schema, &mut series_rows)?;
+                series_writer.close()?;
+                fs::rename(&temporary_series_path, series_path)?;
+                Ok((series_count, chunk_count))
+            }
+        },
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_series_path);
+    }
+    result
+}
+
+fn append_series_row(
+    repository_uri: &str,
+    meta: &BlockMeta,
+    block_path: &str,
+    series: Series,
+    series_rows: &mut Vec<SeriesIndexRow>,
+) -> Result<usize, BoxError> {
+    let series_mint = series
+        .chunks
+        .first()
+        .map(|chunk| chunk.mint)
+        .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+    let series_maxt = series
+        .chunks
+        .last()
+        .map(|chunk| chunk.maxt)
+        .ok_or_else(|| invalid_data("series has no chunks".to_owned()))?;
+    let mut labels = series.labels;
+    for (name, value) in &meta.thanos.labels {
+        labels.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    let count = series.chunks.len();
+    let chunk_locations = series
+        .chunks
+        .into_iter()
+        .map(|chunk| {
+            let chunk_file_seq = (chunk.reference >> 32) as u32;
+            SeriesChunkLocation {
+                chunk_file_path: format!("{block_path}/chunks/{:06}", chunk_file_seq + 1),
+                chunk_file_offset: chunk.reference & u64::from(u32::MAX),
+                chunk_mint: chunk.mint,
+                chunk_maxt: chunk.maxt,
+            }
+        })
+        .collect::<Vec<_>>();
+    series_rows.push(SeriesIndexRow {
+        repository_uri: repository_uri.to_owned(),
+        downsample_resolution: meta.thanos.downsample.resolution,
+        series_mint,
+        series_maxt,
+        labels_json: serde_json::to_string(&labels)?,
+        chunks_json: serde_json::to_string(&chunk_locations)?,
+    });
+    Ok(count)
 }
 
 fn append_chunk_rows(
@@ -959,11 +1292,14 @@ fn parquet_bytes(schema: Arc<Schema>, batch: RecordBatch) -> Result<Vec<u8>, Box
 
 fn parquet_properties() -> WriterProperties {
     WriterProperties::builder()
+        // Index rows repeat metric names, labels, and chunk paths heavily. Zstd level 1 keeps
+        // CPU and encoder memory low while avoiding the enormous uncompressed cache footprint.
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_write_page_header_statistics(true)
         .set_statistics_truncate_length(None)
         .set_column_index_truncate_length(None)
-        .set_max_row_group_row_count(Some(CHUNK_INDEX_BATCH_SIZE))
+        .set_max_row_group_row_count(Some(INDEX_BATCH_SIZE))
         .build()
 }
 
@@ -1289,7 +1625,9 @@ fn series_record_batch(
                 .collect::<Vec<_>>(),
         )),
         Arc::new(Int64Array::from(
-            rows.iter().map(|row| row.downsample_resolution).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| row.downsample_resolution)
+                .collect::<Vec<_>>(),
         )),
         Arc::new(Int64Array::from(
             rows.iter().map(|row| row.series_mint).collect::<Vec<_>>(),
@@ -1405,6 +1743,7 @@ mod tests {
             &storage,
             StorageConfig::default().index_build_concurrency,
             StorageConfig::default().metadata_read_concurrency,
+            StorageConfig::default().materialize_chunk_index,
             None,
         )
         .await
@@ -1456,6 +1795,7 @@ mod tests {
         assert!(metadata.offset_index().is_some());
         for column in metadata.row_group(0).columns() {
             assert!(column.statistics().is_some(), "{column:?}");
+            assert!(matches!(column.compression(), Compression::ZSTD(_)));
         }
     }
 

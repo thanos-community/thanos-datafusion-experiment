@@ -210,7 +210,11 @@ fn exact_label_filters(matchers: &[Matcher]) -> Result<Vec<String>, serde_json::
     matchers
         .iter()
         .filter_map(|matcher| match matcher {
-            Matcher::Eq(name, value) => Some((name, value)),
+            // Prometheus defines `label=""` to also match a missing label. A JSON substring
+            // predicate cannot express that without excluding valid series, so retain it for
+            // the final matcher evaluation.
+            Matcher::Eq(name, value) if !value.is_empty() => Some((name, value)),
+            Matcher::Eq(_, _) => None,
             Matcher::Neq(_, _) | Matcher::Re(_, _) | Matcher::Nre(_, _) => None,
         })
         .map(|(name, value)| {
@@ -695,6 +699,7 @@ mod tests {
         let filters = exact_label_filters(&[
             Matcher::Eq("__name__".to_owned(), "process_cpu_seconds_total".to_owned()),
             Matcher::Eq("prometheus".to_owned(), "monitoring/reader".to_owned()),
+            Matcher::Eq("missing".to_owned(), String::new()),
             Matcher::Re("job".to_owned(), Regex::new("reader").unwrap()),
         ])
         .unwrap();

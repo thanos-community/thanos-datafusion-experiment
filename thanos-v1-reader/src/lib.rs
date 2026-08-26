@@ -139,7 +139,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &storage,
         config.storage.index_build_concurrency,
         config.storage.metadata_read_concurrency,
-        config.storage.bootstrap_max_blocks,
         config.storage.block_max_age_duration()?,
     )
     .await?;
@@ -337,7 +336,6 @@ mod tests {
             &storage,
             config::StorageConfig::default().index_build_concurrency,
             config::StorageConfig::default().metadata_read_concurrency,
-            None,
             None,
         )
         .await

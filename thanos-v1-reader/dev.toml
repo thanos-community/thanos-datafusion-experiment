@@ -15,7 +15,6 @@ bulk_read_concurrency = 4
 max_concurrent_chunk_reads = 16
 index_build_concurrency = 12
 metadata_read_concurrency = 64
-# bootstrap_max_blocks = 64
 
 # Enable this in production on a node-local persistent volume.
 # [storage.chunk_cache]

@@ -147,8 +147,6 @@ max_concurrent_chunk_reads = 16
 index_build_concurrency = 12
 # I/O-bound meta.json/deletion-marker discovery; bounded by max_concurrent_requests.
 metadata_read_concurrency = 64
-# Optional newest-block cap for a fast, bounded bootstrap.
-# bootstrap_max_blocks = 64
 bulk_read_chunk_size = "8MiB"
 bulk_read_concurrency = 4
 

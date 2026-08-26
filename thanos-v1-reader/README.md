@@ -168,6 +168,29 @@ locked prevents startup.
 The writer emits Parquet row-group min/max statistics and page-level column indexes. Each
 generated file has a single row group, so its row-group statistics cover the whole file.
 
+### TSDB block conversion
+
+`convert` expands a single TSDB block into a sorted Parquet sample file. Both arguments are
+OpenDAL URIs, so the same command works with `file://`, `s3://`, and `gs://` locations (using
+the normal AWS/GCP credential chains):
+
+```sh
+cargo run --bin convert -- file:///blocks/01ABC... file:///exports/01ABC.parquet
+```
+
+The output contains native Parquet `VARIANT(1)` labels, with label values shredded into typed
+UTF-8 leaves ordered by decreasing observed cardinality, a 16-byte canonical label hash, and
+sorted `(name, labels..., timestamp)` samples. It uses one row group, Zstd compression, page
+statistics/indexes, delta byte-array hash encoding, delta timestamps, and byte-stream-split
+sample values. `thanos.labels_hll.v1` in the Parquet footer stores packed per-label HLL
+registers for cardinality planning.
+
+Compare the TSDB `index` plus chunks footprint to the converted file with:
+
+```sh
+bash benches/block-storage.sh /blocks/01ABC... /exports/01ABC.parquet
+```
+
 The Prometheus scrape endpoint listens on `metrics_listen_addr` and serves metrics at
 `/metrics`. OpenDAL operations are recorded with OpenDAL's metrics layer and traced with its
 OpenTelemetry layer. Configure standard `OTEL_EXPORTER_OTLP_*` environment variables to send

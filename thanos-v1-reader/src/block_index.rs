@@ -169,6 +169,19 @@ struct BlockBuildTask {
     meta_path: String,
 }
 
+struct MetaReadTask {
+    repository: ThanosRepositoryConfig,
+    storage_repository: std::sync::Arc<crate::storage::Repository>,
+    block_path: String,
+    meta_path: String,
+}
+
+enum MetaReadResult {
+    Build(BlockBuildTask),
+    SkippedOld,
+    SkippedDeleted,
+}
+
 struct BuiltBlockIndex {
     row: BlockIndexRow,
     block_ulid: String,
@@ -213,11 +226,10 @@ pub async fn build_block_index(
     index_cache_location: &str,
     storage: &RepositoryRegistry,
     index_build_concurrency: usize,
+    metadata_read_concurrency: usize,
     block_max_age: Option<Duration>,
 ) -> Result<Vec<MetricTableSchema>, BoxError> {
-    let mut tasks = Vec::new();
-    let mut active_block_ulids = BTreeSet::new();
-    let mut skipped_old_blocks = 0usize;
+    let mut meta_read_tasks = Vec::new();
 
     for repository in repositories {
         let storage_repository = storage.require(&repository.uri)?;
@@ -237,50 +249,46 @@ pub async fn build_block_index(
                 .strip_suffix("/meta.json")
                 .ok_or_else(|| invalid_data(format!("invalid metadata path {meta_path:?}")))?
                 .to_owned();
-            if block_has_deletion_mark(storage_repository.operator(), &block_path).await? {
-                tracing::trace!(
-                    repository = %repository.name,
-                    block_path = %block_path,
-                    "skipping deleted Thanos block"
-                );
-                continue;
-            }
-
-            let contents = storage_repository.read(&meta_path).await?;
-            let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
-                tracing::error!(
-                    repository = %repository.name,
-                    repository_uri = %repository.uri,
-                    block_path = %block_path,
-                    meta_path = %meta_path,
-                    error = %error,
-                    "failed to parse Thanos block metadata"
-                );
-                error
-            })?;
-            if block_is_older_than(&meta, block_max_age)? {
-                skipped_old_blocks += 1;
-                tracing::debug!(
-                    repository = %repository.name,
-                    block_ulid = %meta.ulid,
-                    block_path = %block_path,
-                    max_time = meta.max_time,
-                    max_age = ?block_max_age,
-                    "skipping Thanos block older than configured maximum age"
-                );
-                continue;
-            }
-            active_block_ulids.insert(meta.ulid.clone());
-
-            tasks.push(BlockBuildTask {
+            metrics::counter!("thanos_reader_block_index_metadata_blocks_discovered_total").increment(1);
+            meta_read_tasks.push(MetaReadTask {
                 repository: repository.clone(),
                 storage_repository: storage_repository.clone(),
-                meta,
                 block_path,
                 meta_path,
             });
         }
     }
+
+    // Thanos block ULIDs sort by creation time. Process the newest blocks first so a recent
+    // query can become available before we have examined the historical tail of the bucket.
+    meta_read_tasks.sort_unstable_by(|left, right| right.block_path.cmp(&left.block_path));
+
+    tracing::info!(
+        blocks = meta_read_tasks.len(),
+        concurrency = metadata_read_concurrency,
+        "reading Thanos block metadata concurrently"
+    );
+    let meta_read_results = stream::iter(meta_read_tasks)
+        .map(|task| read_block_meta(task, block_max_age))
+        .buffer_unordered(metadata_read_concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut tasks = Vec::new();
+    let mut skipped_old_blocks = 0usize;
+    for result in meta_read_results {
+        match result {
+            MetaReadResult::Build(task) => {
+                tasks.push(task);
+            }
+            MetaReadResult::SkippedOld => skipped_old_blocks += 1,
+            MetaReadResult::SkippedDeleted => {}
+        }
+    }
+
+    let active_block_ulids = tasks
+        .iter()
+        .map(|task| task.meta.ulid.clone())
+        .collect::<BTreeSet<_>>();
 
     if skipped_old_blocks > 0 {
         tracing::info!(
@@ -354,6 +362,43 @@ fn block_is_older_than(meta: &BlockMeta, max_age: Option<Duration>) -> Result<bo
     Ok(i128::from(meta.max_time) < i128::try_from(cutoff)?)
 }
 
+async fn read_block_meta(
+    task: MetaReadTask,
+    block_max_age: Option<Duration>,
+) -> Result<MetaReadResult, BoxError> {
+    if block_has_deletion_mark(task.storage_repository.operator(), &task.block_path).await? {
+        metrics::counter!("thanos_reader_block_index_blocks_skipped_deleted_total").increment(1);
+        metrics::counter!("thanos_reader_block_index_metadata_blocks_examined_total").increment(1);
+        return Ok(MetaReadResult::SkippedDeleted);
+    }
+
+    let contents = task.storage_repository.read(&task.meta_path).await?;
+    metrics::counter!("thanos_reader_block_index_metadata_blocks_examined_total").increment(1);
+    let meta: BlockMeta = serde_json::from_slice(&contents).map_err(|error| {
+        metrics::counter!("thanos_reader_block_index_block_meta_parse_failures_total").increment(1);
+        tracing::error!(
+            repository = %task.repository.name,
+            repository_uri = %task.repository.uri,
+            block_path = %task.block_path,
+            meta_path = %task.meta_path,
+            error = %error,
+            "failed to parse Thanos block metadata"
+        );
+        error
+    })?;
+    if block_is_older_than(&meta, block_max_age)? {
+        return Ok(MetaReadResult::SkippedOld);
+    }
+
+    Ok(MetaReadResult::Build(BlockBuildTask {
+        repository: task.repository,
+        storage_repository: task.storage_repository,
+        meta,
+        block_path: task.block_path,
+        meta_path: task.meta_path,
+    }))
+}
+
 async fn build_chunk_index(
     task: BlockBuildTask,
     index_cache_location: String,
@@ -366,7 +411,7 @@ async fn build_chunk_index(
         block_path = %task.block_path,
         "starting Thanos block index build"
     );
-    let result = async {
+    let result: Result<BuiltBlockIndex, BoxError> = async {
         let index = task.storage_repository.read(&index_path).await?;
         tracing::debug!(
             repository = %task.repository.name,
@@ -375,41 +420,51 @@ async fn build_chunk_index(
             index_bytes = index.len(),
             "downloaded Thanos TSDB index"
         );
-        let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
-        let mut metric_labels = BTreeMap::new();
-        let (series_count, chunk_count) = write_chunk_index_streaming(
-            &task.repository,
-            &task.meta,
-            &task.block_path,
-            &index,
-            &chunk_index_path,
-            &mut metric_labels,
-        )?;
-        let block_ulid = task.meta.ulid.clone();
-        let row = index_row(
-            &task.repository,
-            task.meta,
-            task.block_path.clone(),
-            task.meta_path,
-        )?;
-        tracing::info!(
-            repository = %task.repository.name,
-            block_ulid = %block_ulid,
-            elapsed_seconds = started.elapsed().as_secs_f64(),
-            series_count,
-            chunk_count,
-            "finished Thanos block index build"
-        );
-        Ok(BuiltBlockIndex {
-            row,
-            block_ulid,
-            block_path: task.block_path,
-            index_path: index_path.clone(),
-            chunk_index_path,
-            series_count,
-            chunk_count,
-            metric_labels,
+        let index_path_for_error = index_path.clone();
+        let index_path_for_worker = index_path.clone();
+        let built_index = tokio::task::spawn_blocking(move || {
+            let chunk_index_path = chunk_index_file_path(&index_cache_location, &task.meta.ulid);
+            let mut metric_labels = BTreeMap::new();
+            let (series_count, chunk_count) = write_chunk_index_streaming(
+                &task.repository,
+                &task.meta,
+                &task.block_path,
+                &index,
+                &chunk_index_path,
+                &mut metric_labels,
+            )
+            .map_err(|error| error.to_string())?;
+            let block_ulid = task.meta.ulid.clone();
+            let row = index_row(
+                &task.repository,
+                task.meta,
+                task.block_path.clone(),
+                task.meta_path,
+            )
+            .map_err(|error| error.to_string())?;
+            tracing::info!(
+                repository = %task.repository.name,
+                block_ulid = %block_ulid,
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                series_count,
+                chunk_count,
+                "finished Thanos block index build"
+            );
+            Ok::<_, String>(BuiltBlockIndex {
+                row,
+                block_ulid,
+                block_path: task.block_path,
+                index_path: index_path_for_worker,
+                chunk_index_path,
+                series_count,
+                chunk_count,
+                metric_labels,
+            })
         })
+        .await
+        .map_err(|error| invalid_data(format!("block index worker failed: {error}")))?
+        .map_err(|error| invalid_data(format!("failed to process {index_path_for_error}: {error}")))?;
+        Ok(built_index)
     }
     .await;
 
@@ -1166,6 +1221,7 @@ mod tests {
             root.path().join("cache").to_str().unwrap(),
             &storage,
             StorageConfig::default().index_build_concurrency,
+            StorageConfig::default().metadata_read_concurrency,
             None,
         )
         .await

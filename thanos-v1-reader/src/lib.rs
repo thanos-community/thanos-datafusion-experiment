@@ -66,6 +66,9 @@ pub async fn index_context(
     context
         .register_parquet("blocks", block_index_path, ParquetReadOptions::default())
         .await?;
+    if metric_table_schemas.is_empty() {
+        return Ok(context);
+    }
     context
         .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
         .await?;
@@ -135,6 +138,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.index_cache_location,
         &storage,
         config.storage.index_build_concurrency,
+        config.storage.metadata_read_concurrency,
         config.storage.block_max_age_duration()?,
     )
     .await?;
@@ -331,6 +335,7 @@ mod tests {
             cache.to_str().unwrap(),
             &storage,
             config::StorageConfig::default().index_build_concurrency,
+            config::StorageConfig::default().metadata_read_concurrency,
             None,
         )
         .await

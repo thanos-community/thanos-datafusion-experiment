@@ -63,6 +63,9 @@ pub struct StorageConfig {
     pub max_concurrent_chunk_reads: usize,
     #[serde(default = "default_index_build_concurrency")]
     pub index_build_concurrency: usize,
+    /// Maximum in-flight metadata and deletion-marker requests while discovering blocks.
+    #[serde(default = "default_metadata_read_concurrency")]
+    pub metadata_read_concurrency: usize,
     /// Ignore blocks whose maximum timestamp is older than this duration. This is useful for
     /// bringing up an experimental reader against a large historical bucket.
     #[serde(default)]
@@ -81,6 +84,7 @@ impl Default for StorageConfig {
             bulk_read_concurrency: default_bulk_read_concurrency(),
             max_concurrent_chunk_reads: default_max_concurrent_chunk_reads(),
             index_build_concurrency: default_index_build_concurrency(),
+            metadata_read_concurrency: default_metadata_read_concurrency(),
             block_max_age: None,
             chunk_cache: None,
         }
@@ -220,6 +224,7 @@ impl ReaderConfig {
             || storage.bulk_read_concurrency == 0
             || storage.max_concurrent_chunk_reads == 0
             || storage.index_build_concurrency == 0
+            || storage.metadata_read_concurrency == 0
         {
             return Err("storage concurrency values must be greater than zero".into());
         }
@@ -269,6 +274,10 @@ fn default_max_concurrent_chunk_reads() -> usize {
 }
 fn default_index_build_concurrency() -> usize {
     12
+}
+
+fn default_metadata_read_concurrency() -> usize {
+    64
 }
 fn default_chunk_cache_max_size() -> String {
     "10GiB".to_owned()
@@ -320,6 +329,8 @@ mod tests {
             8 * 1024_u64.pow(2)
         );
         assert_eq!(storage.max_concurrent_chunk_reads, 16);
+        assert_eq!(storage.index_build_concurrency, 12);
+        assert_eq!(storage.metadata_read_concurrency, 64);
         assert_eq!(default_chunk_cache_page_size(), "512KiB");
     }
 

@@ -143,6 +143,10 @@ request_timeout = "30s"
 max_retries = 3
 max_concurrent_requests = 64
 max_concurrent_chunk_reads = 16
+# CPU-bound TSDB index construction; normally match the pod CPU limit.
+index_build_concurrency = 12
+# I/O-bound meta.json/deletion-marker discovery; bounded by max_concurrent_requests.
+metadata_read_concurrency = 64
 bulk_read_chunk_size = "8MiB"
 bulk_read_concurrency = 4
 

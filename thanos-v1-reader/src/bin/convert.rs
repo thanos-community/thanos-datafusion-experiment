@@ -6,7 +6,10 @@ use std::{
 };
 
 use arrow59::{
-    array::{ArrayRef, FixedSizeBinaryArray, Float64Array, StringArray, TimestampMillisecondArray},
+    array::{
+        ArrayRef, BinaryArray, FixedSizeBinaryArray, Float64Array, StringArray,
+        TimestampMillisecondArray,
+    },
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -31,6 +34,20 @@ use thanos_v1_reader::{
 };
 
 struct Reader(opendal::Operator);
+
+/// One output row.  A row carries either a scalar float or one complete native
+/// histogram TSDB chunk.  Native histogram chunks remain byte-for-byte
+/// recoverable (length prefix, encoding byte, payload, and CRC32C) in
+/// `values_nh`; their timestamp is the chunk's inclusive minimum timestamp.
+struct Row {
+    name: String,
+    labels: BTreeMap<String, String>,
+    json: String,
+    hash: [u8; 16],
+    timestamp: i64,
+    value: Option<f64>,
+    values_nh: Option<Vec<u8>>,
+}
 struct Hll([u8; 64]);
 impl Hll {
     fn add(&mut self, value: &str) {
@@ -64,6 +81,16 @@ fn endpoint(uri: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
         .rsplit_once('/')
         .ok_or("output URI must include an object name")?;
     Ok((root.to_owned(), name.to_owned()))
+}
+
+fn is_native_histogram_record(record: &[u8]) -> Result<bool, io::Error> {
+    match chunk_reader::decode_encoded_record(&record)? {
+        chunk_reader::EncodedChunk::Histogram(_)
+        | chunk_reader::EncodedChunk::FloatHistogram(_) => Ok(true),
+        chunk_reader::EncodedChunk::Aggregate { .. } | chunk_reader::EncodedChunk::Xor(_) => {
+            Ok(false)
+        }
+    }
 }
 
 #[tokio::main]
@@ -152,35 +179,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 Ok(samples) => {
                     for sample in samples {
-                        rows.push((
-                            name.clone(),
-                            s.labels.clone(),
-                            json.clone(),
+                        rows.push(Row {
+                            name: name.clone(),
+                            labels: s.labels.clone(),
+                            json: json.clone(),
                             hash,
-                            sample.timestamp,
-                            sample.value,
-                        ));
+                            timestamp: sample.timestamp,
+                            value: Some(sample.value),
+                            values_nh: None,
+                        });
                     }
                 }
-                // Native histograms and downsampled non-counter aggregate chunks do not have a
-                // single float sample representation. They are intentionally omitted here.
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    let record = chunk_reader::read_chunk_record(
+                        &reader,
+                        &path,
+                        c.reference & u64::from(u32::MAX),
+                    )
+                    .await?;
+                    if is_native_histogram_record(&record)? {
+                        rows.push(Row {
+                            name: name.clone(),
+                            labels: s.labels.clone(),
+                            json: json.clone(),
+                            hash,
+                            timestamp: c.mint,
+                            value: None,
+                            values_nh: Some(record),
+                        });
+                    } else if matches!(
+                        chunk_reader::decode_encoded_record(&record)?,
+                        chunk_reader::EncodedChunk::Xor(_)
+                    ) {
+                        return Err(error.into());
+                    }
+                }
                 Err(error) => return Err(error.into()),
             }
         }
     }
     rows.sort_by(|a, b| {
-        a.0.cmp(&b.0)
+        a.name
+            .cmp(&b.name)
             .then_with(|| {
                 labels
                     .iter()
-                    .map(|label| a.1.get(label))
-                    .cmp(labels.iter().map(|label| b.1.get(label)))
+                    .map(|label| a.labels.get(label))
+                    .cmp(labels.iter().map(|label| b.labels.get(label)))
             })
-            .then_with(|| a.4.cmp(&b.4))
+            .then_with(|| a.timestamp.cmp(&b.timestamp))
     });
     let jsons: ArrayRef = Arc::new(StringArray::from(
-        rows.iter().map(|r| Some(r.2.as_str())).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|r| Some(r.json.as_str()))
+            .collect::<Vec<_>>(),
     ));
     let unshredded = json_to_variant(&jsons)?;
     let label_schema = DataType::Struct(
@@ -200,22 +252,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             DataType::Timestamp(arrow59::datatypes::TimeUnit::Millisecond, None),
             false,
         ),
-        Field::new("value", DataType::Float64, false),
+        Field::new("value", DataType::Float64, true),
+        Field::new("values_nh", DataType::Binary, true),
     ]));
-    let hashes = FixedSizeBinaryArray::try_from_iter(rows.iter().map(|r| r.3.as_slice()))?;
+    let hashes = FixedSizeBinaryArray::try_from_iter(rows.iter().map(|r| r.hash.as_slice()))?;
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(StringArray::from(
-                rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+                rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             )) as ArrayRef,
             Arc::new(hashes),
             variant,
             Arc::new(TimestampMillisecondArray::from(
-                rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+                rows.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
             )),
             Arc::new(Float64Array::from(
-                rows.iter().map(|r| r.5).collect::<Vec<_>>(),
+                rows.iter().map(|r| r.value).collect::<Vec<_>>(),
+            )),
+            Arc::new(BinaryArray::from_iter(
+                rows.iter().map(|r| r.values_nh.as_deref()),
             )),
         ],
     )?;
@@ -230,10 +286,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_column_encoding(ColumnPath::from("labels_hash"), Encoding::DELTA_BYTE_ARRAY)
         .set_column_encoding(ColumnPath::from("timestamp"), Encoding::DELTA_BINARY_PACKED)
         .set_column_encoding(ColumnPath::from("value"), Encoding::BYTE_STREAM_SPLIT)
-        .set_key_value_metadata(Some(vec![KeyValue::new(
-            "thanos.labels_hll.v1".into(),
-            hll_metadata,
-        )]))
+        .set_column_encoding(
+            ColumnPath::from("values_nh"),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        )
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new("thanos.labels_hll.v1".into(), hll_metadata),
+            KeyValue::new(
+                "thanos.values_nh.v1".into(),
+                Some("prometheus-tsdb-chunk-record;timestamp=mint".into()),
+            ),
+        ]))
         .build();
     let mut bytes = Vec::new();
     {
@@ -274,5 +337,18 @@ mod tests {
             endpoint("s3://bucket/prefix/block.parquet").unwrap(),
             ("s3://bucket/prefix".to_owned(), "block.parquet".to_owned())
         );
+    }
+
+    #[test]
+    fn preserves_complete_native_histogram_record_in_values_nh() {
+        use crc::{CRC_32_ISCSI, Crc};
+
+        let crc = Crc::<u32>::new(&CRC_32_ISCSI);
+        let payload = [1, 2, 3];
+        let mut record = vec![payload.len() as u8, 2]; // 2 is Prometheus histogram encoding.
+        record.extend_from_slice(&payload);
+        record.extend_from_slice(&crc.checksum(&record[1..]).to_be_bytes());
+
+        assert!(is_native_histogram_record(&record).unwrap());
     }
 }

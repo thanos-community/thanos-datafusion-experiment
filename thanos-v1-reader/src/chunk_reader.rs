@@ -42,6 +42,24 @@ pub async fn read_encoded_chunk(
     decode_encoded_record(&record)
 }
 
+/// Read a validated chunk record exactly as it is stored in the TSDB segment.
+///
+/// This is useful for chunk encodings which do not yet have a scalar Arrow
+/// representation, notably Prometheus native histograms.  The returned bytes
+/// include the length prefix, encoding byte, payload and CRC32C, and can be
+/// written back to a TSDB segment unchanged.
+pub async fn read_chunk_record(
+    reader: &dyn RangeReader,
+    path: &str,
+    offset: u64,
+) -> Result<Vec<u8>, io::Error> {
+    let record = read_record(reader, path, offset).await?;
+    // Validate before returning data so a conversion never persists corrupted
+    // chunks merely because it does not decode their samples.
+    validated_payload(&record)?;
+    Ok(record)
+}
+
 pub async fn read_samples(
     reader: &dyn RangeReader,
     path: &str,
@@ -52,7 +70,11 @@ pub async fn read_samples(
     decode_record(&record, counter_metric)
 }
 
-async fn read_record(reader: &dyn RangeReader, path: &str, offset: u64) -> Result<Vec<u8>, io::Error> {
+async fn read_record(
+    reader: &dyn RangeReader,
+    path: &str,
+    offset: u64,
+) -> Result<Vec<u8>, io::Error> {
     let prefix = reader
         .read_range(path, offset..offset + (MAX_UVARINT_SIZE as u64) + 1)
         .await?;
@@ -234,7 +256,6 @@ fn read_uvarint(bytes: &[u8]) -> Result<(usize, usize), io::Error> {
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
-
 
 #[cfg(test)]
 mod tests {

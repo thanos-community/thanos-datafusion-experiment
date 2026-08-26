@@ -180,7 +180,10 @@ cargo run --bin convert -- file:///blocks/01ABC... file:///exports/01ABC.parquet
 
 The output contains native Parquet `VARIANT(1)` labels, with label values shredded into typed
 UTF-8 leaves ordered by decreasing observed cardinality, a 16-byte canonical label hash, and
-sorted `(name, labels..., timestamp)` samples. It uses one row group, Zstd compression, page
+sorted `(name, labels..., timestamp)` samples. Float rows use `value`; native histogram and
+float-histogram chunks are retained in nullable `values_nh` as their complete, CRC-validated
+Prometheus TSDB chunk records. Their row timestamp is the chunk `mint`; footer key
+`thanos.values_nh.v1` describes this binary format. It uses one row group, Zstd compression, page
 statistics/indexes, delta byte-array hash encoding, delta timestamps, and byte-stream-split
 sample values. `thanos.labels_hll.v1` in the Parquet footer stores packed per-label HLL
 registers for cardinality planning.

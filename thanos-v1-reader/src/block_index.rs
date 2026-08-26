@@ -1548,12 +1548,14 @@ mod tests {
         }];
 
         let mut rows = Vec::new();
+        let mut series_rows = Vec::new();
         append_chunk_rows(
             &repository,
             &meta,
             &meta.ulid,
             series.into_iter().next().unwrap(),
             &mut rows,
+            &mut series_rows,
         )
         .unwrap();
 
@@ -1562,6 +1564,7 @@ mod tests {
             rows[0].labels_json,
             r#"{"__name__":"up","cluster":"production","job":"reader"}"#
         );
+        assert_eq!(series_rows.len(), 1);
     }
 
     #[test]

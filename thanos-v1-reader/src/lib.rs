@@ -44,6 +44,7 @@ use storage::RepositoryRegistry;
 pub async fn index_context(
     block_index_path: &str,
     chunk_index_path: &str,
+    series_index_path: &str,
     metric_table_schemas: &[MetricTableSchema],
     repositories: &[ThanosRepositoryConfig],
     storage: RepositoryRegistry,
@@ -71,6 +72,9 @@ pub async fn index_context(
     }
     context
         .register_parquet("chunks", chunk_index_path, ParquetReadOptions::default())
+        .await?;
+    context
+        .register_parquet("series", series_index_path, ParquetReadOptions::default())
         .await?;
     register_metric_tables(&context, metric_table_schemas, repositories, storage).await?;
     Ok(context)
@@ -144,12 +148,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let block_index_path = block_index::block_index_file_path(&config.index_cache_location);
     let chunk_index_path = block_index::chunk_index_directory_path(&config.index_cache_location);
+    let series_index_path = block_index::series_index_directory_path(&config.index_cache_location);
     tracing::info!(path = %block_index_path, "generated Thanos blocks index");
     tracing::info!(path = %chunk_index_path, "generated Thanos chunks indexes");
 
     let context = index_context(
         &block_index_path,
         &chunk_index_path,
+        &series_index_path,
         &metric_table_schemas,
         &config.repositories,
         storage.clone(),
@@ -343,6 +349,7 @@ mod tests {
         let context = index_context(
             &block_index::block_index_file_path(cache.to_str().unwrap()),
             &block_index::chunk_index_directory_path(cache.to_str().unwrap()),
+            &block_index::series_index_directory_path(cache.to_str().unwrap()),
             &schemas,
             &repositories,
             storage,

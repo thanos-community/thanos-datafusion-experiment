@@ -12,6 +12,7 @@ use arrow::{
 use datafusion::prelude::SessionContext;
 use futures::{Stream, TryStreamExt};
 use regex::Regex;
+use serde::Deserialize;
 use tokio_stream::iter;
 use tonic::{Request, Response, Status};
 
@@ -32,20 +33,27 @@ type SeriesStream = Pin<Box<dyn Stream<Item = Result<SeriesResponse, Status>> + 
 pub struct ThanosStoreService {
     context: Arc<SessionContext>,
     #[cfg(test)]
-    descriptors: Option<Arc<Vec<ChunkDescriptor>>>,
+    descriptors: Option<Arc<Vec<SeriesDescriptor>>>,
     blocks: Arc<Vec<BlockMetadata>>,
     storage: RepositoryRegistry,
 }
 
 #[derive(Clone)]
-struct ChunkDescriptor {
+struct SeriesDescriptor {
     repository_uri: String,
+    downsample_resolution: i64,
+    series_mint: i64,
+    series_maxt: i64,
+    labels: BTreeMap<String, String>,
+    chunks: Vec<ChunkLocation>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ChunkLocation {
     chunk_file_path: String,
     chunk_file_offset: u64,
     chunk_mint: i64,
     chunk_maxt: i64,
-    downsample_resolution: i64,
-    labels: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -79,19 +87,19 @@ impl ThanosStoreService {
         })
     }
 
-    async fn matching_descriptors(
+    async fn matching_series(
         &self,
         start: i64,
         end: i64,
         matchers: &[Matcher],
-    ) -> Result<Vec<ChunkDescriptor>, Status> {
+    ) -> Result<Vec<SeriesDescriptor>, Status> {
         #[cfg(test)]
         if let Some(descriptors) = &self.descriptors {
             return Ok(descriptors
                 .iter()
-                .filter(|descriptor| {
-                    overlaps(descriptor.chunk_mint, descriptor.chunk_maxt, start, end)
-                        && matches_all(&descriptor.labels, matchers)
+                .filter(|series| {
+                    overlaps(series.series_mint, series.series_maxt, start, end)
+                        && matches_all(&series.labels, matchers)
                 })
                 .cloned()
                 .collect());
@@ -100,9 +108,9 @@ impl ThanosStoreService {
         let frame = self
             .context
             .sql(&format!(
-                "SELECT repository_uri, chunk_file_path, chunk_file_offset, chunk_mint, chunk_maxt, \
-                 downsample_resolution, labels_json FROM chunks \
-                 WHERE chunk_mint <= {end} AND chunk_maxt >= {start}"
+                "SELECT repository_uri, downsample_resolution, series_mint, series_maxt, \
+                 labels_json, chunks_json \
+                 FROM series WHERE series_mint <= {end} AND series_maxt >= {start}"
             ))
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -110,20 +118,20 @@ impl ThanosStoreService {
             .execute_stream()
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        let mut descriptors = Vec::new();
+        let mut series = Vec::new();
         while let Some(batch) = stream
             .try_next()
             .await
             .map_err(|error| Status::internal(error.to_string()))?
         {
-            descriptors.extend(
-                descriptors_from_batch(&batch)
+            series.extend(
+                series_from_batch(&batch)
                     .map_err(|error| Status::internal(error.to_string()))?
                     .into_iter()
-                    .filter(|descriptor| matches_all(&descriptor.labels, matchers)),
+                    .filter(|series| matches_all(&series.labels, matchers)),
             );
         }
-        Ok(descriptors)
+        Ok(series)
     }
 
     fn info_response(&self) -> info::InfoResponse {
@@ -205,42 +213,25 @@ impl Store for ThanosStoreService {
         let abort_on_error = request.partial_response_disabled
             || request.partial_response_strategy == thanos::PartialResponseStrategy::Abort as i32;
 
-        let mut groups = BTreeMap::<Vec<(String, String)>, Vec<ChunkDescriptor>>::new();
-        for descriptor in self
-            .matching_descriptors(request.min_time, request.max_time, &matchers)
-            .await?
-        {
-            groups
-                .entry(labels_key(&descriptor.labels))
-                .or_default()
-                .push(descriptor);
-        }
-
         let mut series_responses = Vec::new();
         let mut warning_responses = Vec::new();
-        for (_, mut descriptors) in groups {
+        for descriptor in self
+            .matching_series(request.min_time, request.max_time, &matchers)
+            .await?
+        {
             if series_responses.len() >= limit {
                 break;
             }
-            let selected_resolution = descriptors
-                .iter()
-                .filter(|descriptor| {
-                    if aggregates.contains(&(Aggr::Raw as i32)) {
-                        descriptor.downsample_resolution == 0
-                    } else {
-                        descriptor.downsample_resolution <= request.max_resolution_window
-                    }
-                })
-                .map(|descriptor| descriptor.downsample_resolution)
-                .max();
-            let Some(selected_resolution) = selected_resolution else {
-                continue;
+            let selected_resolution = if aggregates.contains(&(Aggr::Raw as i32)) {
+                descriptor.downsample_resolution == 0
+            } else {
+                descriptor.downsample_resolution <= request.max_resolution_window
             };
-            descriptors
-                .retain(|descriptor| descriptor.downsample_resolution == selected_resolution);
-            descriptors.sort_by_key(|descriptor| (descriptor.chunk_mint, descriptor.chunk_maxt));
+            if !selected_resolution {
+                continue;
+            }
 
-            let labels = descriptors[0]
+            let labels = descriptor
                 .labels
                 .iter()
                 .map(|(name, value)| Label {
@@ -251,8 +242,19 @@ impl Store for ThanosStoreService {
             let mut chunks = Vec::new();
             let mut warnings = Vec::new();
             if !request.skip_chunks {
-                for descriptor in &descriptors {
-                    match self.encode_chunk(descriptor, &aggregates).await {
+                for chunk in &descriptor.chunks {
+                    if !overlaps(
+                        chunk.chunk_mint,
+                        chunk.chunk_maxt,
+                        request.min_time,
+                        request.max_time,
+                    ) {
+                        continue;
+                    }
+                    match self
+                        .encode_chunk(&descriptor.repository_uri, chunk, &aggregates)
+                        .await
+                    {
                         Ok(Some(chunk)) => chunks.push(chunk),
                         Ok(None) => {}
                         Err(error) if abort_on_error => return Err(error),
@@ -314,7 +316,7 @@ impl Store for ThanosStoreService {
         reject_unsupported_label_options(&request.without_replica_labels, request.hints.is_some())?;
         let matchers = compile_matchers(&request.matchers)?;
         let names = self
-            .matching_descriptors(request.start, request.end, &matchers)
+            .matching_series(request.start, request.end, &matchers)
             .await?
             .into_iter()
             .flat_map(|descriptor| descriptor.labels.into_keys())
@@ -337,7 +339,7 @@ impl Store for ThanosStoreService {
         reject_unsupported_label_options(&request.without_replica_labels, request.hints.is_some())?;
         let matchers = compile_matchers(&request.matchers)?;
         let values = self
-            .matching_descriptors(request.start, request.end, &matchers)
+            .matching_series(request.start, request.end, &matchers)
             .await?
             .into_iter()
             .filter_map(|descriptor| descriptor.labels.get(&request.label).cloned())
@@ -363,16 +365,17 @@ impl info::info_server::Info for ThanosStoreService {
 impl ThanosStoreService {
     async fn encode_chunk(
         &self,
-        descriptor: &ChunkDescriptor,
+        repository_uri: &str,
+        descriptor: &ChunkLocation,
         aggregates: &BTreeSet<i32>,
     ) -> Result<Option<AggrChunk>, Status> {
         let repository = self
             .storage
-            .get(&descriptor.repository_uri)
+            .get(repository_uri)
             .ok_or_else(|| {
                 Status::internal(format!(
                     "no storage repository for repository {:?}",
-                    descriptor.repository_uri
+                    repository_uri
                 ))
             })?;
         let chunk = chunk_reader::read_encoded_chunk(
@@ -577,24 +580,22 @@ async fn load_blocks(context: &SessionContext) -> Result<Vec<BlockMetadata>, Box
     })
 }
 
-fn descriptors_from_batch(batch: &RecordBatch) -> Result<Vec<ChunkDescriptor>, BoxError> {
+fn series_from_batch(batch: &RecordBatch) -> Result<Vec<SeriesDescriptor>, BoxError> {
     let repository_uri = string_column(batch, "repository_uri")?;
-    let chunk_file_path = string_column(batch, "chunk_file_path")?;
-    let chunk_file_offset = uint64_column(batch, "chunk_file_offset")?;
-    let chunk_mint = int64_column(batch, "chunk_mint")?;
-    let chunk_maxt = int64_column(batch, "chunk_maxt")?;
     let downsample_resolution = int64_column(batch, "downsample_resolution")?;
+    let series_mint = int64_column(batch, "series_mint")?;
+    let series_maxt = int64_column(batch, "series_maxt")?;
     let labels_json = string_column(batch, "labels_json")?;
+    let chunks_json = string_column(batch, "chunks_json")?;
     (0..batch.num_rows())
         .map(|index| {
-            Ok(ChunkDescriptor {
+            Ok(SeriesDescriptor {
                 repository_uri: string_value(repository_uri.as_ref(), index)?,
-                chunk_file_path: string_value(chunk_file_path.as_ref(), index)?,
-                chunk_file_offset: chunk_file_offset.value(index),
-                chunk_mint: chunk_mint.value(index),
-                chunk_maxt: chunk_maxt.value(index),
                 downsample_resolution: downsample_resolution.value(index),
+                series_mint: series_mint.value(index),
+                series_maxt: series_maxt.value(index),
                 labels: serde_json::from_str(&string_value(labels_json.as_ref(), index)?)?,
+                chunks: serde_json::from_str(&string_value(chunks_json.as_ref(), index)?)?,
             })
         })
         .collect()
@@ -701,34 +702,32 @@ mod tests {
 
     #[test]
     fn raw_queries_choose_raw_resolution() {
-        let descriptors = vec![
-            ChunkDescriptor {
+        let series = vec![
+            SeriesDescriptor {
                 repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "raw".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 0,
-                chunk_maxt: 10,
                 downsample_resolution: 0,
+                series_mint: 0,
+                series_maxt: 10,
                 labels: BTreeMap::new(),
+                chunks: vec![],
             },
-            ChunkDescriptor {
+            SeriesDescriptor {
                 repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "downsampled".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 0,
-                chunk_maxt: 10,
                 downsample_resolution: 300_000,
+                series_mint: 0,
+                series_maxt: 10,
                 labels: BTreeMap::new(),
+                chunks: vec![],
             },
         ];
         let raw = aggregates(&[Aggr::Raw as i32]).unwrap();
         assert!(
-            descriptors
+            series
                 .iter()
                 .filter(|descriptor| {
                     raw.contains(&(Aggr::Raw as i32)) && descriptor.downsample_resolution == 0
                 })
-                .all(|descriptor| descriptor.chunk_file_path == "raw")
+                .all(|descriptor| descriptor.downsample_resolution == 0)
         );
     }
 
@@ -736,17 +735,16 @@ mod tests {
     async fn generated_clients_discover_and_query_the_store_service() {
         let service = ThanosStoreService {
             context: Arc::new(SessionContext::new()),
-            descriptors: Some(Arc::new(vec![ChunkDescriptor {
+            descriptors: Some(Arc::new(vec![SeriesDescriptor {
                 repository_uri: "file:///blocks".to_owned(),
-                chunk_file_path: "unused-when-skipping-chunks".to_owned(),
-                chunk_file_offset: 0,
-                chunk_mint: 100,
-                chunk_maxt: 200,
                 downsample_resolution: 0,
+                series_mint: 100,
+                series_maxt: 200,
                 labels: BTreeMap::from([
                     ("__name__".to_owned(), "up".to_owned()),
                     ("cluster".to_owned(), "test".to_owned()),
                 ]),
+                chunks: vec![],
             }])),
             blocks: Arc::new(vec![BlockMetadata {
                 min_time: 100,

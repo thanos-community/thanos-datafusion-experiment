@@ -63,6 +63,10 @@ pub struct StorageConfig {
     pub max_concurrent_chunk_reads: usize,
     #[serde(default = "default_index_build_concurrency")]
     pub index_build_concurrency: usize,
+    /// Materialize the legacy per-chunk projection used only by direct Flight metric tables.
+    /// StoreAPI uses the smaller per-series projection and should disable this in production.
+    #[serde(default = "default_materialize_chunk_index")]
+    pub materialize_chunk_index: bool,
     /// Maximum in-flight metadata and deletion-marker requests while discovering blocks.
     #[serde(default = "default_metadata_read_concurrency")]
     pub metadata_read_concurrency: usize,
@@ -84,6 +88,7 @@ impl Default for StorageConfig {
             bulk_read_concurrency: default_bulk_read_concurrency(),
             max_concurrent_chunk_reads: default_max_concurrent_chunk_reads(),
             index_build_concurrency: default_index_build_concurrency(),
+            materialize_chunk_index: default_materialize_chunk_index(),
             metadata_read_concurrency: default_metadata_read_concurrency(),
             block_max_age: None,
             chunk_cache: None,
@@ -276,6 +281,10 @@ fn default_index_build_concurrency() -> usize {
     12
 }
 
+fn default_materialize_chunk_index() -> bool {
+    true
+}
+
 fn default_metadata_read_concurrency() -> usize {
     64
 }
@@ -330,6 +339,7 @@ mod tests {
         );
         assert_eq!(storage.max_concurrent_chunk_reads, 16);
         assert_eq!(storage.index_build_concurrency, 12);
+        assert!(storage.materialize_chunk_index);
         assert_eq!(storage.metadata_read_concurrency, 64);
         assert_eq!(default_chunk_cache_page_size(), "512KiB");
     }

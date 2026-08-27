@@ -6,7 +6,10 @@ use std::{
 };
 
 use arrow::{
-    array::{ArrayRef, BinaryArray, Float64Array, StringArray, TimestampMillisecondArray},
+    array::{
+        Array as ArrowArray, ArrayRef, BinaryArray, Float64Array, StringArray,
+        TimestampMillisecondArray,
+    },
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
@@ -19,8 +22,26 @@ use thanos_v1_reader::{
     tsdb_index,
 };
 use vortex::{
-    VortexSessionDefault, arrow::ArrowSessionExt, buffer::ByteBufferMut,
-    file::WriteOptionsSessionExt, io::session::RuntimeSessionExt, session::VortexSession,
+    VortexSessionDefault,
+    array::{
+        ArrayRef as VortexArrayRef, IntoArray, VortexSessionExecute,
+        arrays::{PrimitiveArray, StructArray, struct_::StructArrayExt},
+        dtype::FieldPath,
+    },
+    arrow::ArrowSessionExt,
+    buffer::ByteBufferMut,
+    encodings::runend::RunEnd,
+    file::{WriteOptionsSessionExt, WriteStrategyBuilder},
+    io::session::RuntimeSessionExt,
+    layout::{
+        LayoutStrategy,
+        layouts::{compressed::CompressingStrategy, flat::writer::FlatLayoutStrategy},
+    },
+    session::VortexSession,
+};
+use vortex_btrblocks::{
+    BtrBlocksCompressorBuilder, SchemeExt,
+    schemes::float::{ALPRDScheme, FloatDictScheme, FloatRLEScheme, NullDominatedSparseScheme},
 };
 
 const HLL_METADATA_KEY: &str = "thanos.labels_hll.v1";
@@ -137,6 +158,85 @@ fn decode_hll_metadata(bytes: &[u8]) -> Result<BTreeMap<String, [u8; HLL_REGISTE
     Ok(hlls)
 }
 
+/// Build a run-end array without dictionary-encoding the distinct values.
+///
+/// `RunEnd::encode` only has a primitive convenience path today.  Label values are UTF-8/Binary,
+/// so construct the general form directly: primitive run ends plus the original string/binary
+/// value for each run.  This is precisely REE and preserves nullable label columns.
+fn run_end_column(
+    column: &ArrayRef,
+    field: &Field,
+    session: &VortexSession,
+    ctx: &mut vortex::array::ExecutionCtx,
+) -> Result<VortexArrayRef, Box<dyn std::error::Error>> {
+    let mut run_end = |run_starts: Vec<usize>, len: usize, values: VortexArrayRef| {
+        let ends = run_starts
+            .into_iter()
+            .skip(1)
+            .chain(std::iter::once(len))
+            .map(|end| end as u64);
+        RunEnd::try_new(PrimitiveArray::from_iter(ends).into_array(), values, ctx)
+            .map(IntoArray::into_array)
+            .map_err(Into::into)
+    };
+    if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+        let mut starts = vec![0];
+        let mut values = Vec::new();
+        if !strings.is_empty() {
+            values.push((!strings.is_null(0)).then(|| strings.value(0)));
+            for index in 1..strings.len() {
+                let same = strings.is_null(index) == strings.is_null(index - 1)
+                    && (strings.is_null(index) || strings.value(index) == strings.value(index - 1));
+                if !same {
+                    starts.push(index);
+                    values.push((!strings.is_null(index)).then(|| strings.value(index)));
+                }
+            }
+        }
+        let values = session
+            .arrow()
+            .from_arrow_array(Arc::new(StringArray::from(values)), field)?;
+        return run_end(starts, strings.len(), values);
+    }
+    if let Some(binary) = column.as_any().downcast_ref::<BinaryArray>() {
+        let mut starts = vec![0];
+        let mut values = Vec::new();
+        if !binary.is_empty() {
+            values.push((!binary.is_null(0)).then(|| binary.value(0)));
+            for index in 1..binary.len() {
+                let same = binary.is_null(index) == binary.is_null(index - 1)
+                    && (binary.is_null(index) || binary.value(index) == binary.value(index - 1));
+                if !same {
+                    starts.push(index);
+                    values.push((!binary.is_null(index)).then(|| binary.value(index)));
+                }
+            }
+        }
+        let values = session
+            .arrow()
+            .from_arrow_array(Arc::new(BinaryArray::from(values)), field)?;
+        return run_end(starts, binary.len(), values);
+    }
+    Err(format!(
+        "REE is only configured for UTF-8/Binary field {}",
+        field.name()
+    )
+    .into())
+}
+
+/// ALP is the only enabled float scheme for scalar samples. Its integer residual child remains
+/// adaptively compressed by BtrBlocks; no dictionary encoding is eligible for `value`.
+fn value_compressor() -> vortex_btrblocks::BtrBlocksCompressor {
+    BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([
+            ALPRDScheme.id(),
+            FloatDictScheme.id(),
+            FloatRLEScheme.id(),
+            NullDominatedSparseScheme.id(),
+        ])
+        .build()
+}
+
 async fn vortex_bytes(
     batch: RecordBatch,
     hll_metadata: Vec<u8>,
@@ -145,9 +245,57 @@ async fn vortex_bytes(
     let array = session
         .arrow()
         .from_arrow_record_batch(batch.clone(), batch.schema().as_ref())?;
+    let mut ctx = session.create_execution_ctx();
+    let root = array.execute::<StructArray>(&mut ctx)?;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    for ((field, original), column) in batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(root.iter_unmasked_fields())
+        .zip(batch.columns())
+    {
+        // `name`, `labels_hash`, and every shredded label share the sorted series prefix.
+        // Store each as REE rather than as a dictionary, including null runs for sparse labels.
+        if field.name() == "name"
+            || field.name() == "labels_hash"
+            || field.name().starts_with("label.")
+        {
+            fields.push(run_end_column(column, field, &session, &mut ctx)?);
+        } else {
+            fields.push(original.clone());
+        }
+    }
+    let array = StructArray::try_new(
+        root.names().clone(),
+        fields,
+        batch.num_rows(),
+        root.struct_validity(),
+    )?
+    .into_array();
+    let mut strategy = WriteStrategyBuilder::default();
+    for field in batch.schema().fields() {
+        if field.name() == "name"
+            || field.name() == "labels_hash"
+            || field.name().starts_with("label.")
+        {
+            strategy = strategy.with_field_writer(
+                FieldPath::from_name(field.name().as_str()),
+                Arc::new(FlatLayoutStrategy::default()),
+            );
+        }
+    }
+    let value_writer: Arc<dyn LayoutStrategy> = Arc::new(CompressingStrategy::new(
+        FlatLayoutStrategy::default(),
+        value_compressor(),
+    ));
+    let strategy = strategy
+        .with_field_writer(FieldPath::from_name("value"), value_writer)
+        .build();
     let mut output = ByteBufferMut::empty();
     session
         .write_options()
+        .with_strategy(strategy)
         .with_metadata_segment(HLL_METADATA_KEY, hll_metadata)
         .write(&mut output, array.to_array_stream())
         .await?;
@@ -333,7 +481,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vortex::file::OpenOptionsSessionExt;
+    use vortex::{
+        array::{IntoArray, arrays::PrimitiveArray},
+        encodings::{alp::ALP, runend::RunEnd},
+        file::OpenOptionsSessionExt,
+    };
     #[test]
     fn endpoint_preserves_object_store_root() {
         assert_eq!(
@@ -356,6 +508,36 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn identity_columns_use_run_end_encoding_without_dictionary_values() {
+        let session = VortexSession::default();
+        let field = Field::new("label.pod", DataType::Utf8, true);
+        let column: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("api-0"),
+            Some("api-0"),
+            None,
+            None,
+            Some("api-1"),
+        ]));
+        let encoded = run_end_column(
+            &column,
+            &field,
+            &session,
+            &mut session.create_execution_ctx(),
+        )
+        .unwrap();
+        assert!(encoded.is::<RunEnd>());
+    }
+    #[test]
+    fn values_use_alp_not_a_dictionary_or_rle_scheme() {
+        let session = VortexSession::default();
+        let values =
+            PrimitiveArray::from_iter((0..2048).map(|index| index as f64 * 0.1)).into_array();
+        let encoded = value_compressor()
+            .compress(&values, &mut session.create_execution_ctx())
+            .unwrap();
+        assert!(encoded.is::<ALP>());
     }
     #[tokio::test]
     async fn vortex_file_exposes_hll_metadata_segment() {

@@ -5680,6 +5680,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "vortex",
+ "vortex-btrblocks",
  "xxhash-rust",
 ]
 

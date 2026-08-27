@@ -16,7 +16,7 @@ FROM chef AS builder
 ARG TARGETARCH
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y libprotobuf-dev protobuf-compiler \
+    && apt-get install --no-install-recommends -y libclang-dev libprotobuf-dev protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PROTOC_INCLUDE=/usr/include

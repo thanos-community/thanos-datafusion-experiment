@@ -1,30 +1,16 @@
-//! Convert a single Thanos TSDB block into a sorted Parquet sample file.
+//! Convert a single Thanos TSDB block into a sorted flattened Vortex sample file.
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     sync::Arc,
 };
 
-use arrow59::{
-    array::{
-        ArrayRef, BinaryArray, FixedSizeBinaryArray, Float64Array, StringArray,
-        TimestampMillisecondArray,
-    },
-    datatypes::{DataType, Field, Schema},
+use arrow::{
+    array::{ArrayRef, BinaryArray, Float64Array, StringArray, TimestampMillisecondArray},
+    datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
-use parquet_variant_compute::shred_variant;
-use parquet59::{
-    arrow::ArrowWriter,
-    basic::{Compression, Encoding, ZstdLevel},
-    file::{
-        metadata::KeyValue,
-        properties::{EnabledStatistics, WriterProperties},
-    },
-    schema::types::ColumnPath,
-    variant::json_to_variant,
-};
 use sha2::{Digest, Sha256};
 use thanos_v1_reader::{
     chunk_reader,
@@ -32,23 +18,24 @@ use thanos_v1_reader::{
     storage::{RangeReader, repository_operator},
     tsdb_index,
 };
+use vortex::{
+    VortexSessionDefault, arrow::ArrowSessionExt, buffer::ByteBufferMut,
+    file::WriteOptionsSessionExt, io::session::RuntimeSessionExt, session::VortexSession,
+};
+
+const HLL_METADATA_KEY: &str = "thanos.labels_hll.v1";
+const HLL_METADATA_MAGIC: &[u8; 4] = b"THLL";
+const HLL_REGISTERS: usize = 64;
 
 struct Reader(opendal::Operator);
-
-/// One output row.  A row carries either a scalar float or one complete native
-/// histogram TSDB chunk.  Native histogram chunks remain byte-for-byte
-/// recoverable (length prefix, encoding byte, payload, and CRC32C) in
-/// `values_nh`; their timestamp is the chunk's inclusive minimum timestamp.
 struct Row {
     name: String,
     labels: BTreeMap<String, String>,
-    json: String,
     hash: [u8; 16],
     timestamp: i64,
-    value: Option<f64>,
-    values_nh: Option<Vec<u8>>,
+    value: f64,
 }
-struct Hll([u8; 64]);
+struct Hll([u8; HLL_REGISTERS]);
 impl Hll {
     fn add(&mut self, value: &str) {
         let hash = Sha256::digest(value.as_bytes());
@@ -56,10 +43,8 @@ impl Hll {
         let bucket = (bits >> 58) as usize;
         self.0[bucket] = self.0[bucket].max((bits << 6).leading_zeros() as u8 + 1);
     }
-    fn hex(&self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
 }
+
 #[async_trait]
 impl RangeReader for Reader {
     async fn read_range(
@@ -82,15 +67,91 @@ fn endpoint(uri: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
         .ok_or("output URI must include an object name")?;
     Ok((root.to_owned(), name.to_owned()))
 }
+fn label_column(name: &str) -> String {
+    format!("label.{name}")
+}
 
-fn is_native_histogram_record(record: &[u8]) -> Result<bool, io::Error> {
-    match chunk_reader::decode_encoded_record(&record)? {
-        chunk_reader::EncodedChunk::Histogram(_)
-        | chunk_reader::EncodedChunk::FloatHistogram(_) => Ok(true),
-        chunk_reader::EncodedChunk::Aggregate { .. } | chunk_reader::EncodedChunk::Xor(_) => {
-            Ok(false)
+/// `THLL`, version, count, then sorted (label name, 64 raw HLL registers).
+fn encode_hll_metadata(hlls: &BTreeMap<String, Hll>) -> Result<Vec<u8>, io::Error> {
+    let count = u32::try_from(hlls.len()).map_err(|_| io::Error::other("too many HLL labels"))?;
+    let mut bytes = Vec::with_capacity(9 + hlls.len() * (2 + HLL_REGISTERS));
+    bytes.extend_from_slice(HLL_METADATA_MAGIC);
+    bytes.push(1);
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for (name, hll) in hlls {
+        let name_len = u16::try_from(name.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "HLL label name is too long")
+        })?;
+        bytes.extend_from_slice(&name_len.to_be_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&hll.0);
+    }
+    Ok(bytes)
+}
+#[cfg(test)]
+fn decode_hll_metadata(bytes: &[u8]) -> Result<BTreeMap<String, [u8; HLL_REGISTERS]>, io::Error> {
+    if bytes.len() < 9 || &bytes[..4] != HLL_METADATA_MAGIC || bytes[4] != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid HLL metadata header",
+        ));
+    }
+    let count = u32::from_be_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let mut offset = 9;
+    let mut hlls = BTreeMap::new();
+    for _ in 0..count {
+        let len: [u8; 2] = bytes
+            .get(offset..offset + 2)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated HLL label length")
+            })?
+            .try_into()
+            .unwrap();
+        offset += 2;
+        let name_len = u16::from_be_bytes(len) as usize;
+        let name = std::str::from_utf8(bytes.get(offset..offset + name_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "truncated HLL label name")
+        })?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HLL label name"))?
+        .to_owned();
+        offset += name_len;
+        let registers = bytes
+            .get(offset..offset + HLL_REGISTERS)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated HLL registers"))?
+            .try_into()
+            .unwrap();
+        offset += HLL_REGISTERS;
+        if hlls.insert(name, registers).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate HLL label",
+            ));
         }
     }
+    if offset != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing HLL metadata bytes",
+        ));
+    }
+    Ok(hlls)
+}
+
+async fn vortex_bytes(
+    batch: RecordBatch,
+    hll_metadata: Vec<u8>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let session = VortexSession::default().with_tokio();
+    let array = session
+        .arrow()
+        .from_arrow_record_batch(batch.clone(), batch.schema().as_ref())?;
+    let mut output = ByteBufferMut::empty();
+    session
+        .write_options()
+        .with_metadata_segment(HLL_METADATA_KEY, hll_metadata)
+        .write(&mut output, array.to_array_stream())
+        .await?;
+    Ok(output.as_ref().to_vec())
 }
 
 #[tokio::main]
@@ -133,7 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .entry(name.clone())
                     .or_default()
                     .insert(value.clone());
-                hlls.entry(name.clone()).or_insert(Hll([0; 64])).add(value);
+                hlls.entry(name.clone())
+                    .or_insert(Hll([0; HLL_REGISTERS]))
+                    .add(value);
             }
         }
     }
@@ -153,12 +216,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get("__name__")
             .ok_or("series missing __name__")?
             .clone();
-        let json = serde_json::to_string(
-            &s.labels
-                .iter()
-                .filter(|(k, _)| k.as_str() != "__name__")
-                .collect::<BTreeMap<_, _>>(),
-        )?;
         let mut hasher = Sha256::new();
         for (k, v) in &s.labels {
             hasher.update((k.len() as u32).to_be_bytes());
@@ -177,43 +234,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
             {
-                Ok(samples) => {
-                    for sample in samples {
-                        rows.push(Row {
-                            name: name.clone(),
-                            labels: s.labels.clone(),
-                            json: json.clone(),
-                            hash,
-                            timestamp: sample.timestamp,
-                            value: Some(sample.value),
-                            values_nh: None,
-                        });
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                    let record = chunk_reader::read_chunk_record(
-                        &reader,
-                        &path,
-                        c.reference & u64::from(u32::MAX),
-                    )
-                    .await?;
-                    if is_native_histogram_record(&record)? {
-                        rows.push(Row {
-                            name: name.clone(),
-                            labels: s.labels.clone(),
-                            json: json.clone(),
-                            hash,
-                            timestamp: c.mint,
-                            value: None,
-                            values_nh: Some(record),
-                        });
-                    } else if matches!(
-                        chunk_reader::decode_encoded_record(&record)?,
-                        chunk_reader::EncodedChunk::Xor(_)
-                    ) {
-                        return Err(error.into());
-                    }
-                }
+                Ok(samples) => rows.extend(samples.into_iter().map(|sample| Row {
+                    name: name.clone(),
+                    labels: s.labels.clone(),
+                    hash,
+                    timestamp: sample.timestamp,
+                    value: sample.value,
+                })),
+                // Vortex currently represents the flattened scalar samples table only.
+                // `read_samples` validates the chunk before identifying these two
+                // Prometheus native-histogram encodings, so corrupted scalar chunks
+                // remain conversion errors rather than being silently omitted.
+                Err(error)
+                    if error.kind() == io::ErrorKind::InvalidData
+                        && matches!(
+                            error.to_string().as_str(),
+                            "unsupported Prometheus chunk encoding 2"
+                                | "unsupported Prometheus chunk encoding 3"
+                        ) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -229,83 +267,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .then_with(|| a.timestamp.cmp(&b.timestamp))
     });
-    let jsons: ArrayRef = Arc::new(StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.json.as_str()))
-            .collect::<Vec<_>>(),
-    ));
-    let unshredded = json_to_variant(&jsons)?;
-    let label_schema = DataType::Struct(
+    let mut fields = vec![
+        Field::new("name", DataType::Utf8, false),
+        // Vortex's Arrow bridge currently does not import FixedSizeBinary;
+        // all values nevertheless remain canonical 16-byte label hashes.
+        Field::new("labels_hash", DataType::Binary, false),
+    ];
+    fields.extend(
         labels
             .iter()
-            .map(|label| Arc::new(Field::new(label, DataType::Utf8, true)))
-            .collect(),
+            .map(|label| Field::new(label_column(label), DataType::Utf8, true)),
     );
-    let variant: ArrayRef = ArrayRef::from(shred_variant(&unshredded, &label_schema)?);
-    let variant_field = parquet59::variant::VariantArray::try_new(&variant)?.field("labels");
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("labels_hash", DataType::FixedSizeBinary(16), false),
-        variant_field,
+    fields.extend([
         Field::new(
             "timestamp",
-            DataType::Timestamp(arrow59::datatypes::TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
             false,
         ),
-        Field::new("value", DataType::Float64, true),
-        Field::new("values_nh", DataType::Binary, true),
-    ]));
-    let hashes = FixedSizeBinaryArray::try_from_iter(rows.iter().map(|r| r.hash.as_slice()))?;
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(hashes),
-            variant,
-            Arc::new(TimestampMillisecondArray::from(
-                rows.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
-            )),
-            Arc::new(Float64Array::from(
-                rows.iter().map(|r| r.value).collect::<Vec<_>>(),
-            )),
-            Arc::new(BinaryArray::from_iter(
-                rows.iter().map(|r| r.values_nh.as_deref()),
-            )),
-        ],
-    )?;
-    let hll_metadata = hlls
-        .iter()
-        .map(|(name, hll)| format!("{name}:{}", hll.hex()))
-        .collect::<Vec<_>>()
-        .join(",");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_column_encoding(ColumnPath::from("labels_hash"), Encoding::DELTA_BYTE_ARRAY)
-        .set_column_encoding(ColumnPath::from("timestamp"), Encoding::DELTA_BINARY_PACKED)
-        .set_column_encoding(ColumnPath::from("value"), Encoding::BYTE_STREAM_SPLIT)
-        .set_column_encoding(
-            ColumnPath::from("values_nh"),
-            Encoding::DELTA_LENGTH_BYTE_ARRAY,
-        )
-        .set_key_value_metadata(Some(vec![
-            KeyValue::new("thanos.labels_hll.v1".into(), hll_metadata),
-            KeyValue::new(
-                "thanos.values_nh.v1".into(),
-                Some("prometheus-tsdb-chunk-record;timestamp=mint".into()),
-            ),
-        ]))
-        .build();
-    let mut bytes = Vec::new();
-    {
-        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-    }
+        Field::new("value", DataType::Float64, false),
+    ]);
+    let schema = Arc::new(Schema::new(fields));
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        )),
+        Arc::new(BinaryArray::from_iter_values(
+            rows.iter().map(|r| r.hash.as_slice()),
+        )),
+    ];
+    columns.extend(labels.iter().map(|label| {
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.labels.get(label).map(String::as_str))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef
+    }));
+    columns.extend([
+        Arc::new(TimestampMillisecondArray::from(
+            rows.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
+        )) as ArrayRef,
+        Arc::new(Float64Array::from(
+            rows.iter().map(|r| r.value).collect::<Vec<_>>(),
+        )) as ArrayRef,
+    ]);
+    let bytes = vortex_bytes(
+        RecordBatch::try_new(schema, columns)?,
+        encode_hll_metadata(&hlls)?,
+    )
+    .await?;
     let (out_root, out_name) = endpoint(&args[2])?;
-    let out = repository_operator(
+    repository_operator(
         &ThanosRepositoryConfig {
             name: "output".into(),
             uri: out_root,
@@ -313,42 +324,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gcs: None,
         },
         &StorageConfig::default(),
-    )?;
-    out.write(&out_name, bytes).await?;
+    )?
+    .write(&out_name, bytes)
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hll_registers_are_stable_and_non_empty() {
-        let mut hll = Hll([0; 64]);
-        hll.add("api-1");
-        let encoded = hll.hex();
-        assert_eq!(encoded.len(), 128);
-        assert_ne!(encoded, "00".repeat(64));
-    }
-
+    use vortex::file::OpenOptionsSessionExt;
     #[test]
     fn endpoint_preserves_object_store_root() {
         assert_eq!(
-            endpoint("s3://bucket/prefix/block.parquet").unwrap(),
-            ("s3://bucket/prefix".to_owned(), "block.parquet".to_owned())
+            endpoint("s3://bucket/prefix/block.vortex").unwrap(),
+            ("s3://bucket/prefix".to_owned(), "block.vortex".to_owned())
         );
     }
-
     #[test]
-    fn preserves_complete_native_histogram_record_in_values_nh() {
-        use crc::{CRC_32_ISCSI, Crc};
-
-        let crc = Crc::<u32>::new(&CRC_32_ISCSI);
-        let payload = [1, 2, 3];
-        let mut record = vec![payload.len() as u8, 2]; // 2 is Prometheus histogram encoding.
-        record.extend_from_slice(&payload);
-        record.extend_from_slice(&crc.checksum(&record[1..]).to_be_bytes());
-
-        assert!(is_native_histogram_record(&record).unwrap());
+    fn hll_metadata_is_stable_and_round_trips() {
+        let mut hll = Hll([0; HLL_REGISTERS]);
+        hll.add("api-1");
+        let bytes = encode_hll_metadata(&BTreeMap::from([("pod".to_owned(), hll)])).unwrap();
+        assert_eq!(
+            decode_hll_metadata(&bytes)
+                .unwrap()
+                .get("pod")
+                .unwrap()
+                .iter()
+                .filter(|value| **value != 0)
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn vortex_file_exposes_hll_metadata_segment() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))]).unwrap();
+        let mut hll = Hll([0; HLL_REGISTERS]);
+        hll.add("one");
+        let metadata = encode_hll_metadata(&BTreeMap::from([("pod".to_owned(), hll)])).unwrap();
+        let bytes = vortex_bytes(batch, metadata.clone()).await.unwrap();
+        let file = VortexSession::default()
+            .with_tokio()
+            .open_options()
+            .include_metadata()
+            .open_buffer(bytes)
+            .unwrap();
+        assert_eq!(
+            file.metadata_segment(HLL_METADATA_KEY).unwrap().as_ref(),
+            metadata.as_slice()
+        );
     }
 }

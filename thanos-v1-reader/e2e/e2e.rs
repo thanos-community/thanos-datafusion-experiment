@@ -5,6 +5,30 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use fixture::{MAXT, MINT, POD_COUNT, RESOLUTION_5M, SAMPLE_COUNT};
+use vortex::{VortexSessionDefault, file::OpenOptionsSessionExt, io::session::RuntimeSessionExt};
+
+#[tokio::test]
+async fn convert_writes_flattened_vortex_with_hll_metadata() {
+    let fixture = fixture::generated_fixture();
+    let block = fixture.raw_block();
+    let output = tempfile::NamedTempFile::new().expect("create Vortex output");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_convert"))
+        .arg(format!("file://{}", block.display()))
+        .arg(format!("file://{}", output.path().display()))
+        .status()
+        .expect("run convert");
+    assert!(status.success(), "convert failed with {status}");
+    let bytes = std::fs::read(output.path()).expect("read Vortex output");
+    let file = vortex::session::VortexSession::default()
+        .with_tokio()
+        .open_options()
+        .include_metadata()
+        .open_buffer(bytes)
+        .expect("open Vortex output");
+    assert!(file.metadata_segment("thanos.labels_hll.v1").is_some());
+    let names = format!("{:?}", file.dtype());
+    assert!(names.contains("label.pod"), "Vortex schema: {names}");
+}
 
 #[tokio::test]
 async fn flight_sql_raw_counter_rows_are_parsed_and_ordered() {

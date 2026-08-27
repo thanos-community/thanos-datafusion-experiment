@@ -74,6 +74,24 @@ pub fn generated_fixture() -> GeneratedFixture {
 }
 
 impl GeneratedFixture {
+    pub fn raw_block(&self) -> PathBuf {
+        std::fs::read_dir(&self.blocks)
+            .expect("list fixture blocks")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                std::fs::read(path.join("meta.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|meta| {
+                        meta.pointer("/thanos/downsample/resolution")
+                            .and_then(|value| value.as_i64())
+                    })
+                    == Some(0)
+            })
+            .expect("find raw fixture block")
+    }
+
     fn root(&self) -> &Path {
         self.root
             .as_ref()

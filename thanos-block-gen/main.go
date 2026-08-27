@@ -36,18 +36,19 @@ var fixtureLabelDictionary = []string{
 }
 
 type config struct {
-	output         string
-	mint           int64
-	maxt           int64
-	samples        int
-	externalLabels map[string]string
-	instances      int
-	pods           int
-	routes         int
-	nativeSeries   int
-	scalarEdges    bool
-	clean          bool
-	downsample5m   bool
+	output           string
+	mint             int64
+	maxt             int64
+	samples          int
+	externalLabels   map[string]string
+	instances        int
+	pods             int
+	routes           int
+	nativeSeries     int
+	nativeHistograms bool
+	scalarEdges      bool
+	clean            bool
+	downsample5m     bool
 }
 
 func main() {
@@ -74,7 +75,7 @@ func run(args []string, stdout io.Writer) error {
 
 	fmt.Fprintf(
 		stdout,
-		"level=info msg=%q output=%q mint=%d maxt=%d duration=%q samples=%d series=%d external_labels=%q downsample_5m=%t clean=%t\n",
+		"level=info msg=%q output=%q mint=%d maxt=%d duration=%q samples=%d series=%d external_labels=%q native_histograms=%t downsample_5m=%t clean=%t\n",
 		"generating Thanos fixture blocks",
 		cfg.output,
 		cfg.mint,
@@ -83,6 +84,7 @@ func run(args []string, stdout io.Writer) error {
 		cfg.samples,
 		cfg.seriesCount(),
 		formatLabels(cfg.externalLabels),
+		cfg.nativeHistograms,
 		cfg.downsample5m,
 		cfg.clean,
 	)
@@ -109,16 +111,17 @@ func run(args []string, stdout io.Writer) error {
 func parseConfig(args []string) (config, error) {
 	defaultEnd := time.Now().Truncate(time.Second)
 	cfg := config{
-		output:         "target",
-		mint:           defaultEnd.Add(-time.Hour).UnixMilli(),
-		maxt:           defaultEnd.UnixMilli(),
-		samples:        240,
-		externalLabels: map[string]string{"cluster": "dummy", "replica": "0"},
-		instances:      20,
-		pods:           100,
-		routes:         5,
-		nativeSeries:   10,
-		downsample5m:   true,
+		output:           "target",
+		mint:             defaultEnd.Add(-time.Hour).UnixMilli(),
+		maxt:             defaultEnd.UnixMilli(),
+		samples:          240,
+		externalLabels:   map[string]string{"cluster": "dummy", "replica": "0"},
+		instances:        20,
+		pods:             100,
+		routes:           5,
+		nativeSeries:     10,
+		nativeHistograms: false,
+		downsample5m:     true,
 	}
 
 	flags := flag.NewFlagSet("thanos-block-gen", flag.ContinueOnError)
@@ -132,6 +135,7 @@ func parseConfig(args []string) (config, error) {
 	flags.IntVar(&cfg.pods, "pods", cfg.pods, "number of counter and gauge pod series")
 	flags.IntVar(&cfg.routes, "routes", cfg.routes, "number of classic histogram route series")
 	flags.IntVar(&cfg.nativeSeries, "native-series", cfg.nativeSeries, "number of integer and float native histogram series")
+	flags.BoolVar(&cfg.nativeHistograms, "native-histograms", cfg.nativeHistograms, "also generate integer and float native histogram samples")
 	flags.BoolVar(&cfg.scalarEdges, "scalar-edge-cases", false, "include counter resets, special gauge values, and zero histograms")
 	flags.Var(&externalLabels, "external-label", "external label in name=value form; repeatable")
 	flags.BoolVar(&cfg.clean, "clean", false, "remove the output directory before generating blocks")
@@ -145,8 +149,8 @@ func parseConfig(args []string) (config, error) {
 	if cfg.samples < 2 {
 		return config{}, errors.New("--samples must be at least 2")
 	}
-	if cfg.instances < 1 || cfg.pods < 1 || cfg.routes < 1 || cfg.nativeSeries < 1 {
-		return config{}, errors.New("--instances, --pods, --routes, and --native-series must be at least 1")
+	if cfg.instances < 1 || cfg.pods < 1 || cfg.routes < 1 || (cfg.nativeHistograms && cfg.nativeSeries < 1) {
+		return config{}, errors.New("--instances, --pods, and --routes must be at least 1; --native-series must be at least 1 when --native-histograms is enabled")
 	}
 	if cfg.maxt-cfg.mint < fiveMinutesMillis {
 		return config{}, errors.New("the time range must span at least 5 minutes")
@@ -168,6 +172,9 @@ func (cfg config) seriesCount() int {
 
 func (cfg config) dimensions() (instances, pods, routes, nativeSeries int) {
 	instances, pods, routes, nativeSeries = cfg.instances, cfg.pods, cfg.routes, cfg.nativeSeries
+	if !cfg.nativeHistograms {
+		nativeSeries = 0
+	}
 	if instances == 0 {
 		instances = 1
 	}
@@ -177,7 +184,7 @@ func (cfg config) dimensions() (instances, pods, routes, nativeSeries int) {
 	if routes == 0 {
 		routes = 1
 	}
-	if nativeSeries == 0 {
+	if cfg.nativeHistograms && nativeSeries == 0 {
 		nativeSeries = 1
 	}
 	return instances, pods, routes, nativeSeries
@@ -236,7 +243,7 @@ func writeSeriesSchema(stdout io.Writer, cfg config) {
 
 func metricSchemas(cfg config) []metricSchema {
 	instances, pods, routes, nativeSeries := cfg.dimensions()
-	return []metricSchema{
+	schemas := []metricSchema{
 		{
 			name:       "dummy_requests_total",
 			metricType: "counter",
@@ -277,23 +284,28 @@ func metricSchemas(cfg config) []metricSchema {
 				"__name__": 1, "job": 1, "pod": pods, "route": routes,
 			},
 		},
-		{
-			name:       "dummy_native_histogram",
-			metricType: "native histogram (integer)",
-			series:     pods * nativeSeries,
-			labelCardinality: map[string]int{
-				"__name__": 1, "job": 1, "pod": pods, "series": nativeSeries,
-			},
-		},
-		{
-			name:       "dummy_float_native_histogram",
-			metricType: "native histogram (float)",
-			series:     pods * nativeSeries,
-			labelCardinality: map[string]int{
-				"__name__": 1, "job": 1, "pod": pods, "series": nativeSeries,
-			},
-		},
 	}
+	if cfg.nativeHistograms {
+		schemas = append(schemas,
+			metricSchema{
+				name:       "dummy_native_histogram",
+				metricType: "native histogram (integer)",
+				series:     pods * nativeSeries,
+				labelCardinality: map[string]int{
+					"__name__": 1, "job": 1, "pod": pods, "series": nativeSeries,
+				},
+			},
+			metricSchema{
+				name:       "dummy_float_native_histogram",
+				metricType: "native histogram (float)",
+				series:     pods * nativeSeries,
+				labelCardinality: map[string]int{
+					"__name__": 1, "job": 1, "pod": pods, "series": nativeSeries,
+				},
+			},
+		)
+	}
+	return schemas
 }
 
 func allLabelNames(schemas []metricSchema) []string {

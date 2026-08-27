@@ -74,6 +74,24 @@ pub fn generated_fixture() -> GeneratedFixture {
 }
 
 impl GeneratedFixture {
+    pub fn raw_block(&self) -> PathBuf {
+        std::fs::read_dir(&self.blocks)
+            .expect("list fixture blocks")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                std::fs::read(path.join("meta.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|meta| {
+                        meta.pointer("/thanos/downsample/resolution")
+                            .and_then(|value| value.as_i64())
+                    })
+                    == Some(0)
+            })
+            .expect("find raw fixture block")
+    }
+
     fn root(&self) -> &Path {
         self.root
             .as_ref()
@@ -117,7 +135,18 @@ impl GeneratedFixture {
             .stderr(Stdio::from(stderr));
         unsafe {
             command.pre_exec(move || {
-                duplicate_listener(grpc_fd, 3).and_then(|_| duplicate_listener(metrics_fd, 4))
+                // Reserve independent descriptors before assigning 3 and 4. When
+                // tests run concurrently, the two source descriptors can arrive
+                // as 4 and 3 respectively; assigning in place would then clobber
+                // the second source before it is duplicated.
+                let grpc_copy = duplicate_listener_source(grpc_fd)?;
+                let metrics_copy = duplicate_listener_source(metrics_fd)?;
+                duplicate_listener(grpc_copy, 3)?;
+                duplicate_listener(metrics_copy, 4)?;
+                if libc::close(grpc_copy) == -1 || libc::close(metrics_copy) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
             });
         }
         let child = command.spawn().expect("start reader process");
@@ -143,6 +172,15 @@ fn duplicate_listener(
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn duplicate_listener_source(source: std::os::fd::RawFd) -> io::Result<std::os::fd::RawFd> {
+    let duplicate = unsafe { libc::fcntl(source, libc::F_DUPFD, 5) };
+    if duplicate == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(duplicate)
 }
 
 impl Drop for GeneratedFixture {

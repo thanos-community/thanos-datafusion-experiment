@@ -91,13 +91,16 @@ func TestDefaultConfigCreatesDenseOneHourFixture(t *testing.T) {
 	if cfg.samples != 240 {
 		t.Fatalf("default samples = %d, want 240", cfg.samples)
 	}
-	if cfg.seriesCount() != 5700 {
-		t.Fatalf("default series = %d, want 5700", cfg.seriesCount())
+	if cfg.nativeHistograms {
+		t.Fatal("native histograms are enabled by default")
+	}
+	if cfg.seriesCount() != 3700 {
+		t.Fatalf("default series = %d, want 3700", cfg.seriesCount())
 	}
 }
 
 func TestWritesReadableMetricSchemaTable(t *testing.T) {
-	cfg := config{instances: 2, pods: 100, routes: 3, nativeSeries: 4}
+	cfg := config{instances: 2, pods: 100, routes: 3, nativeSeries: 4, nativeHistograms: true}
 	var output bytes.Buffer
 
 	writeSeriesSchema(&output, cfg)
@@ -121,6 +124,47 @@ func TestWritesReadableMetricSchemaTable(t *testing.T) {
 		if !strings.Contains(output.String(), expected) {
 			t.Errorf("schema output missing %q:\n%s", expected, output.String())
 		}
+	}
+}
+
+func TestNativeHistogramsAreOptIn(t *testing.T) {
+	cfg, err := parseConfig([]string{"--native-histograms=true", "--native-series=2"})
+	if err != nil {
+		t.Fatalf("parse native histogram config: %v", err)
+	}
+	if !cfg.nativeHistograms {
+		t.Fatal("native histogram flag was not enabled")
+	}
+	if cfg.seriesCount() != 4100 {
+		t.Fatalf("native histogram series = %d, want 4100", cfg.seriesCount())
+	}
+	if got := len(metricSchemas(config{pods: 1, routes: 1})); got != 5 {
+		t.Fatalf("scalar schema count = %d, want 5", got)
+	}
+	if got := len(metricSchemas(config{pods: 1, routes: 1, nativeSeries: 1, nativeHistograms: true})); got != 7 {
+		t.Fatalf("native histogram schema count = %d, want 7", got)
+	}
+}
+
+func TestNativeHistogramFlagWritesHistogramSamples(t *testing.T) {
+	cfg := config{
+		output:           t.TempDir(),
+		mint:             1_700_000_000_000,
+		maxt:             1_700_000_600_000,
+		samples:          10,
+		externalLabels:   map[string]string{"cluster": "test"},
+		instances:        1,
+		pods:             1,
+		routes:           1,
+		nativeSeries:     1,
+		nativeHistograms: true,
+	}
+	_, meta, err := createRawBlock(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("create native histogram block: %v", err)
+	}
+	if meta.Stats.NumHistogramSamples == 0 {
+		t.Fatal("native histogram block has no histogram samples")
 	}
 }
 

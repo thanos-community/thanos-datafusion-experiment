@@ -1,9 +1,10 @@
 # Thanos block generator
 
 `thanos-block-gen` writes local, Thanos-compatible Prometheus TSDB fixture blocks.
-It creates dummy counter, gauge, classic histogram, integer native histogram, and
-float native histogram series. By default, it creates a one-hour block ending now,
-with 240 samples per series and 5,700 series across instances, pods, routes, and
+It creates dummy counter, gauge, and classic histogram series by default. Pass
+`--native-histograms=true` to also generate integer and float native histogram
+series. By default, it creates a one-hour block ending now, with 240 samples per
+series and 3,700 series across instances, pods, routes, and
 histogram dimensions. Every metric family includes 100 distinct `pod` label values.
 It also creates a 5-minute downsampled block.
 
@@ -33,6 +34,7 @@ go run . \
   --instances 20 \
   --pods 100 \
   --routes 5 \
+  --native-histograms=true \
   --native-series 10 \
   --external-label cluster=dev \
   --external-label replica=0 \

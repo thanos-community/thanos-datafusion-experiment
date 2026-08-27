@@ -168,6 +168,41 @@ locked prevents startup.
 The writer emits Parquet row-group min/max statistics and page-level column indexes. Each
 generated file has a single row group, so its row-group statistics cover the whole file.
 
+### TSDB block conversion
+
+`convert` expands a single TSDB block into a sorted Vortex sample file. Both arguments are
+OpenDAL URIs, so the same command works with `file://`, `s3://`, and `gs://` locations (using
+the normal AWS/GCP credential chains):
+
+```sh
+cargo run --bin convert -- file:///blocks/01ABC... file:///exports/01ABC.vortex
+```
+
+The output is a flattened Vortex samples table: `name`, a 16-byte canonical `labels_hash`, one
+nullable `label.<name>` UTF-8 column for each observed label, `timestamp`, and `value`. Label
+columns are ordered by decreasing observed cardinality and rows are sorted
+`(name, labels..., timestamp)`. Native histogram chunks are intentionally not yet emitted by this
+format. Vortex's adaptive compression and file-level statistics are used; the user metadata
+segment `thanos.labels_hll.v1` stores a versioned binary block of raw per-label HLL registers for
+cardinality planning.
+
+Compare the TSDB `index` plus chunks footprint to the converted file with:
+
+```sh
+bash benches/block-storage.sh /blocks/01ABC... /exports/01ABC.vortex
+```
+
+For the reproducible two-hour, scalar-only comparison fixture, run the benchmark driver. It uses
+250 pod values by default; set `PODS` to calibrate another host toward a 10 MiB TSDB block:
+
+```sh
+bash benches/vortex-storage.sh
+```
+
+On the development host, the two-hour fixture with 250 pod values (9,250 scalar series and
+4,440,000 samples) measured 11,305,657 bytes for TSDB `index + chunks` and 18,178,040 bytes for
+the Vortex file.
+
 The Prometheus scrape endpoint listens on `metrics_listen_addr` and serves metrics at
 `/metrics`. OpenDAL operations are recorded with OpenDAL's metrics layer and traced with its
 OpenTelemetry layer. Configure standard `OTEL_EXPORTER_OTLP_*` environment variables to send

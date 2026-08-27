@@ -31,7 +31,7 @@ use vortex::{
     arrow::ArrowSessionExt,
     buffer::ByteBufferMut,
     encodings::runend::RunEnd,
-    file::{WriteOptionsSessionExt, WriteStrategyBuilder},
+    file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder},
     io::session::RuntimeSessionExt,
     layout::{
         LayoutStrategy,
@@ -55,6 +55,12 @@ struct Row {
     hash: [u8; 16],
     timestamp: i64,
     value: f64,
+}
+struct VortexStorageBreakdown {
+    index_bytes: u64,
+    hll_metadata_bytes: u64,
+    data_bytes: u64,
+    total_bytes: u64,
 }
 struct Hll([u8; HLL_REGISTERS]);
 impl Hll {
@@ -302,15 +308,47 @@ async fn vortex_bytes(
     Ok(output.as_ref().to_vec())
 }
 
+/// Account for every on-disk byte. `data_bytes` contains physical column segments (including
+/// their per-column min/max statistics); `index_bytes` is the remainder: file/header/footer,
+/// schema/layout and file-level statistics, alignment padding, postscript, and EOF marker.
+fn vortex_storage_breakdown(
+    bytes: Vec<u8>,
+) -> Result<VortexStorageBreakdown, Box<dyn std::error::Error>> {
+    let total_bytes = u64::try_from(bytes.len())?;
+    let file = VortexSession::default().open_options().open_buffer(bytes)?;
+    let data_bytes = file
+        .footer()
+        .segment_map()
+        .iter()
+        .map(|segment| u64::from(segment.length))
+        .sum();
+    let hll_metadata_bytes = file
+        .footer()
+        .metadata_segment(HLL_METADATA_KEY)
+        .map_or(0, |segment| u64::from(segment.length));
+    let index_bytes = total_bytes
+        .checked_sub(data_bytes)
+        .and_then(|remaining| remaining.checked_sub(hll_metadata_bytes))
+        .ok_or("Vortex segment lengths exceed file length")?;
+    Ok(VortexStorageBreakdown {
+        index_bytes,
+        hll_metadata_bytes,
+        data_bytes,
+        total_bytes,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 3 {
-        return Err("usage: convert <block-uri> <output-uri>".into());
+    let report = args.get(1).is_some_and(|arg| arg == "--report");
+    let first_uri = 1 + usize::from(report);
+    if args.len() != first_uri + 2 {
+        return Err("usage: convert [--report] <block-uri> <output-uri>".into());
     }
     let source = ThanosRepositoryConfig {
         name: "source".into(),
-        uri: args[1].clone(),
+        uri: args[first_uri].clone(),
         s3: None,
         gcs: None,
     };
@@ -463,7 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         encode_hll_metadata(&hlls)?,
     )
     .await?;
-    let (out_root, out_name) = endpoint(&args[2])?;
+    let (out_root, out_name) = endpoint(&args[first_uri + 1])?;
     repository_operator(
         &ThanosRepositoryConfig {
             name: "output".into(),
@@ -473,8 +511,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         &StorageConfig::default(),
     )?
-    .write(&out_name, bytes)
+    .write(&out_name, bytes.clone())
     .await?;
+    if report {
+        let breakdown = vortex_storage_breakdown(bytes)?;
+        println!("format,index_bytes,hll_metadata_bytes,data_bytes,total_bytes");
+        println!(
+            "vortex,{},{},{},{}",
+            breakdown.index_bytes,
+            breakdown.hll_metadata_bytes,
+            breakdown.data_bytes,
+            breakdown.total_bytes
+        );
+    }
     Ok(())
 }
 
@@ -484,7 +533,6 @@ mod tests {
     use vortex::{
         array::{IntoArray, arrays::PrimitiveArray},
         encodings::{alp::ALP, runend::RunEnd},
-        file::OpenOptionsSessionExt,
     };
     #[test]
     fn endpoint_preserves_object_store_root() {
@@ -552,6 +600,12 @@ mod tests {
         hll.add("one");
         let metadata = encode_hll_metadata(&BTreeMap::from([("pod".to_owned(), hll)])).unwrap();
         let bytes = vortex_bytes(batch, metadata.clone()).await.unwrap();
+        let breakdown = vortex_storage_breakdown(bytes.clone()).unwrap();
+        assert_eq!(breakdown.hll_metadata_bytes, metadata.len() as u64);
+        assert_eq!(
+            breakdown.index_bytes + breakdown.hll_metadata_bytes + breakdown.data_bytes,
+            breakdown.total_bytes
+        );
         let file = VortexSession::default()
             .with_tokio()
             .open_options()

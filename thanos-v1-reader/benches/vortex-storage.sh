@@ -15,5 +15,5 @@ pods=${PODS:-250}
   --native-histograms=false --downsample-5m=false)
 block=$(find "$work/blocks" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 (cd "$repo/thanos-v1-reader" && CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo run --quiet --bin convert -- \
-  "file://$block" "file://$work/block.vortex")
-"$repo/thanos-v1-reader/benches/block-storage.sh" "$block" "$work/block.vortex"
+  --report "file://$block" "file://$work/block.vortex" > "$work/vortex-storage.csv")
+"$repo/thanos-v1-reader/benches/block-storage.sh" "$block" "$work/block.vortex" "$work/vortex-storage.csv"
